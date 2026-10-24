@@ -19,12 +19,19 @@ function wrap(text: string, width=WIDTH): string[] {
 }
 function command(...bytes: number[]): Buffer { return Buffer.from(bytes); }
 function text(value: string): Buffer { return Buffer.from(value.replace(/[^\x20-\x7E\n\r]/g,'?'),'ascii'); }
+function money(minor: number): string { return `Rs ${(minor/100).toFixed(2)}`; }
+function readableReceipt(raw:Buffer):string{
+  return raw.toString('latin1')
+    .replace(/\x1b\x40|\x1b[\x61\x45][\s\S]/g,'')
+    .replace(/\x1d\x56[\s\S]{2}/g,'')
+    .replace(/[\x00-\x08\x0B-\x1F]/g,'');
+}
 
 export function formatKitchenTicket(order: KitchenOrder): Buffer {
   const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text('JUNIPER CAFE\n'),command(ESC,0x45,0),
     text('KITCHEN ORDER\n'),command(ESC,0x61,0),text(line('=')+'\n'),text(columns('ORDER',order.orderNumber)+'\n'),
     text(columns(order.orderType==='dine_in'?(order.tableLabel??'DINE IN'):'TAKEAWAY',new Date(order.createdAt).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}))+'\n'),text(line()+'\n')];
-  for(const item of order.lines){parts.push(command(ESC,0x45,1),text(`${item.quantity} x ${item.name}\n`),command(ESC,0x45,0));for(const modifier of item.modifiers)parts.push(text(`    + ${modifier.name}${modifier.priceDeltaMinor?` (₹${(modifier.priceDeltaMinor/100).toFixed(2)})`:''}\n`));for(const row of wrap(item.note??''))if(row)parts.push(text(`    ${row}\n`));}
+  for(const item of order.lines){parts.push(command(ESC,0x45,1),text(`${item.quantity} x ${item.name}\n`),command(ESC,0x45,0));for(const modifier of item.modifiers)parts.push(text(`    + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor)})`:''}\n`));for(const row of wrap(item.note??''))if(row)parts.push(text(`    ${row}\n`));}
   if(order.note)parts.push(text(line()+ '\n'),text('NOTE: '+wrap(order.note).join('\n')+'\n'));
   parts.push(text(line('=')+'\n\n'),command(GS,0x56,0x41,0x03));
   return Buffer.concat(parts);
@@ -34,12 +41,12 @@ export function formatReceipt(order: OrderRecord): Buffer {
   const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text('JUNIPER CAFE\n'),command(ESC,0x45,0),
     text('Vijay Nagar, Indore\n'),text(line('=')+'\n'),text(`INVOICE  ${order.invoiceNumber??'PENDING'}\n`),
     text(`ORDER    ${order.orderNumber}\n`),text(`${new Date(order.createdAt).toLocaleString('en-IN')}\n`),
-    text(`${order.orderType==='dine_in'?(order.tableLabel??'Dine in'):'Takeaway'} · ${order.guestCount} guest(s)\n`),text(line()+'\n')];
-  for(const item of order.lines){parts.push(text(columns(`${item.quantity} x ${item.name}`,`₹${(item.lineTotalMinor/100).toFixed(2)}`)+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (₹${(modifier.priceDeltaMinor/100).toFixed(2)})`:''}\n`));}
-  parts.push(text(line()+'\n'),text(columns('Subtotal',`₹${(order.subtotalMinor/100).toFixed(2)}`)+'\n'),
-    text(columns(`Tax (demo ${order.taxRateBps/100}%)`,`₹${(order.taxTotalMinor/100).toFixed(2)}`)+'\n'),
-    command(ESC,0x45,1),text(columns('TOTAL',`₹${(order.totalMinor/100).toFixed(2)}`)+'\n'),command(ESC,0x45,0),
-    text(columns(`Paid · ${(order.paymentMethod??'cash').toUpperCase()}`,`₹${(order.totalMinor/100).toFixed(2)}`)+'\n'),text(line('=')+'\n'),
+    text(`${order.orderType==='dine_in'?(order.tableLabel??'Dine in'):'Takeaway'} - ${order.guestCount} guest(s)\n`),text(line()+'\n')];
+  for(const item of order.lines){parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor))+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor)})`:''}\n`));}
+  parts.push(text(line()+'\n'),text(columns('Subtotal',money(order.subtotalMinor))+'\n'),
+    text(columns(`Tax (demo ${order.taxRateBps/100}%)`,money(order.taxTotalMinor))+'\n'),
+    command(ESC,0x45,1),text(columns('TOTAL',money(order.totalMinor))+'\n'),command(ESC,0x45,0),
+    text(columns(`Paid - ${(order.paymentMethod??'cash').toUpperCase()}`,money(order.totalMinor))+'\n'),text(line('=')+'\n'),
     command(ESC,0x61,1),text('Thank you. See you again!\n\n'),command(GS,0x56,0x41,0x03));
   return Buffer.concat(parts);
 }
@@ -47,7 +54,7 @@ export function formatReceipt(order: OrderRecord): Buffer {
 export function startMockPrinter(): net.Server {
   const server=net.createServer(socket=>{
     const buffers:Buffer[]=[];socket.on('data',chunk=>buffers.push(chunk));socket.on('end',()=>{
-      const raw=Buffer.concat(buffers);const printable=raw.toString('latin1').replace(/[\x00-\x08\x0B-\x1F]/g,'');
+      const raw=Buffer.concat(buffers);const printable=readableReceipt(raw);
       console.log(`\n🖨  MOCK 80mm ESC/POS PRINTER · ${raw.length} bytes\n${printable}\n--- paper cut ---\n`);
       socket.end('OK');
     });
