@@ -13,6 +13,13 @@ const roles: Role[] = ['manager', 'cashier', 'kitchen', 'viewer'];
 const fieldClass = 'h-11 w-full rounded-xl border border-[#dfe6df] bg-white px-3 text-sm text-[#263b30] outline-none transition focus:border-[#4a8a61] focus:ring-4 focus:ring-[#4a8a61]/10';
 const buttonClass = 'inline-flex min-h-11 items-center justify-center gap-2 rounded-xl bg-[#286a4f] px-4 text-sm font-semibold text-white transition hover:bg-[#1f563f] disabled:cursor-not-allowed disabled:opacity-55';
 
+function authRedirectUrl() {
+  const configuredOrigin = import.meta.env.VITE_AUTH_REDIRECT_URL?.trim();
+  const localHost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+  const origin = configuredOrigin || (localHost ? 'https://common-table-pos.vercel.app' : window.location.origin);
+  return new URL('/admin', origin).toString();
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong. Please retry.';
 }
@@ -92,6 +99,17 @@ export default function AdminApp() {
   }, [loadWorkspace]);
 
   useEffect(() => {
+    if (!user || !tenantId || !outletId) return;
+    const outlet = outlets.find(row => row.outlet_id === outletId);
+    if (!outlet) return;
+    try {
+      localStorage.setItem('common-table.menu-context.v1', JSON.stringify({
+        tenantId, outletId, outletName: outlet.name, currency: outlet.currency,
+      }));
+    } catch { /* Cashier can still load the menu during this session. */ }
+  }, [user, tenantId, outletId, outlets]);
+
+  useEffect(() => {
     const inviteToken = new URLSearchParams(window.location.search).get('invite');
     if (!inviteToken || !user || !supabase) return;
     setLoading(true); setError(''); setNotice('Checking your staff invitation…');
@@ -114,7 +132,7 @@ export default function AdminApp() {
         const { data, error: authError } = await supabase.auth.signUp({
           email: form.email.trim(), password: form.password,
           options: {
-            emailRedirectTo: `${window.location.origin}/admin`,
+            emailRedirectTo: authRedirectUrl(),
             data: { display_name: form.displayName.trim() },
           },
         });
@@ -138,7 +156,7 @@ export default function AdminApp() {
         email: form.email.trim(),
         options: {
           shouldCreateUser: true,
-          emailRedirectTo: `${window.location.origin}/admin`,
+          emailRedirectTo: authRedirectUrl(),
           data: { display_name: form.displayName.trim() || 'Demo Owner' },
         },
       });

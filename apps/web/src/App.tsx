@@ -3,14 +3,20 @@ import { Banknote, Check, ChefHat, ChevronDown, CircleHelp, Coffee, CreditCard, 
 import type { CreateOrderCommand, KitchenOrder, MenuItem, ModifierOption, OrderLine, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage } from '@common-table/contracts';
 import { DEMO_MENU } from '@common-table/contracts';
 import { listQueuedOrders, queueOrder, removeQueuedOrder, type QueuedOrder } from './offline';
+import { supabase } from './supabase';
 
 const formatMoney=(minor:number,currency='INR')=>new Intl.NumberFormat('en-IN',{style:'currency',currency}).format(minor/100);
 const makeId=()=>crypto.randomUUID();
 const CONTEXT_CACHE='common-table.edge-context.v1';
 
 interface EdgeContext {tenantId:string;tenantName:string;outletId:string;outletName:string;terminalId:string;terminalName:string;locationLabel:string;currency:string;taxRateBps:number;}
+interface CloudMenuContext {tenantId:string;outletId:string;outletName?:string;currency?:string;}
+interface CloudMenuRow {item_id:string;category_id:string;name:string;price_minor:number;emoji:string;color:string;tag:string|null;vegetarian:boolean;available:boolean;kitchen_station:string;modifiers:ModifierOption[]|null;}
 function readCachedContext():EdgeContext|null{
   try{const value=localStorage.getItem(CONTEXT_CACHE);if(!value)return null;const parsed=JSON.parse(value) as Partial<EdgeContext>;return parsed.tenantId&&parsed.outletId&&parsed.terminalId?parsed as EdgeContext:null;}catch{return null;}
+}
+function readCloudMenuContext():CloudMenuContext|null{
+  try{const value=localStorage.getItem('common-table.menu-context.v1');if(!value)return null;const parsed=JSON.parse(value) as Partial<CloudMenuContext>;return parsed.tenantId&&parsed.outletId?parsed as CloudMenuContext:null;}catch{return null;}
 }
 
 interface CartLine { id:string; item:MenuItem; quantity:number; modifiers:ModifierOption[]; }
@@ -20,6 +26,7 @@ type TicketView=(KitchenOrder&{pending?:boolean});
 function App(){
   const [page,setPage]=useState<'pos'|'kitchen'>('pos');
   const [menu,setMenu]=useState<MenuItem[]>(DEMO_MENU);
+  const [menuSource,setMenuSource]=useState<'demo'|'edge'|'cloud'|'offline cache'>('demo');
   const [category,setCategory]=useState('All items');
   const [search,setSearch]=useState('');
   const [orderType,setOrderType]=useState<'dine_in'|'takeaway'>('dine_in');
@@ -82,7 +89,35 @@ function App(){
       if(!context||typeof context.tenantId!=='string'||typeof context.outletId!=='string'||typeof context.terminalId!=='string')return;
       setOutletContext(context);setTaxRateBps(context.taxRateBps);try{localStorage.setItem(CONTEXT_CACHE,JSON.stringify(context));}catch{/* The current session can still work without caching outlet setup. */}
     }).catch(()=>undefined);
-    fetch('/api/menu').then(response=>response.ok?response.json():null).then(rows=>{if(Array.isArray(rows)&&rows.length)setMenu(rows as MenuItem[]);}).catch(()=>undefined);
+    const cloudContext=readCloudMenuContext();
+    if(cloudContext&&supabase){
+      const cacheKey=`common-table.menu-cache.v1:${cloudContext.tenantId}:${cloudContext.outletId}`;
+      void (async()=>{
+        const {data:sessionData}=await supabase.auth.getSession();
+        const currentUserId=sessionData.session?.user.id;
+        if(!currentUserId)return;
+        try{const cached=localStorage.getItem(cacheKey);if(cached){const saved=JSON.parse(cached) as {userId?:string;items?:MenuItem[]};if(saved.userId===currentUserId&&Array.isArray(saved.items)&&saved.items.length){setMenu(saved.items);setMenuSource('offline cache');}}}catch{/* A bad or stale cache is ignored; the cloud request can repopulate it. */}
+        if(!navigator.onLine)return;
+        const {data:userData,error:userError}=await supabase.auth.getUser();
+        if(userError||!userData.user||userData.user.id!==currentUserId)return;
+        const [categoryResult,itemResult]=await Promise.all([
+          supabase.from('menu_categories').select('category_id,name,active').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('active',true),
+          supabase.from('menu_items').select('item_id,category_id,name,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,modifiers').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('available',true).order('sort_order').order('name'),
+        ]);
+        if(categoryResult.error)throw categoryResult.error;
+        if(itemResult.error)throw itemResult.error;
+        const names=new Map((categoryResult.data??[]).map(row=>[row.category_id as string,row.name as string]));
+        const rows=((itemResult.data??[]) as CloudMenuRow[]).map(row=>({
+          id:row.item_id,name:row.name,category:names.get(row.category_id)??'Menu',priceMinor:Number(row.price_minor),emoji:row.emoji,color:row.color,
+          ...(row.tag?{tag:row.tag}:{}),vegetarian:row.vegetarian,available:row.available,kitchenStation:row.kitchen_station,modifiers:Array.isArray(row.modifiers)?row.modifiers:[],
+        } satisfies MenuItem));
+        if(!rows.length)return;
+        setMenu(rows);setMenuSource('cloud');
+        try{localStorage.setItem(cacheKey,JSON.stringify({userId:currentUserId,items:rows}));}catch{/* Current session continues even when storage is full. */}
+      })().catch(()=>undefined);
+    }else{
+      fetch('/api/menu').then(response=>response.ok?response.json():null).then(rows=>{if(Array.isArray(rows)&&rows.length){setMenu(rows as MenuItem[]);setMenuSource('edge');}}).catch(()=>undefined);
+    }
     const onOnline=()=>{setOnline(true);void flushQueue();};const onOffline=()=>setOnline(false);
     window.addEventListener('online',onOnline);window.addEventListener('offline',onOffline);
     const retry=window.setInterval(()=>{void flushQueue();void refreshOrders();},5000);
@@ -200,7 +235,7 @@ function App(){
         <div className="mb-3 flex items-center gap-4 rounded-lg border border-[#e8ede9] bg-white p-3 text-[9px] text-[#758179]"><span className="flex items-center gap-1.5"><i className="size-2 rounded-full bg-[#eaa64c]"/>In progress <strong className="text-[#34443c]">{tickets.filter(ticket=>ticket.status==='sent'||ticket.status==='preparing').length}</strong></span><span className="flex items-center gap-1.5"><i className="size-2 rounded-full bg-[#5eaa7a]"/>Ready to serve <strong className="text-[#34443c]">{tickets.filter(ticket=>ticket.status==='ready').length}</strong></span><span className="ml-auto hidden text-[8px] text-[#a1aaa5] sm:block">{connected?'Connected · Live updates on':'Waiting for edge connection'}</span></div>
         <div className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-3">{tickets.map(ticket=><article key={ticket.id} className="overflow-hidden rounded-xl border border-[#e7ece8] bg-white shadow-[0_10px_24px_rgba(25,37,34,.045)]"><header className="flex items-start justify-between border-b border-[#edf0ed] p-3"><div><span className="text-[8px] tracking-[.7px] text-[#89958f]">{ticket.pending?'OFFLINE · PENDING SYNC':ticket.status.toUpperCase()} · {ticket.orderNumber}</span><h3 className="mt-1 text-[14px] font-bold">{ticket.orderType==='dine_in'?ticket.tableLabel:'Takeaway'}</h3></div><span className="rounded-md bg-[#fff5e8] px-2 py-1 text-[8px] font-bold text-[#ab702d]">{Math.max(0,Math.floor((Date.now()-new Date(ticket.createdAt).getTime())/60000))||'Just now'}{typeof Math.floor((Date.now()-new Date(ticket.createdAt).getTime())/60000)==='number'&&Date.now()-new Date(ticket.createdAt).getTime()>=60000?' min':''}</span></header><div className="flex gap-1.5 px-3 py-2 text-[8px] text-[#8a968f]"><span>{ticket.orderType.toUpperCase().replace('_',' ')}</span><span>·</span><span>{ticket.lines.reduce((sum,line)=>sum+line.quantity,0)} items</span><span>·</span><span>Demo Owner</span></div><div className="px-3 pb-2">{ticket.lines.map(line=><div key={line.id} className="flex gap-2 border-b border-dashed border-[#edf0ed] py-2 last:border-0"><span className="grid size-5 place-items-center rounded bg-[#f2f5f2] text-[9px] font-bold text-[#466151]">{line.quantity}</span><span><strong className="block text-[9px] font-semibold">{line.name}</strong><small className="text-[8px] text-[#9aa49e]">{line.kitchenStation}{line.note?` · ${line.note}`:''}</small>{line.modifiers.map(modifier=><small key={modifier.id} className="block text-[8px] text-[#62746a]">↳ {modifier.name}</small>)}</span></div>)}</div>{ticket.note&&<p className="mx-3 mb-2 rounded bg-[#fff8ed] p-2 text-[8px] text-[#a17a48]">Note: {ticket.note}</p>}<div className="flex gap-1.5 border-t border-[#edf0ed] bg-[#fbfcfb] p-2.5"><button disabled={ticket.pending} onClick={()=>void updateTicket(ticket,ticket.status==='sent'?'preparing':'ready')} className="rounded-md border border-[#e5ebe6] bg-white px-2.5 py-2 text-[8px] font-semibold text-[#607168] disabled:opacity-50">{ticket.status==='sent'?'Start preparing':'Mark ready'}</button><button disabled={ticket.pending} onClick={()=>void updateTicket(ticket,'ready')} className="ml-auto flex items-center gap-1.5 rounded-md border border-[#d7e8db] bg-[#eef6f0] px-2.5 py-2 text-[8px] font-semibold text-[#37704c] disabled:opacity-50"><Check size={12}/>Ready</button></div></article>)}{!tickets.length&&<div className="col-span-full flex min-h-[220px] flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-[#dfe8e1] bg-white text-center"><Flame size={25} className="text-[#d7e2d9]"/><strong className="text-[12px] text-[#607168]">Kitchen is clear</strong><span className="text-[9px] text-[#91a096]">Orders sent from the POS appear here.</span></div>}</div>
       </section>}
-      <footer className="mx-3 flex h-8 items-center justify-between border-t border-[#e9eeea] text-[7px] tracking-[.65px] text-[#a4ada7] sm:mx-8"><span>COMMON TABLE · POS PROTOTYPE</span><span>{online?<Wifi size={11} className="inline text-[#6f9b79]"/>:<WifiOff size={11} className="inline text-[#d79543]"/>} <span className="ml-1">Local-first · {queue.length} pending</span></span></footer>
+      <footer className="mx-3 flex h-8 items-center justify-between border-t border-[#e9eeea] text-[7px] tracking-[.65px] text-[#a4ada7] sm:mx-8"><span>COMMON TABLE · POS PROTOTYPE</span><span>{online?<Wifi size={11} className="inline text-[#6f9b79]"/>:<WifiOff size={11} className="inline text-[#d79543]"/>} <span className="ml-1">{menuSource} menu · {menu.length} items · Local-first · {queue.length} pending</span></span></footer>
     </main>
 
     {floorOpen&&<div className="fixed inset-0 z-20 grid place-items-center bg-[#14221c]/55 p-4 backdrop-blur-[2px]"><div className="w-full max-w-[510px] rounded-2xl border border-[#e3e9e4] bg-white p-5 shadow-2xl"><div className="flex items-center justify-between"><div><span className="text-[8px] font-bold tracking-[1.2px] text-[#84918a]">DINING ROOM</span><h2 className="mt-1 text-lg font-bold">Choose a table</h2></div><button onClick={()=>setFloorOpen(false)} className="grid size-7 place-items-center rounded-lg bg-[#f4f6f4] text-[#68776f]"><X size={16}/></button></div><div className="mb-3 mt-2 flex gap-3 text-[8px] text-[#84918a]"><span><i className="mr-1 inline-block size-2 rounded-full bg-[#74a984]"/>Available</span><span><i className="mr-1 inline-block size-2 rounded-full bg-[#e6b66f]"/>In service</span></div><div className="grid grid-cols-3 gap-2 sm:grid-cols-4">{['Table 01','Table 02','Table 03','Table 04','Table 05','Patio 01','Bar 01','Bar 02'].map((name,index)=>{const occupied=orders.some(order=>order.tableLabel===name&&['sent','preparing','ready'].includes(order.status));return <button key={name} disabled={occupied} onClick={()=>{setTable(name);setFloorOpen(false);}} className={`flex h-[83px] flex-col items-center justify-center rounded-xl border text-center ${name===table?'border-[#4b8a65] bg-[#edf6ef] text-[#28694f]':occupied?'cursor-not-allowed border-[#efe4d4] bg-[#fff9f0] text-[#aa875a]':'border-[#e7ece8] bg-[#fbfcfb] text-[#64736b] hover:border-[#a9c9b1]'}`}><LayoutGrid size={19}/><strong className="mt-2 text-[9px]">{name}</strong><small className="mt-0.5 text-[7px]">{occupied?'In service':`${index<5?2:4} seats`}</small></button>;})}</div><p className="mt-3 text-[8px] text-[#98a29d]">Occupied tables are locked in this prototype; order transfer and merge come later.</p></div></div>}
