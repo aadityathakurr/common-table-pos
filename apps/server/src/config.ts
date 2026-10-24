@@ -14,13 +14,13 @@ function integerSetting(name: string, developmentFallback: number): number {
 
 export const EDGE_CONFIG = Object.freeze({
   tenantId: setting('POS_TENANT_ID', 'tenant-common-table-demo'),
-  tenantName: setting('POS_TENANT_NAME', 'Common Table Demo'),
-  outletId: setting('POS_OUTLET_ID', 'outlet-juniper-cafe'),
-  outletName: setting('POS_OUTLET_NAME', 'Juniper Café'),
+  tenantName: setting('POS_TENANT_NAME', 'Indore Mithai House Demo'),
+  outletId: setting('POS_OUTLET_ID', 'outlet-vijay-nagar-demo'),
+  outletName: setting('POS_OUTLET_NAME', 'Vijay Nagar Demo Outlet'),
   terminalId: setting('POS_TERMINAL_ID', 'terminal-counter-01'),
   terminalName: setting('POS_TERMINAL_NAME', 'Counter 01'),
-  locationLabel: setting('POS_LOCATION_LABEL', 'Restaurant outlet'),
-  actorId: setting('POS_ACTOR_ID', 'staff-alex-rivera'),
+  locationLabel: setting('POS_LOCATION_LABEL', 'Vijay Nagar, Indore · Demo'),
+  actorId: setting('POS_ACTOR_ID', 'demo-owner'),
   timezone: setting('POS_TIMEZONE', 'Asia/Kolkata'),
   currency: setting('POS_CURRENCY', 'INR'),
   taxRateBps: integerSetting('POS_TAX_RATE_BPS', Number(process.env.DEMO_TAX_RATE_BPS ?? 500)),

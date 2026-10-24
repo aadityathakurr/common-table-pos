@@ -1,5 +1,6 @@
 import net, { type AddressInfo } from 'node:net';
 import type { KitchenOrder, OrderRecord } from '@common-table/contracts';
+import { EDGE_CONFIG } from './config.js';
 
 const ESC = 0x1b;
 const GS = 0x1d;
@@ -28,7 +29,7 @@ function readableReceipt(raw:Buffer):string{
 }
 
 export function formatKitchenTicket(order: KitchenOrder): Buffer {
-  const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text('JUNIPER CAFE\n'),command(ESC,0x45,0),
+  const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text(`${EDGE_CONFIG.tenantName}\n${EDGE_CONFIG.outletName}\n`),command(ESC,0x45,0),
     text('KITCHEN ORDER\n'),command(ESC,0x61,0),text(line('=')+'\n'),text(columns('ORDER',order.orderNumber)+'\n'),
     text(columns(order.orderType==='dine_in'?(order.tableLabel??'DINE IN'):'TAKEAWAY',new Date(order.createdAt).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}))+'\n'),text(line()+'\n')];
   for(const item of order.lines){parts.push(command(ESC,0x45,1),text(`${item.quantity} x ${item.name}\n`),command(ESC,0x45,0));for(const modifier of item.modifiers)parts.push(text(`    + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor)})`:''}\n`));for(const row of wrap(item.note??''))if(row)parts.push(text(`    ${row}\n`));}
@@ -38,8 +39,8 @@ export function formatKitchenTicket(order: KitchenOrder): Buffer {
 }
 
 export function formatReceipt(order: OrderRecord): Buffer {
-  const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text('JUNIPER CAFE\n'),command(ESC,0x45,0),
-    text('Vijay Nagar, Indore\n'),text(line('=')+'\n'),text(`INVOICE  ${order.invoiceNumber??'PENDING'}\n`),
+  const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text(`${EDGE_CONFIG.tenantName}\n${EDGE_CONFIG.outletName}\n`),command(ESC,0x45,0),
+    text(`${EDGE_CONFIG.locationLabel}\n`),text(line('=')+'\n'),text(`INVOICE  ${order.invoiceNumber??'PENDING'}\n`),
     text(`ORDER    ${order.orderNumber}\n`),text(`${new Date(order.createdAt).toLocaleString('en-IN')}\n`),
     text(`${order.orderType==='dine_in'?(order.tableLabel??'Dine in'):'Takeaway'} - ${order.guestCount} guest(s)\n`),text(line()+'\n')];
   for(const item of order.lines){parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor))+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor)})`:''}\n`));}

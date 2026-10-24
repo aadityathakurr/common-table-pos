@@ -2,7 +2,9 @@
 
 See [ROADMAP.md](ROADMAP.md) for the target architecture, delivery stages, and pilot acceptance checklist.
 
-A first vertical slice for a café/QSR counter: touch-first order entry, dine-in tables, takeaway, item modifiers, kitchen display, demo tender capture, offline order outbox, and an 80 mm ESC/POS mock printer.
+A first vertical slice for an Indian mithai-house/QSR counter: touch-first order entry, dine-in tables, takeaway, item modifiers, kitchen display, demo tender capture, offline order outbox, and an 80 mm ESC/POS mock printer. The fictional Indore Mithai House catalogue contains 43 vegetarian training items across breakfast, chaat, North Indian food, thalis, sweets, namkeen, cookies, and beverages.
+
+The catalogue is inspired by publicly listed Apna Sweets offerings and categories. Names and prices in the prototype are illustrative, some prices are estimates, and this is not an Apna Sweets account or a verified copy of its current menu. Confirm actual item, portion, price, tax, and outlet details before using it commercially.
 
 ## Requirements
 
@@ -36,7 +38,7 @@ The root `vercel.json` builds the monorepo and publishes `apps/web/dist`. It hos
 
 ## Prototype boundaries
 
-- The sample menu, staff, and tax are demo data. Outlet identity is configurable through environment settings. The `/admin` manager route creates tenants/outlets, staff invitations, and cloud terminal records; local edge staff authentication, terminal-key pairing, menu administration, retention, and cloud order sync still need implementation. Staff invite links are returned for the manager to share manually; no email is sent.
+- The menu, staff, and tax are demo data. Outlet identity is configurable through environment settings. The `/admin` manager route creates tenants/outlets, staff invitations, and cloud terminal records; local edge staff authentication, terminal-key pairing, managed menu administration, retention, and cloud order sync still need implementation. Staff invite links are returned for the manager to share manually; no staff invitation email is sent.
 - Demo cash/UPI/card tenders are records only. No payment provider is called.
 - Orders made while disconnected are stored in the browser's IndexedDB outbox and retried with the same command ID, preventing duplicate orders on server retries. Browser offline storage is per device/browser profile. Use the app once while connected before relying on the cached shell; across devices on a LAN, deploy with HTTPS.
 - SQLite is the outlet edge database. `db/migrations/0001_core.sql` is the initial PostgreSQL cloud schema direction; cloud replication and conflict resolution are not wired into this prototype.

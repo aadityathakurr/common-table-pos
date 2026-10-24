@@ -33,7 +33,7 @@ Vercel is a good home for the hosted web/control plane. The local edge process r
 
 **Progress:** the new Supabase project has 12 tenant/outlet/staff/terminal/setup/audit tables with RLS and scoped policies, two tracked migrations, no security-advisor findings, and no remaining unindexed-FK performance warnings. The React manager route supports Supabase email/password sign-up/sign-in, first tenant/outlet configuration, dining tables, kitchen stations, terminal enrollment, and staff invites through a JWT-verified Edge Function. Vercel's browser-safe project URL and publishable key are scoped to production only. The local edge uses `POS_*` configuration, request IDs and JSON logs, readiness/integrity checks, and a SQLite backup command.
 
-**Still open:** no manager account has been created or verified, so end-to-end RLS behavior has not yet been exercised with a real user. Terminal registration is cloud-side only; local terminal-key pairing and per-staff authorization at the edge are not implemented. Preview/development Supabase credentials are intentionally unset. Step 1 remains in progress until a manager signs in, configures an outlet, invites staff, and a terminal is paired to the local edge.
+**Still open:** owner email was supplied and the portal now offers passwordless sign-in, but the owner must open the Supabase email link before we can create/verify account-owned cloud rows under RLS. Terminal registration is cloud-side only; local terminal-key pairing and per-staff authorization at the edge are not implemented. Preview/development Supabase credentials are intentionally unset. Step 1 remains in progress until a manager signs in, configures an outlet, invites staff, and a terminal is paired to the local edge.
 
 **Done when:** a manager can create an outlet, invite staff with roles, enroll a terminal, and see only their authorized outlet data.
 
@@ -80,7 +80,7 @@ Vercel is a good home for the hosted web/control plane. The local edge process r
 
 ## Current baseline and known gaps
 
-The repo has a touch POS, demo menu/modifiers, dine-in/takeaway order creation, a basic KDS state update, demo tender recording, IndexedDB order outbox, local SQLite edge storage, WebSocket updates, and a mock ESC/POS TCP printer. The cloud foundation and manager onboarding exist, but there is no cloud order synchronization yet. Local edge staff authentication/role enforcement, managed menu administration, real payment processing, split/refund flows, shift management, production printer drivers, and operational monitoring are not implemented. Vercel serves the frontend and manager route; outlet operations still require the local edge service.
+The repo has a touch POS, a 43-item fictional Indore vegetarian demo menu, dine-in/takeaway order creation, a basic KDS state update, demo tender recording, IndexedDB order outbox, local SQLite edge storage, WebSocket updates, and a mock ESC/POS TCP printer. The cloud foundation and manager onboarding exist, but there is no cloud menu publishing or order synchronization yet. Local edge staff authentication/role enforcement, managed menu administration, real payment processing, split/refund flows, shift management, production printer drivers, and operational monitoring are not implemented. Vercel serves the frontend and manager route; outlet operations still require the local edge service.
 
 ## Pilot acceptance checklist
 

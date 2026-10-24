@@ -92,17 +92,64 @@ export interface ServerMessage {
   payload: KitchenOrder[] | KitchenOrder | { outletId: string };
 }
 
+function demoItem(id:string,name:string,category:string,rupees:number,emoji:string,color:string,kitchenStation='Sweets',tag?:string,modifiers:ModifierOption[]=[]):MenuItem{
+  return {id,name,category,priceMinor:rupees*100,emoji,color,...(tag?{tag}:{}),vegetarian:true,available:true,kitchenStation,modifiers};
+}
+
+const spiceChoices=(id:string):ModifierOption[]=>[
+  {id:`${id}-mild`,group:'Spice',name:'Mild',priceDeltaMinor:0},
+  {id:`${id}-medium`,group:'Spice',name:'Medium',priceDeltaMinor:0},
+  {id:`${id}-spicy`,group:'Spice',name:'Spicy',priceDeltaMinor:0},
+];
+
+// Fictional POS training catalogue inspired by common Indore mithai-house menus.
+// Prices are demonstrative estimates; this is not Apna Sweets' live menu.
 export const DEMO_MENU: MenuItem[] = [
-  {id:'flat-white',name:'Flat white',category:'Coffee',priceMinor:18000,emoji:'☕',color:'#efe4d4',tag:'BESTSELLER',vegetarian:true,available:true,kitchenStation:'Coffee',modifiers:[{id:'flat-white-size-regular',group:'Size',name:'Regular',priceDeltaMinor:0},{id:'flat-white-size-large',group:'Size',name:'Large',priceDeltaMinor:5000},{id:'flat-white-milk-dairy',group:'Milk',name:'Dairy',priceDeltaMinor:0},{id:'flat-white-milk-oat',group:'Milk',name:'Oat milk',priceDeltaMinor:2500},{id:'flat-white-milk-almond',group:'Milk',name:'Almond milk',priceDeltaMinor:3500}]},
-  {id:'iced-oat-latte',name:'Iced oat latte',category:'Coffee',priceMinor:22000,emoji:'🧋',color:'#e9e1d5',tag:'POPULAR',vegetarian:true,available:true,kitchenStation:'Coffee',modifiers:[{id:'latte-size-regular',group:'Size',name:'Regular',priceDeltaMinor:0},{id:'latte-size-large',group:'Size',name:'Large',priceDeltaMinor:5000},{id:'latte-milk-oat',group:'Milk',name:'Oat milk',priceDeltaMinor:0},{id:'latte-milk-dairy',group:'Milk',name:'Dairy',priceDeltaMinor:0},{id:'latte-milk-almond',group:'Milk',name:'Almond milk',priceDeltaMinor:3500}]},
-  {id:'masala-chai',name:'Masala chai',category:'Coffee',priceMinor:11000,emoji:'🍵',color:'#f2e6d3',vegetarian:true,available:true,kitchenStation:'Coffee',modifiers:[{id:'chai-size-regular',group:'Size',name:'Regular',priceDeltaMinor:0},{id:'chai-size-large',group:'Size',name:'Large',priceDeltaMinor:3000},{id:'chai-sugar-normal',group:'Sugar',name:'Regular sugar',priceDeltaMinor:0},{id:'chai-sugar-less',group:'Sugar',name:'Less sugar',priceDeltaMinor:0},{id:'chai-sugar-none',group:'Sugar',name:'No sugar',priceDeltaMinor:0}]},
-  {id:'cold-brew',name:'Cold brew',category:'Coffee',priceMinor:19500,emoji:'🥤',color:'#e4e0d8',vegetarian:true,available:true,kitchenStation:'Coffee',modifiers:[{id:'coldbrew-size-regular',group:'Size',name:'Regular',priceDeltaMinor:0},{id:'coldbrew-size-large',group:'Size',name:'Large',priceDeltaMinor:5000}]},
-  {id:'avocado-toast',name:'Avocado toast',category:'Brunch',priceMinor:31000,emoji:'🥑',color:'#e5eddc',tag:'POPULAR',vegetarian:true,available:true,kitchenStation:'Hot kitchen',modifiers:[{id:'toast-add-egg',group:'Add-on',name:'Add poached egg',priceDeltaMinor:7000},{id:'toast-add-avocado',group:'Add-on',name:'Extra avocado',priceDeltaMinor:8000}]},
-  {id:'mushroom-melt',name:'Mushroom melt',category:'Brunch',priceMinor:28500,emoji:'🥪',color:'#f2e3ce',vegetarian:true,available:true,kitchenStation:'Hot kitchen',modifiers:[{id:'melt-add-cheese',group:'Add-on',name:'Extra cheese',priceDeltaMinor:5000},{id:'melt-add-fries',group:'Add-on',name:'Side of fries',priceDeltaMinor:7000}]},
-  {id:'paneer-wrap',name:'Paneer tikka wrap',category:'Brunch',priceMinor:26000,emoji:'🌯',color:'#f4e4d3',tag:'CHEF PICK',vegetarian:true,available:true,kitchenStation:'Hot kitchen',modifiers:[{id:'wrap-spice-mild',group:'Spice',name:'Mild',priceDeltaMinor:0},{id:'wrap-spice-medium',group:'Spice',name:'Medium',priceDeltaMinor:0},{id:'wrap-spice-hot',group:'Spice',name:'Hot',priceDeltaMinor:0}]},
-  {id:'eggs-toast',name:'Eggs on toast',category:'Brunch',priceMinor:27500,emoji:'🍳',color:'#efe5ce',vegetarian:false,available:true,kitchenStation:'Hot kitchen',modifiers:[{id:'eggs-style-poached',group:'Egg style',name:'Poached',priceDeltaMinor:0},{id:'eggs-style-scrambled',group:'Egg style',name:'Scrambled',priceDeltaMinor:0},{id:'eggs-style-fried',group:'Egg style',name:'Fried',priceDeltaMinor:0}]},
-  {id:'blueberry-pancakes',name:'Blueberry pancakes',category:'Bakery',priceMinor:29000,emoji:'🥞',color:'#f0e2e2',vegetarian:true,available:true,kitchenStation:'Hot kitchen',modifiers:[{id:'pancake-add-cream',group:'Add-on',name:'Whipped cream',priceDeltaMinor:4000}]},
-  {id:'butter-croissant',name:'Butter croissant',category:'Bakery',priceMinor:14500,emoji:'🥐',color:'#f1e2cc',tag:'FRESH',vegetarian:true,available:true,kitchenStation:'Bakery',modifiers:[{id:'croissant-warm',group:'Preparation',name:'Warm it up',priceDeltaMinor:0}]},
-  {id:'chocolate-brownie',name:'Chocolate brownie',category:'Bakery',priceMinor:16000,emoji:'🍰',color:'#eadfd9',vegetarian:true,available:true,kitchenStation:'Bakery',modifiers:[{id:'brownie-icecream',group:'Add-on',name:'Vanilla ice cream',priceDeltaMinor:6000}]},
-  {id:'fruit-bowl',name:'Seasonal fruit bowl',category:'Bakery',priceMinor:21000,emoji:'🍓',color:'#f2e2e0',vegetarian:true,available:true,kitchenStation:'Cold prep',modifiers:[]},
+  demoItem('indori-poha','Indori Poha','Breakfast',70,'🍋','#f5ecd5','Hot kitchen','POPULAR'),
+  demoItem('poha-jalebi-combo','Poha with Kesariya Jalebi','Breakfast',99,'🍋','#f5ecd5','Hot kitchen','COMBO'),
+  demoItem('dal-kachori','Dal Kachori','Breakfast',45,'🥟','#f0e3cf','Hot kitchen'),
+  demoItem('aloo-pyaz-kachori','Aloo Pyaz Kachori','Breakfast',35,'🥟','#f0e3cf','Hot kitchen'),
+  demoItem('samosa','Samosa','Breakfast',25,'🔺','#f3e3cd'),
+  demoItem('kesariya-jalebi','Kesariya Jalebi · 100 g','Breakfast',55,'🍯','#f6e7c7','Sweets','POPULAR'),
+  demoItem('sabudana-khichdi','Sabudana Khichdi','Breakfast',110,'🥣','#f1eadb','Hot kitchen'),
+  demoItem('sabudana-bada-dahi','Sabudana Bada with Dahi','Breakfast',65,'🥣','#f1eadb','Hot kitchen'),
+  demoItem('sada-khaman','Sada Khaman · 100 g','Breakfast',38,'🟨','#f4edcf','Sweets'),
+  demoItem('dahi-kachori','Dahi Kachori','Chaat & Snacks',55,'🥣','#f0e5d8','Chaat counter'),
+  demoItem('fruit-chaat','Fresh Fruit Chaat','Chaat & Snacks',95,'🍎','#f1e7db','Chaat counter'),
+  demoItem('pani-puri','Pani Puri · 6 pcs','Chaat & Snacks',70,'🟠','#f2e1cf','Chaat counter'),
+  demoItem('sev-puri','Indori Sev Puri','Chaat & Snacks',85,'🍽️','#f4e8d6','Chaat counter'),
+  demoItem('pav-bhaji','Pav Bhaji · 2 pav','Chaat & Snacks',143,'🍛','#f3e5d1','Hot kitchen','POPULAR',spiceChoices('pav-bhaji')),
+  demoItem('chole-bhature','Chole Bhature · 2 bhature','North Indian',238,'🍛','#f0e3d0','Hot kitchen','POPULAR',spiceChoices('chole-bhature')),
+  demoItem('paneer-tikka','Paneer Tikka · 8 pcs','North Indian',286,'🧀','#f1e2d2','Tandoor','POPULAR',spiceChoices('paneer-tikka')),
+  demoItem('paneer-65','Paneer 65','North Indian',220,'🧀','#f3e3d3','Hot kitchen','POPULAR',spiceChoices('paneer-65')),
+  demoItem('dal-makhani','Dal Makhani','North Indian',250,'🥘','#eee3d4','Hot kitchen'),
+  demoItem('butter-paneer-masala','Butter Paneer Masala','North Indian',210,'🥘','#f0e1d3','Hot kitchen',undefined,spiceChoices('butter-paneer')),
+  demoItem('veg-thali','Veg Thali','Thalis',219,'🍱','#eee5d8','Hot kitchen','POPULAR'),
+  demoItem('special-thali','Special Bhojan Thali','Thalis',279,'🍱','#eee5d8','Hot kitchen','COMBO'),
+  demoItem('dal-rice-bowl','Dal Rice Bowl','Thalis',149,'🍚','#f3eadc','Hot kitchen'),
+  demoItem('gulab-jamun','Gulab Jamun · 2 pcs','Mawa & Milk Sweets',66,'🍮','#f0dfd3','Sweets','POPULAR'),
+  demoItem('rasgulla','Rasgulla · 2 pcs','Bengali Sweets',36,'⚪','#f2eee5','Sweets','POPULAR'),
+  demoItem('rasmalai','Rasmalai · 2 pcs','Bengali Sweets',90,'🥛','#f2ece1','Sweets'),
+  demoItem('milk-cake','Milk Cake · 250 g','Mawa & Milk Sweets',150,'🍰','#f0e4d8','Sweets'),
+  demoItem('kala-jamun','Kala Jamun · 2 pcs','Mawa & Milk Sweets',70,'🍮','#eadbd2','Sweets'),
+  demoItem('sohan-halwa','Sohan Halwa · 250 g','Desi Ghee Sweets',155,'🟫','#eee0d0','Sweets'),
+  demoItem('besan-laddu','Besan Laddu · 250 g','Desi Ghee Sweets',170,'🟡','#f1e7ce','Sweets'),
+  demoItem('kaju-katli','Kaju Katli · 250 g','Dry Fruit Sweets',250,'💎','#eee6d4','Sweets','POPULAR'),
+  demoItem('dry-fruit-laddu','Rose Dry Fruit Laddu · 250 g','Dry Fruit Sweets',310,'🟤','#ecdfd3','Sweets'),
+  demoItem('kaju-kachori-sweet','Kaju Kachori · 250 g','Dry Fruit Sweets',317,'🥮','#eee1d1','Sweets'),
+  demoItem('mixed-sweet-box','Assorted Mithai Box · 500 g','Gift Boxes',420,'🎁','#f2e4d5','Sweets','GIFT'),
+  demoItem('namkeen-mixture','Indori Namkeen Mixture · 250 g','Namkeen & Dry Snacks',95,'🥜','#f2e3ce','Sweets'),
+  demoItem('ratlami-sev','Ratlami Sev · 250 g','Namkeen & Dry Snacks',110,'🥨','#f3e5d3','Sweets','POPULAR'),
+  demoItem('masala-peanuts','Masala Peanuts · 200 g','Namkeen & Dry Snacks',85,'🥜','#ecdfd1','Sweets'),
+  demoItem('atta-nankhatai','Atta Nankhatai · 250 g','Cookies & Bakery',98,'🍪','#f0e2cd','Bakery'),
+  demoItem('oats-cookies','Oats Cookies · 250 g','Cookies & Bakery',102,'🍪','#f0e2cd','Bakery'),
+  demoItem('kesar-pista-cookies','Kesar Pista Cookies · 250 g','Cookies & Bakery',100,'🍪','#f0e2cd','Bakery'),
+  demoItem('masala-chai','Masala Chai','Beverages',35,'🍵','#f2e6d3','Beverages','POPULAR',[
+    {id:'chai-regular-sugar',group:'Sugar',name:'Regular sugar',priceDeltaMinor:0},
+    {id:'chai-less-sugar',group:'Sugar',name:'Less sugar',priceDeltaMinor:0},
+    {id:'chai-no-sugar',group:'Sugar',name:'No sugar',priceDeltaMinor:0},
+  ]),
+  demoItem('lassi','Sweet Lassi','Beverages',80,'🥛','#eee6d8','Beverages'),
+  demoItem('masala-chaas','Masala Chaas','Beverages',55,'🥛','#e9e8d9','Beverages'),
+  demoItem('mango-shake','Mango Shake','Beverages',110,'🥭','#f2e6ce','Beverages'),
 ];
