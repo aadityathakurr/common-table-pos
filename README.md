@@ -25,6 +25,10 @@ npm start
 
 When `apps/web/dist` exists, Express serves the client and API on port 3001. Set `PORT`, `POS_DATABASE_PATH`, `MOCK_PRINTER_HOST`, `MOCK_PRINTER_PORT`, or `DEMO_TAX_RATE_BPS` to configure the local process. Relative `POS_DATABASE_PATH` values resolve from `apps/server`. The default tax rate is a demo value, not a tax configuration for a real outlet.
 
+## Vercel preview
+
+The root `vercel.json` builds the monorepo and publishes `apps/web/dist` as a frontend preview. It does not deploy the local Express edge server: Vercel does not provide this prototype's durable SQLite WAL database or raw TCP printer socket. On the hosted preview, orders fall back to the current browser's IndexedDB outbox and are not shared with the local edge server or other devices. Payments and live KDS synchronization require the edge API. Use `npm run dev` or `npm run build && npm start` for the complete local prototype; use Vercel as a UI preview until a cloud API and database are implemented.
+
 ## Prototype boundaries
 
 - The sample outlet, menu, staff, and tax are demo seed data. Tenant/outlet IDs and authorization are hardcoded; production requires authentication, role permissions, device enrollment, outlet configuration, backups, monitoring, and data-retention policy.
