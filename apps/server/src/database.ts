@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { DEMO_MENU } from '@common-table/contracts';
+import { EDGE_CONFIG } from './config.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const databasePath = resolve(process.env.POS_DATABASE_PATH ?? '.data/common-table.db');
@@ -16,16 +17,18 @@ db.pragma('foreign_keys = ON');
 db.pragma('busy_timeout = 5000');
 db.exec(readFileSync(resolve(here, 'schema.sql'), 'utf8'));
 
-export const DEMO_TENANT = 'tenant-common-table-demo';
-export const DEMO_OUTLET = 'outlet-juniper-cafe';
-export const DEMO_TERMINAL = 'terminal-counter-01';
-export const DEMO_ACTOR = 'staff-alex-rivera';
-export const DEMO_TAX_RATE_BPS = Math.max(0, Number(process.env.DEMO_TAX_RATE_BPS ?? 500));
+export const DEMO_TENANT = EDGE_CONFIG.tenantId;
+export const DEMO_OUTLET = EDGE_CONFIG.outletId;
+export const DEMO_TERMINAL = EDGE_CONFIG.terminalId;
+export const DEMO_ACTOR = EDGE_CONFIG.actorId;
+export const DEMO_TAX_RATE_BPS = EDGE_CONFIG.taxRateBps;
 
 const seed = db.transaction(() => {
-  db.prepare('INSERT OR IGNORE INTO tenants(id,name) VALUES(?,?)').run(DEMO_TENANT, 'Common Table Demo');
-  db.prepare('INSERT OR IGNORE INTO outlets(id,tenant_id,name) VALUES(?,?,?)').run(DEMO_OUTLET, DEMO_TENANT, 'Juniper Café');
-  db.prepare('INSERT OR IGNORE INTO terminals(id,tenant_id,outlet_id,name) VALUES(?,?,?,?)').run(DEMO_TERMINAL, DEMO_TENANT, DEMO_OUTLET, 'Counter 01');
+  db.prepare('INSERT OR IGNORE INTO tenants(id,name) VALUES(?,?)').run(DEMO_TENANT, EDGE_CONFIG.tenantName);
+  db.prepare('INSERT OR IGNORE INTO outlets(id,tenant_id,name,timezone,currency) VALUES(?,?,?,?,?)')
+    .run(DEMO_OUTLET, DEMO_TENANT, EDGE_CONFIG.outletName, EDGE_CONFIG.timezone, EDGE_CONFIG.currency);
+  db.prepare('INSERT OR IGNORE INTO terminals(id,tenant_id,outlet_id,name) VALUES(?,?,?,?)')
+    .run(DEMO_TERMINAL, DEMO_TENANT, DEMO_OUTLET, EDGE_CONFIG.terminalName);
   const insert = db.prepare(`INSERT OR IGNORE INTO menu_items
     (id,tenant_id,outlet_id,name,category,price_minor,emoji,color,tag,vegetarian,available,kitchen_station)
     VALUES(@id,@tenantId,@outletId,@name,@category,@priceMinor,@emoji,@color,@tag,@vegetarian,@available,@kitchenStation)`);

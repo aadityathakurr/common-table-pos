@@ -7,6 +7,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CreateOrderCommand, KitchenOrder, OrderLine, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage } from '@common-table/contracts';
 import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TAX_RATE_BPS, DEMO_TENANT, DEMO_TERMINAL } from './database.js';
+import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
 import { formatKitchenTicket, formatReceipt, sendToMockPrinter, startMockPrinter } from './printer.js';
 
 const app=express();
@@ -15,6 +16,17 @@ const wss=new WebSocketServer({noServer:true});
 const port=Number(process.env.PORT??3001);
 app.disable('x-powered-by');
 app.use(express.json({limit:'128kb'}));
+app.use((req,res,next)=>{
+  const supplied=req.header('x-request-id');
+  const requestId=supplied&&/^[A-Za-z0-9._-]{8,80}$/.test(supplied)?supplied:randomUUID();
+  const startedAt=performance.now();
+  res.setHeader('x-request-id',requestId);
+  res.on('finish',()=>console.log(JSON.stringify({
+    level:res.statusCode>=500?'error':'info',event:'http.request',requestId,method:req.method,
+    path:req.path,status:res.statusCode,durationMs:Math.round(performance.now()-startedAt),
+  })));
+  next();
+});
 
 function fail(res:Response,status:number,message:string){return res.status(status).json({error:message});}
 function publish(type:ServerMessage['type'],payload:ServerMessage['payload']){
@@ -101,6 +113,23 @@ function createOrder(command:CreateOrderCommand):{order:OrderRecord;duplicate:bo
 }
 
 app.get('/api/health',(_req,res)=>res.json({status:'ok',service:'common-table-edge',outletId:DEMO_OUTLET,taxRateBps:DEMO_TAX_RATE_BPS,printer:{host:process.env.MOCK_PRINTER_HOST??'127.0.0.1',port:Number(process.env.MOCK_PRINTER_PORT??9100)}}));
+app.get('/api/context',(_req,res)=>res.json({
+  tenantId:DEMO_TENANT,tenantName:EDGE_CONFIG.tenantName,outletId:DEMO_OUTLET,outletName:EDGE_CONFIG.outletName,
+  terminalId:DEMO_TERMINAL,terminalName:EDGE_CONFIG.terminalName,locationLabel:EDGE_CONFIG.locationLabel,
+  currency:EDGE_CONFIG.currency,taxRateBps:DEMO_TAX_RATE_BPS,
+}));
+app.get('/api/ready',(_req,res)=>{
+  try{
+    checkEdgeConfiguration();
+    const databaseCheck=db.prepare('PRAGMA quick_check').get() as {quick_check?:string};
+    if(databaseCheck.quick_check!=='ok')return res.status(503).json({status:'not_ready',checks:{database:'failed',configuration:'ok'}});
+    db.prepare('SELECT 1').get();
+    return res.json({status:'ready',checks:{database:'ok',configuration:'ok'}});
+  }catch(error){
+    console.error(JSON.stringify({level:'error',event:'readiness.failed',reason:error instanceof Error?error.message:'unknown'}));
+    return res.status(503).json({status:'not_ready',checks:{database:'unknown',configuration:'failed'}});
+  }
+});
 app.get('/api/menu',(_req,res)=>{
   const rows=db.prepare('SELECT id,name,category,price_minor AS priceMinor,emoji,color,tag,vegetarian,available,kitchen_station AS kitchenStation FROM menu_items WHERE tenant_id=? AND outlet_id=? AND available=1 ORDER BY rowid')
     .all(DEMO_TENANT,DEMO_OUTLET) as Array<Record<string,unknown>>;

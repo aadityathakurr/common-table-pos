@@ -15,20 +15,25 @@ Vercel is a good home for the hosted web/control plane. The local edge process r
 
 ## Roadmap
 
-### 0. Pilot definition and architecture (in progress)
+### 0. Pilot definition and architecture (complete)
 
-- Lock the first outlet type and devices: cafe/QSR, dine-in + takeaway, browser on tablets/laptops.
-- Document offline-first boundary, data ownership, and rollout stages.
-- Choose hosted Postgres/auth provider and payment terminal/provider before wiring credentials or real payments.
+- First outlet: Indian cafe/QSR with dine-in and takeaway; devices: browser on tablets and laptops.
+- Orders must be accepted locally during internet outages and sync later; the outlet edge owns local order acceptance, KDS, numbering, and printer access.
+- Hosting: Vercel for the hosted web/control plane; Supabase for cloud Postgres and Auth; SQLite remains the outlet database.
+- Live payment processing is deferred until phase 3, when the pilot's payment terminal/provider is selected.
 
-**Done when:** pilot scope and deployment boundaries are agreed; providers are selected before credentials or production data are introduced.
+**Complete:** pilot scope, offline boundary, and providers are agreed. A dedicated Supabase project (`common-table-pos`) is active in Mumbai (the creation quote was $0); the unrelated split-bill project remains untouched.
 
-### 1. Production foundation
+### 1. Production foundation (in progress)
 
 - Add real sign-in, tenant/outlet membership, role permissions, staff identities, and terminal enrollment. Remove hardcoded demo identity from request handling.
 - Add migrations and configuration for both local SQLite and cloud Postgres; make tenant/outlet scoping mandatory in repository operations.
 - Add outlet setup: timezone, currency, tax configuration, receipt identity, dining areas/tables, and kitchen stations.
 - Add secrets handling, structured logs, request IDs, health/readiness checks, backup/restore notes, and development/staging/production environments.
+
+**Progress:** the new Supabase project has 12 tenant/outlet/staff/terminal/setup/audit tables with RLS and scoped policies, two tracked migrations, no security-advisor findings, and no remaining unindexed-FK performance warnings. The React manager route supports Supabase email/password sign-up/sign-in, first tenant/outlet configuration, dining tables, kitchen stations, terminal enrollment, and staff invites through a JWT-verified Edge Function. Vercel's browser-safe project URL and publishable key are scoped to production only. The local edge uses `POS_*` configuration, request IDs and JSON logs, readiness/integrity checks, and a SQLite backup command.
+
+**Still open:** no manager account has been created or verified, so end-to-end RLS behavior has not yet been exercised with a real user. Terminal registration is cloud-side only; local terminal-key pairing and per-staff authorization at the edge are not implemented. Preview/development Supabase credentials are intentionally unset. Step 1 remains in progress until a manager signs in, configures an outlet, invites staff, and a terminal is paired to the local edge.
 
 **Done when:** a manager can create an outlet, invite staff with roles, enroll a terminal, and see only their authorized outlet data.
 
@@ -66,16 +71,16 @@ Vercel is a good home for the hosted web/control plane. The local edge process r
 
 ## Immediate build sequence
 
-1. Select cloud database and identity providers; confirm whether the first pilot should run local-only first or launch with cloud sync from day one.
-2. Complete tenant/outlet/staff/terminal data boundaries and authentication before exposing manager operations to a network.
-3. Implement outlet setup and managed menu data, replacing demo constants with persisted configuration.
+1. (Done) Create a dedicated Supabase POS project; configure Vercel's public client settings without exposing privileged keys.
+2. (Foundation done) Establish tenant/outlet/staff/terminal data boundaries and authentication before exposing manager operations to a network; finish real-user verification and edge pairing.
+3. Implement managed menu data and connect the cashier UI to persisted outlet configuration.
 4. Add shift lifecycle and auditable order edits/voids.
 5. Build sync protocol and cloud acknowledgements, then deploy the web/control plane to Vercel and run the edge service at the outlet.
 6. Validate payment, tax, and printer choices against the pilot's actual hardware and accounting needs.
 
 ## Current baseline and known gaps
 
-The repo has a touch POS, demo menu/modifiers, dine-in/takeaway order creation, a basic KDS state update, demo tender recording, IndexedDB order outbox, local SQLite edge storage, WebSocket updates, and a mock ESC/POS TCP printer. A PostgreSQL schema draft exists. Authentication, role enforcement, menu administration, real payment processing, split/refund flows, shift management, cloud persistence/sync, production printer drivers, and operational monitoring are not implemented. The Vercel configuration currently serves a frontend preview only.
+The repo has a touch POS, demo menu/modifiers, dine-in/takeaway order creation, a basic KDS state update, demo tender recording, IndexedDB order outbox, local SQLite edge storage, WebSocket updates, and a mock ESC/POS TCP printer. The cloud foundation and manager onboarding exist, but there is no cloud order synchronization yet. Local edge staff authentication/role enforcement, managed menu administration, real payment processing, split/refund flows, shift management, production printer drivers, and operational monitoring are not implemented. Vercel serves the frontend and manager route; outlet operations still require the local edge service.
 
 ## Pilot acceptance checklist
 
