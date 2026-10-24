@@ -1,5 +1,7 @@
 # Common Table POS prototype
 
+See [ROADMAP.md](ROADMAP.md) for the target architecture, delivery stages, and pilot acceptance checklist.
+
 A first vertical slice for a café/QSR counter: touch-first order entry, dine-in tables, takeaway, item modifiers, kitchen display, demo tender capture, offline order outbox, and an 80 mm ESC/POS mock printer.
 
 ## Requirements
