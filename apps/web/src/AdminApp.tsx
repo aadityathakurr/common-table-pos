@@ -112,7 +112,10 @@ export default function AdminApp() {
       if (authMode === 'signup') {
         const { data, error: authError } = await supabase.auth.signUp({
           email: form.email.trim(), password: form.password,
-          options: { data: { display_name: form.displayName.trim() } },
+          options: {
+            emailRedirectTo: `${window.location.origin}/admin`,
+            data: { display_name: form.displayName.trim() },
+          },
         });
         if (authError) throw authError;
         if (data.session) { setUser(data.user); setNotice('Your account is ready. Set up your first outlet below.'); }
