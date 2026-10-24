@@ -3,7 +3,8 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { CreateOrderCommand, KitchenOrder, OrderLine, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage } from '@common-table/contracts';
 import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TAX_RATE_BPS, DEMO_TENANT, DEMO_TERMINAL } from './database.js';
 import { formatKitchenTicket, formatReceipt, sendToMockPrinter, startMockPrinter } from './printer.js';
@@ -99,7 +100,7 @@ function createOrder(command:CreateOrderCommand):{order:OrderRecord;duplicate:bo
   return {order,duplicate:false};
 }
 
-app.get('/api/health',(_req,res)=>res.json({status:'ok',service:'common-table-edge',outletId:DEMO_OUTLET,printer:{host:process.env.MOCK_PRINTER_HOST??'127.0.0.1',port:Number(process.env.MOCK_PRINTER_PORT??9100)}}));
+app.get('/api/health',(_req,res)=>res.json({status:'ok',service:'common-table-edge',outletId:DEMO_OUTLET,taxRateBps:DEMO_TAX_RATE_BPS,printer:{host:process.env.MOCK_PRINTER_HOST??'127.0.0.1',port:Number(process.env.MOCK_PRINTER_PORT??9100)}}));
 app.get('/api/menu',(_req,res)=>{
   const rows=db.prepare('SELECT id,name,category,price_minor AS priceMinor,emoji,color,tag,vegetarian,available,kitchen_station AS kitchenStation FROM menu_items WHERE tenant_id=? AND outlet_id=? AND available=1 ORDER BY rowid')
     .all(DEMO_TENANT,DEMO_OUTLET) as Array<Record<string,unknown>>;
@@ -163,7 +164,7 @@ app.post('/api/printer/test',(_req,res)=>{
   void sendToMockPrinter(formatKitchenTicket(sample)).catch(()=>undefined);
   return res.json({status:'queued',host:process.env.MOCK_PRINTER_HOST??'127.0.0.1',port:Number(process.env.MOCK_PRINTER_PORT??9100)});
 });
-const webDist=resolve(process.cwd(),'apps/web/dist');
+const webDist=resolve(dirname(fileURLToPath(import.meta.url)),'../../web/dist');
 if(existsSync(webDist)){
   app.use(express.static(webDist,{index:false}));
   app.get(/^(?!\/api(?:\/|$)|\/socket(?:\/|$)).*/,(_req,res)=>res.sendFile(resolve(webDist,'index.html')));

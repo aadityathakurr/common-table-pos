@@ -61,6 +61,7 @@ export function sendToMockPrinter(payload: Buffer): Promise<void> {
   return new Promise((resolve,reject)=>{
     const socket=net.createConnection({host:printerHost,port:printerPort});
     socket.setTimeout(2500);
+    socket.on('data',()=>undefined);
     socket.once('connect',()=>{socket.end(payload);});
     socket.once('end',resolve);
     socket.once('error',reject);

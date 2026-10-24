@@ -14,7 +14,7 @@ npm install
 npm run dev
 ```
 
-Vite serves the web client on port 5173 and proxies API/WebSocket traffic to the edge server on port 3001. The server creates `.data/common-table.db` in SQLite WAL mode and starts its mock ESC/POS TCP listener on `127.0.0.1:9100`.
+Vite serves the web client on port 5173 and proxies API/WebSocket traffic to the edge server on port 3001. From the server workspace, the edge server creates `apps/server/.data/common-table.db` in SQLite WAL mode and starts its mock ESC/POS TCP listener on `127.0.0.1:9100`.
 
 ## Build and run as one edge process
 
@@ -23,7 +23,7 @@ npm run build
 npm start
 ```
 
-When `apps/web/dist` exists, Express serves the client and API on port 3001. Set `PORT`, `POS_DATABASE_PATH`, `MOCK_PRINTER_HOST`, `MOCK_PRINTER_PORT`, or `DEMO_TAX_RATE_BPS` to configure the local process. The default tax rate is a demo value, not a tax configuration for a real outlet.
+When `apps/web/dist` exists, Express serves the client and API on port 3001. Set `PORT`, `POS_DATABASE_PATH`, `MOCK_PRINTER_HOST`, `MOCK_PRINTER_PORT`, or `DEMO_TAX_RATE_BPS` to configure the local process. Relative `POS_DATABASE_PATH` values resolve from `apps/server`. The default tax rate is a demo value, not a tax configuration for a real outlet.
 
 ## Prototype boundaries
 
