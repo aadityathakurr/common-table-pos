@@ -6,12 +6,12 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AddOrderLinesCommand, CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderLineDraft, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
-import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, enqueueSyncEvent, syncOutboxStatus } from './database.js';
+import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, enqueueSyncEvent, localInventoryBalances, recordPaidOrderInventoryConsumption, syncOutboxStatus } from './database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
 import { formatKitchenTicket, formatReceipt, printerStatus, sendToPrinter, startPrinterAdapter } from './printer.js';
 import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from './reports.js';
 import { getSyncStatus, startSyncWorker } from './sync.js';
-import { clearedSessionCookie, createStaffSession, currentStaff, readStaffSession, readStaffSessionCookie, requireRoles, sessionCookie, sessionMiddleware, StaffAuthError } from './auth.js';
+import { clearedSessionCookie, createStaffSession, currentStaff, readStaffSession, readStaffSessionCookie, refreshStaffSession, requireRoles, sessionCookie, sessionMiddleware, StaffAuthError } from './auth.js';
 
 const app=express();
 const httpServer=createServer(app);
@@ -245,6 +245,8 @@ app.get('/api/auth/session',(req,res)=>{
     res.setHeader('Set-Cookie',sessionCookie(session,EDGE_CONFIG.secureSessionCookie));
   }
   if(!session)return fail(res,401,'Sign in to this outlet before continuing.');
+  const refreshed=refreshStaffSession(session);
+  if(refreshed!==session){session=refreshed;res.setHeader('Set-Cookie',sessionCookie(session,EDGE_CONFIG.secureSessionCookie));}
   return res.json({userId:session.userId,email:session.email,displayName:session.displayName,role:session.role,tenantId:session.tenantId,outletId:session.outletId,expiresAt:session.expiresAt});
 });
 app.post('/api/auth/session',async(req,res)=>{
@@ -283,6 +285,7 @@ app.get('/api/menu',requireRoles('owner','manager','cashier','kitchen','viewer')
     .all(DEMO_TENANT,DEMO_OUTLET) as Array<Record<string,unknown>>;
   res.json(rows.map(row=>({...row,priceMinor:Number(row.priceMinor),vegetarian:Boolean(row.vegetarian),available:Boolean(row.available),modifiers:modifiers.filter(modifier=>modifier.menuItemId===row.id).map(({menuItemId,...modifier})=>({...modifier,priceDeltaMinor:Number(modifier.priceDeltaMinor)}))})));
 });
+app.get('/api/inventory',requireRoles('owner','manager'),(_req,res)=>res.json(localInventoryBalances().map(item=>({...item,active:Boolean(item.active),lowStock:Boolean(item.lowStock)}))));
 app.get('/api/kitchen',requireRoles('owner','manager','kitchen'),(_req,res)=>res.json(kitchenSnapshot()));
 app.get('/api/reports/daily',requireRoles('owner','manager','viewer'),(req,res)=>{
   const date=typeof req.query.date==='string'?req.query.date:localBusinessDate();
@@ -576,6 +579,7 @@ app.post('/api/orders/:orderId/payment',requireRoles('owner','manager','cashier'
         shiftId:body.shiftId,method:payment.method,amountMinor:payment.amountMinor,status:'succeeded',invoiceNumber,createdAt:timestamp,
         tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,terminalId:DEMO_TERMINAL},timestamp);
     });
+    recordPaidOrderInventoryConsumption(before.id,before.orderNumber,currentStaff(res).userId,timestamp);
     const singleMethod=payments.every(payment=>payment.method===payments[0]?.method)?payments[0]?.method:null;
     db.prepare('UPDATE orders SET status=\'paid\',payment_method=?,invoice_number=?,updated_at=? WHERE id=?').run(singleMethod,invoiceNumber,timestamp,before.id);
     audit('order',before.id,'order.payment_recorded',null,{payments:payments.map(({method,amountMinor})=>({method,amountMinor})),invoiceNumber,amountMinor:before.totalMinor,shiftId:body.shiftId},currentStaff(res).userId);

@@ -31,6 +31,27 @@ CREATE TABLE IF NOT EXISTS menu_modifiers (
   UNIQUE(tenant_id,outlet_id,id)
 );
 CREATE INDEX IF NOT EXISTS modifiers_by_item ON menu_modifiers(tenant_id,outlet_id,menu_item_id,group_name,sort_order);
+CREATE TABLE IF NOT EXISTS edge_inventory_items (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, name TEXT NOT NULL,
+  unit TEXT NOT NULL, reorder_level REAL NOT NULL, active INTEGER NOT NULL CHECK(active IN (0,1)),
+  cloud_on_hand REAL NOT NULL, updated_at TEXT NOT NULL,
+  FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id), UNIQUE(tenant_id,outlet_id,id)
+);
+CREATE TABLE IF NOT EXISTS edge_inventory_recipes (
+  tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, menu_item_id TEXT NOT NULL, inventory_item_id TEXT NOT NULL,
+  quantity_per_sale REAL NOT NULL CHECK(quantity_per_sale > 0),
+  PRIMARY KEY(tenant_id,outlet_id,menu_item_id,inventory_item_id),
+  FOREIGN KEY(tenant_id,outlet_id,menu_item_id) REFERENCES menu_items(tenant_id,outlet_id,id),
+  FOREIGN KEY(tenant_id,outlet_id,inventory_item_id) REFERENCES edge_inventory_items(tenant_id,outlet_id,id)
+);
+CREATE INDEX IF NOT EXISTS edge_inventory_recipes_by_item ON edge_inventory_recipes(tenant_id,outlet_id,inventory_item_id);
+CREATE TABLE IF NOT EXISTS edge_inventory_movements (
+  id TEXT PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, command_id TEXT NOT NULL UNIQUE,
+  tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, inventory_item_id TEXT NOT NULL, order_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL, quantity REAL NOT NULL CHECK(quantity > 0), quantity_delta REAL NOT NULL CHECK(quantity_delta = -quantity),
+  reason TEXT NOT NULL, occurred_at TEXT NOT NULL, synced INTEGER NOT NULL DEFAULT 0 CHECK(synced IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS edge_inventory_movements_by_item ON edge_inventory_movements(tenant_id,outlet_id,inventory_item_id,occurred_at DESC);
 CREATE TABLE IF NOT EXISTS menu_sync_state (
   tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, version TEXT NOT NULL,
   last_synced_at TEXT NOT NULL, last_error TEXT,
@@ -149,7 +170,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE TABLE IF NOT EXISTS sync_outbox (
   outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id TEXT NOT NULL UNIQUE,
-  entity_type TEXT NOT NULL CHECK(entity_type IN ('order','payment','shift','cash_movement','audit')),
+  entity_type TEXT NOT NULL CHECK(entity_type IN ('order','payment','shift','cash_movement','audit','inventory')),
   entity_id TEXT NOT NULL,
   action TEXT NOT NULL,
   occurred_at TEXT NOT NULL,

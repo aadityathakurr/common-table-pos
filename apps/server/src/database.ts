@@ -16,6 +16,29 @@ db.pragma('synchronous = FULL');
 db.pragma('foreign_keys = ON');
 db.pragma('busy_timeout = 5000');
 db.exec(readFileSync(resolve(here, 'schema.sql'), 'utf8'));
+const outboxDefinition=db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_outbox'").get() as {sql:string}|undefined;
+if(outboxDefinition&&!outboxDefinition.sql.includes("'inventory'")){
+  db.exec(`BEGIN;
+    CREATE TABLE sync_outbox_new (
+      outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL UNIQUE,
+      entity_type TEXT NOT NULL CHECK(entity_type IN ('order','payment','shift','cash_movement','audit','inventory')),
+      entity_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      occurred_at TEXT NOT NULL,
+      payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+      next_attempt_at TEXT,
+      last_error TEXT,
+      synced_at TEXT,
+      created_at TEXT NOT NULL
+    );
+    INSERT INTO sync_outbox_new SELECT * FROM sync_outbox;
+    DROP TABLE sync_outbox;
+    ALTER TABLE sync_outbox_new RENAME TO sync_outbox;
+    CREATE INDEX sync_outbox_pending ON sync_outbox(next_attempt_at,outbox_id) WHERE synced_at IS NULL;
+    COMMIT;`);
+}
 const outletColumns = db.pragma('table_info(outlets)') as Array<{ name: string }>;
 if (!outletColumns.some(column => column.name === 'tax_rate_bps')) {
   db.exec('ALTER TABLE outlets ADD COLUMN tax_rate_bps INTEGER NOT NULL DEFAULT 0 CHECK(tax_rate_bps BETWEEN 0 AND 10000)');
@@ -110,7 +133,7 @@ export function createId(): string { return randomUUID(); }
 
 export interface PendingSyncEvent {
   eventId: string;
-  entityType: 'order'|'payment'|'shift'|'cash_movement'|'audit';
+  entityType: 'order'|'payment'|'shift'|'cash_movement'|'audit'|'inventory';
   entityId: string;
   action: string;
   occurredAt: string;
@@ -140,8 +163,10 @@ export function pendingSyncEvents(limit = 50): PendingSyncEvent[] {
 export function acknowledgeSyncEvents(eventIds: string[]): void {
   if (!eventIds.length) return;
   const update = db.prepare('UPDATE sync_outbox SET synced_at=?,next_attempt_at=NULL,last_error=NULL WHERE event_id=? AND synced_at IS NULL');
+  const markInventory = db.prepare(`UPDATE edge_inventory_movements SET synced=1 WHERE event_id=?
+    AND EXISTS (SELECT 1 FROM sync_outbox WHERE event_id=? AND entity_type='inventory')`);
   const syncedAt = new Date().toISOString();
-  db.transaction(()=>{for(const eventId of eventIds)update.run(syncedAt,eventId);})();
+  db.transaction(()=>{for(const eventId of eventIds){markInventory.run(eventId,eventId);update.run(syncedAt,eventId);}})();
 }
 
 export function failSyncEvents(eventIds: string[], errorMessage: string): void {
@@ -166,6 +191,45 @@ export function syncOutboxStatus(){
 
 export interface ManagedMenuSnapshotItem extends MenuItem {}
 export type ManagedOutletLayout = OutletLayoutConfig;
+export interface ManagedInventoryItem { id:string;name:string;unit:string;reorderLevel:number;active:boolean;onHand:number; }
+export interface ManagedInventoryRecipe { menuItemId:string;inventoryItemId:string;quantityPerSale:number; }
+
+export function localInventoryBalances(){
+  return db.prepare(`SELECT i.id AS inventoryItemId,i.name,i.unit,i.active,i.reorder_level AS reorderLevel,
+    i.cloud_on_hand+COALESCE(SUM(m.quantity_delta),0) AS onHand,
+    i.cloud_on_hand+COALESCE(SUM(m.quantity_delta),0)<=i.reorder_level AS lowStock
+    FROM edge_inventory_items i LEFT JOIN edge_inventory_movements m
+      ON m.tenant_id=i.tenant_id AND m.outlet_id=i.outlet_id AND m.inventory_item_id=i.id
+    WHERE i.tenant_id=? AND i.outlet_id=? GROUP BY i.id ORDER BY i.name`)
+    .all(DEMO_TENANT,DEMO_OUTLET) as Array<{inventoryItemId:string;name:string;unit:string;active:number;reorderLevel:number;onHand:number;lowStock:number}>;
+}
+
+export function recordPaidOrderInventoryConsumption(orderId:string,orderNumber:string,actorId:string,occurredAt:string):number{
+  const recipeRows=db.prepare(`SELECT r.inventory_item_id AS inventoryItemId,r.quantity_per_sale AS quantityPerSale,l.quantity
+    FROM order_lines l JOIN edge_inventory_recipes r ON r.tenant_id=l.tenant_id AND r.outlet_id=l.outlet_id AND r.menu_item_id=l.menu_item_id
+    JOIN edge_inventory_items i ON i.tenant_id=r.tenant_id AND i.outlet_id=r.outlet_id AND i.id=r.inventory_item_id AND i.active=1
+    LEFT JOIN order_line_voids v ON v.order_line_id=l.id
+    WHERE l.tenant_id=? AND l.outlet_id=? AND l.order_id=? AND v.order_line_id IS NULL`)
+    .all(DEMO_TENANT,DEMO_OUTLET,orderId) as Array<{inventoryItemId:string;quantityPerSale:number;quantity:number}>;
+  const consumed=new Map<string,number>();
+  for(const row of recipeRows){
+    const milli=Math.round(Number(row.quantityPerSale)*Number(row.quantity)*1000);
+    if(!Number.isSafeInteger(milli)||milli<=0)throw new Error('A recipe produced an invalid stock quantity.');
+    consumed.set(row.inventoryItemId,(consumed.get(row.inventoryItemId)??0)+milli);
+  }
+  const insert=db.prepare(`INSERT INTO edge_inventory_movements
+    (id,event_id,command_id,tenant_id,outlet_id,inventory_item_id,order_id,actor_id,quantity,quantity_delta,reason,occurred_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+  for(const [inventoryItemId,milli] of consumed){
+    const quantity=milli/1000;const commandId=`sale:${orderId}:${inventoryItemId}`;
+    const id=createId();const eventId=createId();const reason=`Order ${orderNumber} paid`;
+    insert.run(id,eventId,commandId,DEMO_TENANT,DEMO_OUTLET,inventoryItemId,orderId,actorId,quantity,-quantity,reason,occurredAt);
+    enqueueSyncEvent('inventory',id,'inventory.sale_consumed',{
+      movementId:id,commandId,inventoryItemId,orderId,actorId,quantity,reason,occurredAt,
+    },occurredAt,eventId);
+  }
+  return consumed.size;
+}
 
 export function managedMenuSyncState(){
   return db.prepare('SELECT version,last_synced_at AS lastSyncedAt,last_error AS lastError FROM menu_sync_state WHERE tenant_id=? AND outlet_id=?')
@@ -185,8 +249,9 @@ export function markManagedMenuChecked(version:string, syncedAt=new Date().toISO
     .run(DEMO_TENANT,DEMO_OUTLET,version,syncedAt);
 }
 
-export function applyManagedMenuSnapshot(version:string,items:ManagedMenuSnapshotItem[],settings:OutletRuntimeSettings,layout:ManagedOutletLayout,syncedAt=new Date().toISOString()):void{
+export function applyManagedMenuSnapshot(version:string,items:ManagedMenuSnapshotItem[],inventoryItems:ManagedInventoryItem[],recipes:ManagedInventoryRecipe[],settings:OutletRuntimeSettings,layout:ManagedOutletLayout,syncedAt=new Date().toISOString()):void{
   if(items.length>5000)throw new Error('The outlet menu exceeds the item limit.');
+  if(inventoryItems.length>20000||recipes.length>50000)throw new Error('The outlet inventory recipe snapshot exceeds its supported size.');
   const apply=db.transaction(()=>{
     db.prepare(`UPDATE outlets SET name=?,timezone=?,currency=?,tax_rate_bps=?,receipt_name=?,receipt_address=?,receipt_phone=?,gstin=?,receipt_footer=?
       WHERE id=? AND tenant_id=?`)
@@ -229,6 +294,23 @@ export function applyManagedMenuSnapshot(version:string,items:ManagedMenuSnapsho
         if(modifierResult.changes!==1)throw new Error('A modifier ID conflicts with data owned by another outlet.');
       }
     }
+    db.prepare('UPDATE edge_inventory_items SET active=0,updated_at=? WHERE tenant_id=? AND outlet_id=?')
+      .run(syncedAt,DEMO_TENANT,DEMO_OUTLET);
+    const upsertInventoryItem=db.prepare(`INSERT INTO edge_inventory_items
+      (id,tenant_id,outlet_id,name,unit,reorder_level,active,cloud_on_hand,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET name=excluded.name,unit=excluded.unit,reorder_level=excluded.reorder_level,
+        active=excluded.active,cloud_on_hand=excluded.cloud_on_hand,updated_at=excluded.updated_at
+      WHERE edge_inventory_items.tenant_id=excluded.tenant_id AND edge_inventory_items.outlet_id=excluded.outlet_id`);
+    for(const item of inventoryItems){
+      const result=upsertInventoryItem.run(item.id,DEMO_TENANT,DEMO_OUTLET,item.name,item.unit,item.reorderLevel,item.active?1:0,item.onHand,syncedAt);
+      if(result.changes!==1)throw new Error('An inventory item ID conflicts with data owned by another outlet.');
+    }
+    db.prepare('DELETE FROM edge_inventory_recipes WHERE tenant_id=? AND outlet_id=?').run(DEMO_TENANT,DEMO_OUTLET);
+    const insertRecipe=db.prepare(`INSERT INTO edge_inventory_recipes
+      (tenant_id,outlet_id,menu_item_id,inventory_item_id,quantity_per_sale) VALUES(?,?,?,?,?)`);
+    for(const recipe of recipes)insertRecipe.run(DEMO_TENANT,DEMO_OUTLET,recipe.menuItemId,recipe.inventoryItemId,recipe.quantityPerSale);
+    // The snapshot includes all cloud-acknowledged consumption, so only pending edge movements remain local.
+    db.prepare('DELETE FROM edge_inventory_movements WHERE tenant_id=? AND outlet_id=? AND synced=1').run(DEMO_TENANT,DEMO_OUTLET);
     markManagedMenuChecked(version,syncedAt);
   });
   apply();

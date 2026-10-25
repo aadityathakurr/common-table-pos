@@ -28,11 +28,14 @@ let layout = { areas: [{ id: 'area-main', name: 'Main floor', sortOrder: 0, tabl
   { id: 'table-1', name: 'Table 01', capacity: 2, sortOrder: 0 },
   { id: 'table-2', name: 'Table 02', capacity: 4, sortOrder: 1 },
 ] }], stations: [{ id: 'station-hot', name: 'Hot kitchen', sortOrder: 0 }, { id: 'station-sweets', name: 'Sweets', sortOrder: 1 }] };
+let inventoryItems = [{ id: '00000000-0000-4000-8000-000000000001', name: 'Poha', unit: 'g', reorderLevel: 50, active: true, onHand: 500 }];
+let recipes = [{ menuItemId: 'cloud-poha', inventoryItemId: inventoryItems[0].id, quantityPerSale: 60 }];
+const acceptedInventoryEventIds = new Set();
 function localFloorPlan(occupiedTables = []) {
   return { ...layout, areas: layout.areas.map(area => ({ ...area, tables: area.tables.map(table => ({ ...table, occupied: occupiedTables.includes(table.name) })) })) };
 }
 function snapshotVersion() {
-  return createHash('sha256').update(JSON.stringify({ outletConfig, items, layout })).digest('hex');
+  return createHash('sha256').update(JSON.stringify({ outletConfig, items, layout, inventoryItems, recipes })).digest('hex');
 }
 let version = snapshotVersion();
 let upstreamAvailable = true;
@@ -79,13 +82,20 @@ const upstream = createServer(async (request, response) => {
       return;
     }
     response.writeHead(200, { 'content-type': 'application/json', etag, 'cache-control': 'no-store' })
-      .end(JSON.stringify({ tenantId, outletId, version: currentVersion, outletConfig, items, layout }));
+      .end(JSON.stringify({ tenantId, outletId, version: currentVersion, outletConfig, items, inventoryItems, recipes, layout }));
     return;
   }
   if (request.method === 'POST') {
     let body = '';
     for await (const chunk of request) body += chunk;
     const payload = JSON.parse(body);
+    for (const event of payload.events) {
+      if (event.entityType !== 'inventory' || acceptedInventoryEventIds.has(event.eventId)) continue;
+      acceptedInventoryEventIds.add(event.eventId);
+      const stock = inventoryItems.find((item) => item.id === event.payload.inventoryItemId);
+      if (stock) stock.onHand -= Number(event.payload.quantity);
+    }
+    version = snapshotVersion();
     response.writeHead(200, { 'content-type': 'application/json' })
       .end(JSON.stringify({ acceptedEventIds: payload.events.map((event) => event.eventId) }));
     return;
@@ -220,6 +230,8 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   }, 'the paired edge applies cloud outlet settings');
   assert.deepEqual((await jsonRequest(baseUrl, '/api/floor-plan')).body, localFloorPlan(),
     'the paired edge applies the active cloud floor plan and kitchen stations');
+  assert.equal((await jsonRequest(baseUrl, '/api/inventory')).body[0].onHand, 500,
+    'the edge hydrates the cloud stock balance for offline operation');
 
   const firstMenu = await jsonRequest(baseUrl, '/api/menu');
   assert.equal(firstMenu.body.length, 2);
@@ -344,7 +356,8 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.equal((await jsonRequest(baseUrl, '/api/context')).body.currency, 'USD', 'cloud outlet settings survive an edge restart');
   assert.equal((await jsonRequest(baseUrl, '/api/context')).body.taxRateBps, 1000);
   assert.equal((await jsonRequest(baseUrl, '/api/context')).body.timeZone, 'UTC');
-  assert.ok(seenEtags.some((etag) => etag === `"${version}"`), 'edge requests a 304 when the cloud menu is unchanged');
+  assert.ok(seenEtags.some((etag) => etag === `"${version}"`),
+    `edge requests a 304 when the cloud menu is unchanged (${JSON.stringify({ version, seenEtags })})`);
   const restoredMenu = await jsonRequest(baseUrl, '/api/menu');
   assert.deepEqual(restoredMenu.body.map((item) => item.id), ['cloud-poha', 'cloud-chai']);
   const restoredOrder = (await jsonRequest(baseUrl, '/api/orders')).body.find((order) => order.commandId === commandId);
@@ -369,16 +382,21 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
     body: JSON.stringify({ ...splitPaymentCommand, commandId: randomUUID(), tenders: [{ method: 'cash', amountMinor: 300 }, { method: 'upi', amountMinor: 200 }] }),
   });
   assert.equal(invalidSplit.response.status, 409, 'tender amounts must equal the invoice total');
+  upstreamAvailable = false;
   const payment = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/payment`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify(splitPaymentCommand),
   });
   assert.equal(payment.body.status, 'paid');
   assert.equal(payment.body.invoiceNumber, 'J-INV-000001');
+  assert.equal((await jsonRequest(baseUrl, '/api/inventory')).body[0].onHand, 440,
+    'paid orders consume recipe stock locally during WAN loss');
   const replayPayment = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/payment`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(splitPaymentCommand),
   });
   assert.equal(replayPayment.response.status, 200, 'a repeated split tender command returns the original paid order');
+  assert.equal((await jsonRequest(baseUrl, '/api/inventory')).body[0].onHand, 440,
+    'a replayed payment does not consume recipe stock twice');
   const cashierSession = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer cashier-token' } });
   const cashierCookie = cashierSession.response.headers.get('set-cookie').split(';', 1)[0];
   const refundCommand = { commandId: randomUUID(), paymentId: '', shiftId: openedShift.body.shift.id, amountMinor: 100, reason: 'Guest changed mind' };
@@ -453,6 +471,12 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.match(csvText, /refunds/);
   assert.match(csvText, /Indori Poha/);
   assert.match(csvText, /closed_shifts/);
+  upstreamAvailable = true;
+  await waitFor(async () => (await jsonRequest(baseUrl, '/api/sync/status')).body.pending === 0,
+    'inventory consumption did not sync after the WAN returned');
+  assert.equal(inventoryItems[0].onHand, 440, 'the synced cloud stock balance includes recipe consumption');
+  assert.equal((await jsonRequest(baseUrl, '/api/inventory')).body[0].onHand, 440,
+    'a newer cloud inventory snapshot replaces the edge movement without double counting');
 
   outletConfig = { name: 'Updated Test Outlet', timezone: 'Asia/Kolkata', currency: 'INR', taxRateBps: 500,
     receiptName: 'Updated Test Cafe', receiptAddress: '22 Sample Road', receiptPhone: '+91 12345 67890',

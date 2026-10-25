@@ -4,7 +4,7 @@ import { ifNoneMatchMatches } from "./etag.mjs";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
 const secretKey = Deno.env.get("SUPABASE_SECRET_KEY") ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const allowedEntityTypes = new Set(["order", "payment", "shift", "cash_movement", "audit"]);
+const allowedEntityTypes = new Set(["order", "payment", "shift", "cash_movement", "audit", "inventory"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type SyncEvent = {
@@ -78,7 +78,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
   await recordTerminalSeen(client, terminal);
 
   if (request.method === "GET") {
-    const [outletResult, categoryResult, itemResult, areaResult, tableResult, stationResult] = await Promise.all([
+    const [outletResult, categoryResult, itemResult, areaResult, tableResult, stationResult, inventoryResult, recipeResult] = await Promise.all([
       client.from("outlets").select("name,timezone,currency,tax_rate_bps,receipt_name,receipt_address,receipt_phone,gstin,receipt_footer")
         .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id).maybeSingle(),
       client.from("menu_categories").select("category_id,name,sort_order,active")
@@ -96,9 +96,15 @@ Deno.serve(async (request: Request): Promise<Response> => {
       client.from("kitchen_stations").select("station_id,name,sort_order,active")
         .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id).eq("active", true)
         .order("sort_order").order("station_id"),
+      client.from("inventory_stock_balances").select("inventory_item_id,name,unit,reorder_level,active,on_hand")
+        .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id)
+        .order("inventory_item_id"),
+      client.from("inventory_recipe_components").select("menu_item_id,inventory_item_id,quantity_per_sale")
+        .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id)
+        .order("menu_item_id").order("inventory_item_id"),
     ]);
-    if (outletResult.error || !outletResult.data || categoryResult.error || itemResult.error || areaResult.error || tableResult.error || stationResult.error) {
-      console.error(JSON.stringify({ event: "pos_sync.snapshot_read_failed", code: outletResult.error?.code ?? categoryResult.error?.code ?? itemResult.error?.code ?? areaResult.error?.code ?? tableResult.error?.code ?? stationResult.error?.code }));
+    if (outletResult.error || !outletResult.data || categoryResult.error || itemResult.error || areaResult.error || tableResult.error || stationResult.error || inventoryResult.error || recipeResult.error) {
+      console.error(JSON.stringify({ event: "pos_sync.snapshot_read_failed", code: outletResult.error?.code ?? categoryResult.error?.code ?? itemResult.error?.code ?? areaResult.error?.code ?? tableResult.error?.code ?? stationResult.error?.code ?? inventoryResult.error?.code ?? recipeResult.error?.code }));
       return json(503, { error: "The outlet configuration could not be read. Retry safely." });
     }
     const outletConfig = {
@@ -141,6 +147,34 @@ Deno.serve(async (request: Request): Promise<Response> => {
         modifiers: item.modifiers.map((modifier) => ({ ...modifier, priceDeltaMinor: Number(modifier.priceDeltaMinor) })),
       });
     }
+    if ((inventoryResult.data?.length ?? 0) > 20_000 || (recipeResult.data?.length ?? 0) > 50_000) {
+      return json(503, { error: "The outlet inventory recipe snapshot exceeds its supported size." });
+    }
+    const inventoryItems = (inventoryResult.data ?? []).map((item) => ({
+      id: item.inventory_item_id, name: item.name.trim(), unit: item.unit,
+      reorderLevel: Number(item.reorder_level), active: item.active, onHand: Number(item.on_hand),
+    }));
+    if (inventoryItems.some((item) => !item.id || !item.name || item.name.length > 120
+      || !["each", "g", "kg", "ml", "l", "portion", "pack"].includes(item.unit)
+      || !Number.isFinite(item.reorderLevel) || item.reorderLevel < 0 || item.reorderLevel > 1_000_000_000
+      || !Number.isFinite(item.onHand) || Math.abs(item.onHand) > 1_000_000_000)) {
+      return json(503, { error: "The outlet inventory contains invalid configuration." });
+    }
+    const inventoryIds = new Set(inventoryItems.map((item) => item.id));
+    const menuIds = new Set(items.map((item) => item.id));
+    const recipePairs = new Set<string>();
+    const recipes = (recipeResult.data ?? []).map((recipe) => ({
+      menuItemId: recipe.menu_item_id, inventoryItemId: recipe.inventory_item_id,
+      quantityPerSale: Number(recipe.quantity_per_sale),
+    }));
+    if (recipes.some((recipe) => {
+      const pair = `${recipe.menuItemId}:${recipe.inventoryItemId}`;
+      const invalid = !menuIds.has(recipe.menuItemId) || !inventoryIds.has(recipe.inventoryItemId)
+        || recipePairs.has(pair) || !Number.isFinite(recipe.quantityPerSale) || recipe.quantityPerSale <= 0
+        || recipe.quantityPerSale > 1_000_000_000 || Math.round(recipe.quantityPerSale * 1000) !== recipe.quantityPerSale * 1000;
+      recipePairs.add(pair);
+      return invalid;
+    })) return json(503, { error: "The outlet inventory recipes are invalid." });
     if ((areaResult.data?.length ?? 0) > 100 || (tableResult.data?.length ?? 0) > 500 || (stationResult.data?.length ?? 0) > 100) {
       return json(503, { error: "The outlet floor plan exceeds its supported size." });
     }
@@ -165,12 +199,12 @@ Deno.serve(async (request: Request): Promise<Response> => {
       || (tableResult.data ?? []).some((table) => !(areaResult.data ?? []).some((area) => area.area_id === table.area_id))) {
       return json(503, { error: "The outlet floor plan is invalid." });
     }
-    const versionBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify({ outletConfig, items, layout }))));
+    const versionBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify({ outletConfig, items, layout, inventoryItems, recipes }))));
     const version = [...versionBytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
     const etag = `"${version}"`;
     const headers = { etag, "x-pos-menu-version": version };
     if (ifNoneMatchMatches(request.headers.get("if-none-match"), etag)) return noContent(304, headers);
-    return json(200, { tenantId: terminal.tenant_id, outletId: terminal.outlet_id, version, outletConfig, items, layout }, headers);
+    return json(200, { tenantId: terminal.tenant_id, outletId: terminal.outlet_id, version, outletConfig, items, inventoryItems, recipes, layout }, headers);
   }
 
   const contentLength = Number(request.headers.get("content-length") ?? "0");
@@ -210,6 +244,19 @@ Deno.serve(async (request: Request): Promise<Response> => {
       || typeof event.occurredAt !== "string" || !Number.isFinite(Date.parse(event.occurredAt))
       || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) {
       return json(400, { error: "The sync batch contains an invalid event." });
+    }
+    if (event.entityType === "inventory") {
+      const payload = event.payload as Record<string, unknown>;
+      const quantity = Number(payload.quantity);
+      if (event.action !== "inventory.sale_consumed" || !uuidPattern.test(String(payload.movementId ?? ""))
+        || event.entityId !== payload.movementId || !uuidPattern.test(String(payload.inventoryItemId ?? ""))
+        || !uuidPattern.test(String(payload.actorId ?? "")) || !uuidPattern.test(String(payload.orderId ?? ""))
+        || typeof payload.commandId !== "string" || payload.commandId.length < 8 || payload.commandId.length > 160
+        || !Number.isFinite(quantity) || quantity <= 0 || quantity > 1_000_000_000 || Math.round(quantity * 1000) !== quantity * 1000
+        || typeof payload.reason !== "string" || payload.reason.trim().length < 3 || payload.reason.length > 120
+        || /[\u0000-\u001f\u007f]/.test(payload.reason)) {
+        return json(400, { error: "The sync batch contains an invalid inventory movement." });
+      }
     }
     seen.add(event.eventId);
     rows.push({

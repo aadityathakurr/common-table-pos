@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
@@ -107,6 +108,17 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
   assert.equal(cashier.response.status, 200);
   assert.equal(cashier.body.role, 'cashier');
   assert.match(cashier.response.headers.get('set-cookie') ?? '', /HttpOnly/);
+  const nearExpiry = { ...cashier.body, expiresAt: Math.floor(Date.now() / 1000) + 60 };
+  const encodedSession = Buffer.from(JSON.stringify(nearExpiry)).toString('base64url');
+  const signedSession = createHmac('sha256', secret).update(encodedSession).digest('base64url');
+  const nearExpiryCookie = `ct_pos_session=${encodedSession}.${signedSession}`;
+  const renewedResponse = await fetch(`${baseUrl}/api/orders`, { headers: { cookie: nearExpiryCookie } });
+  assert.equal(renewedResponse.status, 200, 'the local edge accepts the verified session without checking Supabase again');
+  const renewedCookie = renewedResponse.headers.get('set-cookie');
+  assert.match(renewedCookie ?? '', /Max-Age=2592000/, 'active local use renews the persistent cookie for 30 days');
+  const renewedPayload = JSON.parse(Buffer.from(renewedCookie.split('=')[1].split('.')[0], 'base64url').toString());
+  assert.ok(renewedPayload.expiresAt > Math.floor(Date.now() / 1000) + 29 * 24 * 60 * 60,
+    'offline session renewal extends its signed local expiry');
   assert.equal((await fetch(`${baseUrl}/api/support/diagnostics.json`, { headers: { cookie: cashier.cookie } })).status, 403);
   const cashierKitchen = await fetch(`${baseUrl}/api/kitchen`, { headers: { cookie: cashier.cookie } });
   assert.equal(cashierKitchen.status, 403);

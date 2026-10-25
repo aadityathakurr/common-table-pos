@@ -1,4 +1,4 @@
-import { acknowledgeSyncEvents, applyManagedMenuSnapshot, failSyncEvents, managedMenuSyncState, markManagedMenuChecked, pendingSyncEvents, recordManagedMenuSyncError, syncOutboxStatus, type ManagedMenuSnapshotItem, type ManagedOutletLayout } from './database.js';
+import { acknowledgeSyncEvents, applyManagedMenuSnapshot, failSyncEvents, managedMenuSyncState, markManagedMenuChecked, pendingSyncEvents, recordManagedMenuSyncError, syncOutboxStatus, type ManagedInventoryItem, type ManagedInventoryRecipe, type ManagedMenuSnapshotItem, type ManagedOutletLayout } from './database.js';
 import { EDGE_CONFIG, parseOutletRuntimeSettings, SYNC_CONFIG } from './config.js';
 
 let sending = false;
@@ -65,6 +65,32 @@ function validOutletLayout(value:unknown):value is ManagedOutletLayout{
   return true;
 }
 
+function validInventorySnapshot(items:unknown,recipes:unknown,menuItems:ManagedMenuSnapshotItem[]):items is ManagedInventoryItem[]{
+  if(!Array.isArray(items)||items.length>20000||!Array.isArray(recipes)||recipes.length>50000)return false;
+  const inventoryIds=new Set<string>();
+  for(const value of items){
+    if(!value||typeof value!=='object'||Array.isArray(value))return false;
+    const row=value as Record<string,unknown>;
+    if(typeof row.id!=='string'||!row.id.trim()||row.id.length>120||inventoryIds.has(row.id)
+      ||typeof row.name!=='string'||!row.name.trim()||row.name.length>120||/[\u0000-\u001f\u007f]/.test(row.name)
+      ||!['each','g','kg','ml','l','portion','pack'].includes(String(row.unit))
+      ||!Number.isFinite(Number(row.reorderLevel))||Number(row.reorderLevel)<0||Number(row.reorderLevel)>1_000_000_000
+      ||!Number.isFinite(Number(row.onHand))||Math.abs(Number(row.onHand))>1_000_000_000||typeof row.active!=='boolean')return false;
+    inventoryIds.add(row.id);
+  }
+  const menuIds=new Set(menuItems.map(item=>item.id));const seen=new Set<string>();
+  for(const value of recipes){
+    if(!value||typeof value!=='object'||Array.isArray(value))return false;
+    const row=value as Record<string,unknown>;const pair=`${String(row.menuItemId)}:${String(row.inventoryItemId)}`;
+    if(typeof row.menuItemId!=='string'||!menuIds.has(row.menuItemId)||typeof row.inventoryItemId!=='string'
+      ||!inventoryIds.has(row.inventoryItemId)||seen.has(pair)||!Number.isFinite(Number(row.quantityPerSale))
+      ||Number(row.quantityPerSale)<=0||Number(row.quantityPerSale)>1_000_000_000
+      ||Math.round(Number(row.quantityPerSale)*1000)!==Number(row.quantityPerSale)*1000)return false;
+    seen.add(pair);
+  }
+  return true;
+}
+
 export function getSyncStatus(){
   const stats=syncOutboxStatus();
   return {configured:Boolean(SYNC_CONFIG.url&&SYNC_CONFIG.terminalKey),pending:stats.pending,failed:stats.failed,
@@ -72,7 +98,7 @@ export function getSyncStatus(){
 }
 
 export async function syncMenuOnce():Promise<void>{
-  if(menuSending||!SYNC_CONFIG.url||!SYNC_CONFIG.terminalKey)return;
+  if(menuSending||sending||!SYNC_CONFIG.url||!SYNC_CONFIG.terminalKey)return;
   menuSending=true;
   const previous=managedMenuSyncState();
   try{
@@ -84,7 +110,7 @@ export async function syncMenuOnce():Promise<void>{
       menuError=null;
       return;
     }
-    const result=await response.json().catch(()=>({})) as {tenantId?:unknown;outletId?:unknown;version?:unknown;outletConfig?:unknown;items?:unknown;layout?:unknown;error?:unknown};
+    const result=await response.json().catch(()=>({})) as {tenantId?:unknown;outletId?:unknown;version?:unknown;outletConfig?:unknown;items?:unknown;inventoryItems?:unknown;recipes?:unknown;layout?:unknown;error?:unknown};
     if(!response.ok)throw new Error(typeof result.error==='string'?result.error:`Menu sync returned HTTP ${response.status}.`);
     if(result.tenantId!==EDGE_CONFIG.tenantId||result.outletId!==EDGE_CONFIG.outletId)
       throw new Error('The cloud menu belongs to a different outlet.');
@@ -93,7 +119,9 @@ export async function syncMenuOnce():Promise<void>{
       ||result.items.length>5000||!result.items.every(validMenuItem))throw new Error('The cloud returned an invalid menu snapshot.');
     const ids=new Set((result.items as ManagedMenuSnapshotItem[]).map(item=>item.id));
     if(ids.size!==(result.items as ManagedMenuSnapshotItem[]).length)throw new Error('The cloud menu contains duplicate item IDs.');
-    applyManagedMenuSnapshot(result.version,result.items as ManagedMenuSnapshotItem[],outletConfig,result.layout);
+    if(!validInventorySnapshot(result.inventoryItems,result.recipes,result.items as ManagedMenuSnapshotItem[]))throw new Error('The cloud returned an invalid inventory recipe snapshot.');
+    applyManagedMenuSnapshot(result.version,result.items as ManagedMenuSnapshotItem[],result.inventoryItems as ManagedInventoryItem[],
+      result.recipes as ManagedInventoryRecipe[],outletConfig,result.layout);
     menuError=null;
     console.log(JSON.stringify({level:'info',event:'menu.sync_succeeded',count:result.items.length,version:result.version}));
   }catch(error){
@@ -104,7 +132,7 @@ export async function syncMenuOnce():Promise<void>{
 }
 
 async function syncOnce():Promise<void>{
-  if(sending||!SYNC_CONFIG.url||!SYNC_CONFIG.terminalKey)return;
+  if(sending||menuSending||!SYNC_CONFIG.url||!SYNC_CONFIG.terminalKey)return;
   const events=pendingSyncEvents(50);if(!events.length)return;
   sending=true;
   const ids=events.map(event=>event.eventId);
@@ -134,8 +162,10 @@ export function startSyncWorker():()=>void{
     console.log(JSON.stringify({level:'info',event:'sync.disabled',reason:'POS_SYNC_URL or POS_TERMINAL_KEY is not configured.'}));
     return ()=>undefined;
   }
-  void syncOnce();
-  void syncMenuOnce();
+  // Fetch the current menu baseline first. If pending outbox events exist,
+  // starting both workers at once lets syncOnce grab the lock and silently
+  // skip the startup menu refresh until the 30 second interval.
+  void syncMenuOnce().finally(()=>void syncOnce());
   interval=setInterval(()=>void syncOnce(),5_000);
   menuInterval=setInterval(()=>void syncMenuOnce(),30_000);
   return ()=>{if(interval)clearInterval(interval);if(menuInterval)clearInterval(menuInterval);};
