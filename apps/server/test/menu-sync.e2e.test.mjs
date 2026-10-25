@@ -93,7 +93,11 @@ const upstream = createServer(async (request, response) => {
       if (event.entityType !== 'inventory' || acceptedInventoryEventIds.has(event.eventId)) continue;
       acceptedInventoryEventIds.add(event.eventId);
       const stock = inventoryItems.find((item) => item.id === event.payload.inventoryItemId);
-      if (stock) stock.onHand -= Number(event.payload.quantity);
+      if (stock) {
+        if(event.action==='inventory.receipt')stock.onHand+=Number(event.payload.quantity);
+        else if(event.action==='inventory.count_adjustment')stock.onHand=Number(event.payload.quantity);
+        else stock.onHand-=Number(event.payload.quantity);
+      }
     }
     version = snapshotVersion();
     response.writeHead(200, { 'content-type': 'application/json' })
@@ -215,6 +219,10 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.equal(cashierLogin.response.status, 200);
   sessionCookie = cashierLogin.response.headers.get('set-cookie').split(';', 1)[0];
   assert.equal((await jsonRequest(baseUrl, '/api/reports/daily')).response.status, 403, 'cashiers cannot read manager reports');
+  const cashierInventoryMovement=await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+    commandId:randomUUID(),inventoryItemId:inventoryItems[0].id,movementType:'receipt',quantity:1,expectedBalance:null,reason:'Delivery received',
+  })});
+  assert.equal(cashierInventoryMovement.response.status,403,'cashiers cannot change inventory');
   const ownerSession = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer owner-token' } });
   sessionCookie = ownerSession.response.headers.get('set-cookie').split(';', 1)[0];
   await waitFor(async () => {
@@ -509,4 +517,27 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   const originalOrderAfterConfigChange = (await jsonRequest(baseUrl, '/api/orders')).body.find((order) => order.commandId === commandId);
   assert.equal(originalOrderAfterConfigChange.currency, 'USD', 'configuration updates do not rewrite historical order currency');
   assert.equal(originalOrderAfterConfigChange.taxRateBps, 1000, 'configuration updates do not rewrite historical order tax');
+
+  upstreamAvailable=false;
+  const offlineReceipt={commandId:randomUUID(),inventoryItemId:inventoryItems[0].id,movementType:'receipt',quantity:5,expectedBalance:null,reason:'Morning delivery'};
+  const receipt=await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(offlineReceipt)});
+  assert.equal(receipt.response.status,201,'manager can save an inventory receipt without WAN');
+  assert.equal(receipt.body.inventory[0].onHand,445);
+  assert.equal((await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(offlineReceipt)})).response.status,200,
+    'replaying a movement command does not duplicate stock');
+  const waste=await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+    commandId:randomUUID(),inventoryItemId:inventoryItems[0].id,movementType:'waste',quantity:2,expectedBalance:null,reason:'Spoilage recorded',
+  })});
+  assert.equal(waste.body.inventory[0].onHand,443);
+  const count={commandId:randomUUID(),inventoryItemId:inventoryItems[0].id,movementType:'count_adjustment',quantity:442,expectedBalance:443,reason:'Closing count'};
+  const savedCount=await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(count)});
+  assert.equal(savedCount.body.inventory[0].onHand,442);
+  assert.equal((await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...count,commandId:randomUUID(),expectedBalance:443})})).response.status,409,
+    'a physical count based on a stale local balance is rejected');
+  assert.ok((await jsonRequest(baseUrl,'/api/sync/status')).body.pending>=3,'offline stock movements are durable in the sync outbox');
+  upstreamAvailable=true;
+  await waitFor(async()=>{
+    const [{body:status},{body:stock}]=await Promise.all([jsonRequest(baseUrl,'/api/sync/status'),jsonRequest(baseUrl,'/api/inventory')]);
+    return status.pending===0&&stock[0].onHand===442&&inventoryItems[0].onHand===442;
+  },'offline stock movements did not reconcile to cloud without duplication');
 });

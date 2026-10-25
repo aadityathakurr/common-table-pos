@@ -165,8 +165,10 @@ export function acknowledgeSyncEvents(eventIds: string[]): void {
   const update = db.prepare('UPDATE sync_outbox SET synced_at=?,next_attempt_at=NULL,last_error=NULL WHERE event_id=? AND synced_at IS NULL');
   const markInventory = db.prepare(`UPDATE edge_inventory_movements SET synced=1 WHERE event_id=?
     AND EXISTS (SELECT 1 FROM sync_outbox WHERE event_id=? AND entity_type='inventory')`);
+  const markManualInventory = db.prepare(`UPDATE edge_manual_inventory_movements SET synced=1 WHERE event_id=?
+    AND EXISTS (SELECT 1 FROM sync_outbox WHERE event_id=? AND entity_type='inventory')`);
   const syncedAt = new Date().toISOString();
-  db.transaction(()=>{for(const eventId of eventIds){markInventory.run(eventId,eventId);update.run(syncedAt,eventId);}})();
+  db.transaction(()=>{for(const eventId of eventIds){markInventory.run(eventId,eventId);markManualInventory.run(eventId,eventId);update.run(syncedAt,eventId);}})();
 }
 
 export function failSyncEvents(eventIds: string[], errorMessage: string): void {
@@ -196,12 +198,65 @@ export interface ManagedInventoryRecipe { menuItemId:string;inventoryItemId:stri
 
 export function localInventoryBalances(){
   return db.prepare(`SELECT i.id AS inventoryItemId,i.name,i.unit,i.active,i.reorder_level AS reorderLevel,
-    i.cloud_on_hand+COALESCE(SUM(m.quantity_delta),0) AS onHand,
-    i.cloud_on_hand+COALESCE(SUM(m.quantity_delta),0)<=i.reorder_level AS lowStock
-    FROM edge_inventory_items i LEFT JOIN edge_inventory_movements m
-      ON m.tenant_id=i.tenant_id AND m.outlet_id=i.outlet_id AND m.inventory_item_id=i.id
-    WHERE i.tenant_id=? AND i.outlet_id=? GROUP BY i.id ORDER BY i.name`)
-    .all(DEMO_TENANT,DEMO_OUTLET) as Array<{inventoryItemId:string;name:string;unit:string;active:number;reorderLevel:number;onHand:number;lowStock:number}>;
+    i.cloud_on_hand+COALESCE(sale.quantity_delta,0)+COALESCE(manual.quantity_delta,0) AS onHand,
+    i.cloud_on_hand+COALESCE(sale.quantity_delta,0)+COALESCE(manual.quantity_delta,0)<=i.reorder_level AS lowStock
+    FROM edge_inventory_items i
+    LEFT JOIN (SELECT inventory_item_id,SUM(quantity_delta) AS quantity_delta FROM edge_inventory_movements
+      WHERE tenant_id=? AND outlet_id=? GROUP BY inventory_item_id) sale ON sale.inventory_item_id=i.id
+    LEFT JOIN (SELECT inventory_item_id,SUM(quantity_delta) AS quantity_delta FROM edge_manual_inventory_movements
+      WHERE tenant_id=? AND outlet_id=? GROUP BY inventory_item_id) manual ON manual.inventory_item_id=i.id
+    WHERE i.tenant_id=? AND i.outlet_id=? ORDER BY i.name`)
+    .all(DEMO_TENANT,DEMO_OUTLET,DEMO_TENANT,DEMO_OUTLET,DEMO_TENANT,DEMO_OUTLET) as Array<{inventoryItemId:string;name:string;unit:string;active:number;reorderLevel:number;onHand:number;lowStock:number}>;
+}
+
+export interface ManualInventoryMovementInput {
+  commandId:string;inventoryItemId:string;movementType:'receipt'|'waste'|'count_adjustment';
+  quantity:number;expectedBalance:number|null;reason:string;actorId:string;occurredAt:string;
+}
+
+export function recordManualInventoryMovement(input:ManualInventoryMovementInput){
+  const item=db.prepare(`SELECT id FROM edge_inventory_items WHERE tenant_id=? AND outlet_id=? AND id=? AND active=1`)
+    .get(DEMO_TENANT,DEMO_OUTLET,input.inventoryItemId);
+  if(!item)throw new Error('Choose an active inventory item for this outlet.');
+  const existing=db.prepare(`SELECT id,inventory_item_id AS inventoryItemId,movement_type AS movementType,quantity,
+    expected_balance AS expectedBalance,reason,actor_id AS actorId FROM edge_manual_inventory_movements WHERE command_id=?`)
+    .get(input.commandId) as {id:string;inventoryItemId:string;movementType:string;quantity:number;expectedBalance:number|null;reason:string;actorId:string}|undefined;
+  if(existing){
+    if(existing.inventoryItemId!==input.inventoryItemId||existing.movementType!==input.movementType||Number(existing.quantity)!==input.quantity
+      ||(existing.expectedBalance===null?null:Number(existing.expectedBalance))!==input.expectedBalance||existing.reason!==input.reason||existing.actorId!==input.actorId)
+      throw new Error('This command ID was already used for different stock details. Refresh inventory and try again.');
+    return {movementId:existing.id,duplicate:true};
+  }
+  const movementId=createId();const eventId=createId();
+  const save=db.transaction(()=>{
+    let expectedBalance:number|null=null;let delta:number;
+    if(input.movementType==='count_adjustment'){
+      const balance=db.prepare(`SELECT i.cloud_on_hand+COALESCE((SELECT SUM(quantity_delta) FROM edge_inventory_movements
+        WHERE tenant_id=i.tenant_id AND outlet_id=i.outlet_id AND inventory_item_id=i.id),0)
+        +COALESCE((SELECT SUM(quantity_delta) FROM edge_manual_inventory_movements
+        WHERE tenant_id=i.tenant_id AND outlet_id=i.outlet_id AND inventory_item_id=i.id),0) AS on_hand
+        FROM edge_inventory_items i WHERE i.tenant_id=? AND i.outlet_id=? AND i.id=? AND i.active=1`)
+        .get(DEMO_TENANT,DEMO_OUTLET,input.inventoryItemId) as {on_hand:number}|undefined;
+      if(!balance)throw new Error('Inventory item is not available on this device. Sync and try again.');
+      expectedBalance=Number(balance.on_hand);
+      if(Math.round(expectedBalance*1000)!==Math.round((input.expectedBalance??Number.NaN)*1000))
+        throw new Error('Stock changed after this count began. Refresh inventory and count again.');
+      delta=input.quantity-expectedBalance;
+    }else delta=input.movementType==='receipt'?input.quantity:-input.quantity;
+    db.prepare(`INSERT INTO edge_manual_inventory_movements
+      (id,event_id,command_id,tenant_id,outlet_id,inventory_item_id,movement_type,quantity,expected_balance,quantity_delta,reason,actor_id,occurred_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(movementId,eventId,input.commandId,DEMO_TENANT,DEMO_OUTLET,input.inventoryItemId,
+        input.movementType,input.quantity,expectedBalance,delta,input.reason,input.actorId,input.occurredAt);
+    enqueueSyncEvent('inventory',movementId,`inventory.${input.movementType}`,{
+      movementId,commandId:input.commandId,inventoryItemId:input.inventoryItemId,movementType:input.movementType,
+      quantity:input.quantity,expectedBalance,reason:input.reason,actorId:input.actorId,occurredAt:input.occurredAt,
+    },input.occurredAt,eventId);
+    db.prepare(`INSERT INTO audit_events(id,tenant_id,outlet_id,actor_id,terminal_id,entity_type,entity_id,action,reason,payload_json,occurred_at)
+      VALUES(?,?,?,?,?,'inventory_item',?,?,?,?,?)`).run(createId(),DEMO_TENANT,DEMO_OUTLET,input.actorId,DEMO_TERMINAL,
+        input.inventoryItemId,`inventory.${input.movementType}`,input.reason,JSON.stringify({movementId,quantityDelta:delta}),input.occurredAt);
+    return {movementId,duplicate:false};
+  });
+  return save();
 }
 
 export function recordPaidOrderInventoryConsumption(orderId:string,orderNumber:string,actorId:string,occurredAt:string):number{
@@ -311,6 +366,7 @@ export function applyManagedMenuSnapshot(version:string,items:ManagedMenuSnapsho
     for(const recipe of recipes)insertRecipe.run(DEMO_TENANT,DEMO_OUTLET,recipe.menuItemId,recipe.inventoryItemId,recipe.quantityPerSale);
     // The snapshot includes all cloud-acknowledged consumption, so only pending edge movements remain local.
     db.prepare('DELETE FROM edge_inventory_movements WHERE tenant_id=? AND outlet_id=? AND synced=1').run(DEMO_TENANT,DEMO_OUTLET);
+    db.prepare('DELETE FROM edge_manual_inventory_movements WHERE tenant_id=? AND outlet_id=? AND synced=1').run(DEMO_TENANT,DEMO_OUTLET);
     markManagedMenuChecked(version,syncedAt);
   });
   apply();

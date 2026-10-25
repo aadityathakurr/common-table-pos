@@ -52,6 +52,19 @@ CREATE TABLE IF NOT EXISTS edge_inventory_movements (
   reason TEXT NOT NULL, occurred_at TEXT NOT NULL, synced INTEGER NOT NULL DEFAULT 0 CHECK(synced IN (0,1))
 );
 CREATE INDEX IF NOT EXISTS edge_inventory_movements_by_item ON edge_inventory_movements(tenant_id,outlet_id,inventory_item_id,occurred_at DESC);
+CREATE TABLE IF NOT EXISTS edge_manual_inventory_movements (
+  id TEXT PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, command_id TEXT NOT NULL UNIQUE,
+  tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, inventory_item_id TEXT NOT NULL,
+  movement_type TEXT NOT NULL CHECK(movement_type IN ('receipt','waste','count_adjustment')),
+  quantity REAL NOT NULL CHECK(quantity >= 0), expected_balance REAL,
+  quantity_delta REAL NOT NULL, reason TEXT NOT NULL, actor_id TEXT NOT NULL,
+  occurred_at TEXT NOT NULL, synced INTEGER NOT NULL DEFAULT 0 CHECK(synced IN (0,1)),
+  CHECK((movement_type='receipt' AND quantity>0 AND expected_balance IS NULL AND quantity_delta=quantity)
+    OR (movement_type='waste' AND quantity>0 AND expected_balance IS NULL AND quantity_delta=-quantity)
+    OR (movement_type='count_adjustment' AND expected_balance IS NOT NULL AND quantity_delta=quantity-expected_balance))
+);
+CREATE INDEX IF NOT EXISTS edge_manual_inventory_movements_by_item
+  ON edge_manual_inventory_movements(tenant_id,outlet_id,inventory_item_id,occurred_at DESC);
 CREATE TABLE IF NOT EXISTS menu_sync_state (
   tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, version TEXT NOT NULL,
   last_synced_at TEXT NOT NULL, last_error TEXT,

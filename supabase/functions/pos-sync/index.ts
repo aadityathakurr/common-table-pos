@@ -248,11 +248,17 @@ Deno.serve(async (request: Request): Promise<Response> => {
     if (event.entityType === "inventory") {
       const payload = event.payload as Record<string, unknown>;
       const quantity = Number(payload.quantity);
-      if (event.action !== "inventory.sale_consumed" || !uuidPattern.test(String(payload.movementId ?? ""))
+      const movementType=payload.movementType;
+      const sale=event.action==='inventory.sale_consumed';
+      const validAction=sale||(['receipt','waste','count_adjustment'].includes(String(movementType))&&event.action===`inventory.${String(movementType)}`);
+      if (!validAction || !uuidPattern.test(String(payload.movementId ?? ""))
         || event.entityId !== payload.movementId || !uuidPattern.test(String(payload.inventoryItemId ?? ""))
-        || !uuidPattern.test(String(payload.actorId ?? "")) || !uuidPattern.test(String(payload.orderId ?? ""))
+        || !uuidPattern.test(String(payload.actorId ?? "")) || (sale&&!uuidPattern.test(String(payload.orderId ?? "")))
         || typeof payload.commandId !== "string" || payload.commandId.length < 8 || payload.commandId.length > 160
-        || !Number.isFinite(quantity) || quantity <= 0 || quantity > 1_000_000_000 || Math.round(quantity * 1000) !== quantity * 1000
+        || !Number.isFinite(quantity) || quantity < (event.action==='inventory.count_adjustment'?0:Number.MIN_VALUE)
+        || quantity > 1_000_000_000 || Math.round(quantity * 1000) !== quantity * 1000
+        || (event.action==='inventory.count_adjustment'&&(!Number.isFinite(Number(payload.expectedBalance))||Math.abs(Number(payload.expectedBalance))>1_000_000_000))
+        || (event.action!=='inventory.count_adjustment'&&payload.expectedBalance!==null)
         || typeof payload.reason !== "string" || payload.reason.trim().length < 3 || payload.reason.length > 120
         || /[\u0000-\u001f\u007f]/.test(payload.reason)) {
         return json(400, { error: "The sync batch contains an invalid inventory movement." });
@@ -274,12 +280,17 @@ Deno.serve(async (request: Request): Promise<Response> => {
 
   const serializedSize = new TextEncoder().encode(JSON.stringify(rows)).byteLength;
   if (serializedSize > 256_000) return json(413, { error: "Sync event payloads exceed the batch limit." });
-  const { error: insertError } = await client.from("pos_sync_events")
-    .upsert(rows, { onConflict: "tenant_id,outlet_id,terminal_id,event_id", ignoreDuplicates: true });
-  if (insertError) {
-    console.error(JSON.stringify({ event: "pos_sync.insert_failed", code: insertError.code }));
-    return json(503, { error: "The sync batch was not acknowledged. It is safe to retry." });
+  const acceptedEventIds: string[] = [];
+  for (const row of rows) {
+    const { error: insertError } = await client.from("pos_sync_events")
+      .upsert([row], { onConflict: "tenant_id,outlet_id,terminal_id,event_id", ignoreDuplicates: true });
+    if (insertError) {
+      // Keep a bad event retryable without letting it roll back unrelated sales in this batch.
+      console.error(JSON.stringify({ event: "pos_sync.event_rejected", eventId: row.event_id, code: insertError.code }));
+      continue;
+    }
+    acceptedEventIds.push(row.event_id);
   }
 
-  return json(200, { acceptedEventIds: events.map((event) => event.eventId) });
+  return json(200, { acceptedEventIds });
 });

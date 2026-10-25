@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Banknote, BarChart3, Check, ChefHat, ChevronDown, CircleHelp, Coffee, CreditCard, Flame, LayoutGrid, LoaderCircle, MapPin, Minus, MoreHorizontal, Plus, Printer, QrCode, ReceiptText, Search, Send, Trash2, Wifi, WifiOff, X } from 'lucide-react';
+import { Banknote, BarChart3, Check, ChefHat, ChevronDown, CircleHelp, Coffee, CreditCard, Flame, LayoutGrid, LoaderCircle, MapPin, Minus, MoreHorizontal, Package, Plus, Printer, QrCode, ReceiptText, Search, Send, Trash2, Wifi, WifiOff, X } from 'lucide-react';
 import type { CreateOrderCommand, DiningAreaConfig, DiningTableConfig, KitchenOrder, KitchenStationConfig, MenuItem, ModifierOption, OrderLine, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftSummary } from '@common-table/contracts';
 import { DEMO_MENU } from '@common-table/contracts';
 import { listQueuedOrders, queueOrder, removeQueuedOrder, type QueuedOrder } from './offline';
 import { supabase } from './supabase';
 import ReportsView from './ReportsView';
+import LocalInventoryView from './LocalInventoryView';
 
 const formatMoney=(minor:number,currency='INR')=>new Intl.NumberFormat('en-IN',{style:'currency',currency}).format(minor/100);
 const makeId=()=>crypto.randomUUID();
@@ -74,7 +75,7 @@ function ticketStatus(ticket:TicketView):'new'|'preparing'|'ready'{
 }
 
 function App(){
-  const [page,setPage]=useState<'pos'|'kitchen'|'reports'>('pos');
+  const [page,setPage]=useState<'pos'|'kitchen'|'reports'|'inventory'>('pos');
   const [menu,setMenu]=useState<MenuItem[]>(DEMO_MENU);
   const [menuSource,setMenuSource]=useState<'demo'|'edge'|'cloud'|'offline cache'>('demo');
   const [category,setCategory]=useState('All items');
@@ -464,6 +465,7 @@ function App(){
       <nav className="space-y-1">
         {canUsePos&&<button onClick={()=>setPage('pos')} className={`flex h-10 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[11px] ${page==='pos'?'bg-[#e9f4ed] font-bold text-[#27694f]':'text-[#718078] hover:bg-[#f1f5f1]'}`}><LayoutGrid size={16} />Point of sale <span className="ml-auto text-[9px] opacity-60">1</span></button>}
         {canUseKitchen&&<button onClick={()=>setPage('kitchen')} className={`flex h-10 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[11px] ${page==='kitchen'?'bg-[#e9f4ed] font-bold text-[#27694f]':'text-[#718078] hover:bg-[#f1f5f1]'}`}><ChefHat size={16} />Kitchen display{tickets.length>0&&<span className="ml-auto rounded-full bg-white px-2 py-0.5 text-[9px]">{tickets.length}</span>}</button>}
+        {canManage&&isOutletEdge&&<button onClick={()=>setPage('inventory')} className={`flex h-10 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[11px] ${page==='inventory'?'bg-[#e9f4ed] font-bold text-[#27694f]':'text-[#718078] hover:bg-[#f1f5f1]'}`}><Package size={16}/>Inventory</button>}
         {canViewReports&&<button onClick={()=>setPage('reports')} className={`flex h-10 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[11px] ${page==='reports'?'bg-[#e9f4ed] font-bold text-[#27694f]':'text-[#718078] hover:bg-[#f1f5f1]'}`}><BarChart3 size={16}/>Daily reports</button>}
       </nav>
       <div className="mt-auto">
@@ -474,11 +476,11 @@ function App(){
 
     <main className="flex min-w-0 flex-1 flex-col">
       <header className="flex h-[58px] items-center justify-between border-b border-[#e7ece8] bg-white/70 px-4 md:px-8">
-        <div className="flex items-center gap-2 text-[10px] text-[#89958f]"><span className="md:hidden font-bold text-[#28694f]">ct</span><span>{outletContext?.outletName??'Common Table POS'}</span><span className="text-[#c3cbc6]">/</span><strong className="font-semibold text-[#405149]">{page==='pos'?'Point of sale':page==='kitchen'?'Kitchen display':'Daily reports'}</strong></div>
+        <div className="flex items-center gap-2 text-[10px] text-[#89958f]"><span className="md:hidden font-bold text-[#28694f]">ct</span><span>{outletContext?.outletName??'Common Table POS'}</span><span className="text-[#c3cbc6]">/</span><strong className="font-semibold text-[#405149]">{page==='pos'?'Point of sale':page==='kitchen'?'Kitchen display':page==='inventory'?'Inventory':'Daily reports'}</strong></div>
         <div className="flex items-center gap-2 sm:gap-4"><span title={syncStatus?.lastError??(syncStatus?.lastSyncedAt?`Last cloud sync ${new Date(syncStatus.lastSyncedAt).toLocaleString('en-IN')}`:'Sync state from the outlet edge')} className={`hidden items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-[9px] sm:flex ${!syncStatus?.configured?'border-[#e6ebe7] text-[#78857d]':syncStatus.failed?'border-[#f0d9d2] bg-[#fff6f3] text-[#a34f3d]':syncStatus.pending?'border-[#f0e2c9] bg-[#fffaf1] text-[#9a6c2b]':'border-[#dce9df] bg-[#f5faf6] text-[#467652]'}`}><i className={`size-1.5 rounded-full ${!syncStatus?.configured?'bg-[#a4ada7]':syncStatus.failed?'bg-[#c66955]':syncStatus.pending?'bg-[#d69b45]':'bg-[#55a877]'}`} />{!syncStatus?'Sync status':!syncStatus.configured?'Sync not configured':syncStatus.failed?`${syncStatus.failed} failed`:syncStatus.pending?`${syncStatus.pending} queued`:syncStatus.lastSyncedAt?'Queue clear':'Sync ready'}</span>{canUsePos&&<button onClick={()=>setReceiptHistoryOpen(true)} aria-label="Recent receipts" title="Recent receipts" className="grid size-7 place-items-center rounded-full border border-[#e6ebe7] bg-white text-[#6a7c70]"><ReceiptText size={13}/></button>}<button onClick={()=>setShiftOpen(true)} aria-haspopup="dialog" className="flex items-center gap-2 rounded-full border border-[#e6ebe7] px-2.5 py-1.5 text-[9px] text-[#65736c]"><i className={`size-1.5 rounded-full ${shiftSummary?.shift.status==='open'?'bg-[#55a877]':'bg-[#d79543]'}`} />{shiftSummary?.shift.status==='open'?shiftSummary.shift.shiftNumber:'No shift open'}</button><button disabled={!isOutletEdge} onClick={testPrinter} title={isOutletEdge?'Send a test ticket to the configured printer':'Connect to the local cashier service to test the printer'} aria-label="Send printer test ticket" className="grid size-7 place-items-center rounded-full border border-[#e6ebe7] bg-white text-[#7d8983] disabled:cursor-not-allowed disabled:opacity-40"><Printer size={13}/></button><button onClick={()=>setConnectionHelpOpen(true)} aria-haspopup="dialog" aria-label="Help and connection setup" title="Help and connection setup" className="grid size-7 place-items-center rounded-full border border-[#e6ebe7] bg-white text-[#7d8983]"><CircleHelp size={13}/></button><div className="text-right text-[8px] tracking-[.6px] text-[#97a19b]">{clock.toLocaleDateString('en-IN',{weekday:'short',month:'short',day:'2-digit'}).toUpperCase()} <strong className="block text-[10px] tracking-normal text-[#42534b]">{clock.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})}</strong></div></div>
       </header>
 
-      {page==='pos'?<section className="mx-auto w-full max-w-[1540px] flex-1 px-3 py-5 sm:px-5 lg:px-8">
+      {page==='inventory'?<LocalInventoryView/>:page==='pos'?<section className="mx-auto w-full max-w-[1540px] flex-1 px-3 py-5 sm:px-5 lg:px-8">
         <div className="mb-5 flex items-end justify-between gap-3"><div><p className="mb-1.5 text-[8px] font-bold tracking-[1px] text-[#87948d]">{clock.toLocaleDateString('en-IN',{weekday:'long'}).toUpperCase()} SERVICE <span className={`ml-1.5 ${isOutletEdge?'text-[#46805e]':'text-[#a77735]'}`}>● {isOutletEdge?'LIVE':'EDGE REQUIRED'}</span></p><h1 className="font-[Manrope,Inter,sans-serif] text-[23px] font-bold tracking-[-1px] text-[#24312c] sm:text-[26px]">Good morning, {staffName.split(/\s+/)[0]} <span className="text-[#d3974e]">✳</span></h1><p className="mt-1 text-[10px] text-[#8a9690]">A little more coffee, a little less waiting.</p></div><button onClick={()=>{if(cart.length)notify('Send or charge this order before starting a new one.');else{setEditingOrderId('');setEditCommandId('');setNote('');notify('New order ready.');}}} className="hidden h-9 items-center gap-2 rounded-lg border border-[#dfe6e1] bg-white px-3 text-[10px] font-bold text-[#40564b] sm:flex"><Plus size={14}/>New order</button></div>
 
         <div className="grid items-start gap-3 lg:grid-cols-[minmax(0,1.45fr)_minmax(280px,.85fr)]">
