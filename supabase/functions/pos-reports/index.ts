@@ -1,6 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.118.0";
-import { aggregateCloudDailyReport } from "./_shared/cloud-report.mjs";
+import { aggregateCloudProjectionReport } from "./_shared/cloud-report.mjs";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
 const publishableKey = Deno.env.get("SUPABASE_PUBLISHABLE_KEY") ?? Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -73,14 +73,15 @@ function reportRange(date: string, timeZone: string): { startAt: string; endAt: 
 
 async function fetchAll(query: any): Promise<any[]> {
   const rows: any[] = [];
-  for (let offset = 0; offset < maxRows; offset += pageSize) {
+  for (let offset = 0; offset <= maxRows; offset += pageSize) {
     const { data, error } = await query.range(offset, offset + pageSize - 1);
     if (error) throw new Error(`Cloud report query failed (${error.code ?? "unknown"}).`);
     const page = data ?? [];
     rows.push(...page);
+    if (rows.length > maxRows) throw new Error("This report exceeds the event limit. Narrow the report date and retry.");
     if (page.length < pageSize) return rows;
   }
-  throw new Error("This report exceeds the event limit. Narrow the report date and retry.");
+  return rows;
 }
 
 Deno.serve(async (request: Request): Promise<Response> => {
@@ -118,25 +119,44 @@ Deno.serve(async (request: Request): Promise<Response> => {
   const date = body.date === undefined ? localBusinessDate(outlet.timezone) : body.date as string;
   const range = reportRange(date, outlet.timezone);
   try {
-    const eventQuery = client.from("pos_sync_events").select("entity_type,entity_id,action,occurred_at,payload")
-      .eq("tenant_id", body.tenantId).eq("outlet_id", body.outletId)
-      .in("entity_type", ["order", "payment", "shift"]).gte("occurred_at", range.startAt).lt("occurred_at", range.endAt)
-      .order("occurred_at").order("event_id");
-    const events = await fetchAll(eventQuery);
-    const orderIds = [...new Set(events.filter((event) => event.entity_type === "payment"
-      && ["payment.recorded", "payment.refunded"].includes(event.action)
-      && typeof event.payload?.orderId === "string").map((event) => event.payload.orderId as string))];
-    const orderHistory: any[] = [];
+    const tenantId = body.tenantId;
+    const outletId = body.outletId;
+    const payments = await fetchAll(client.from("pos_payments")
+      .select("order_id,entry_type,method,amount_minor,status,occurred_at")
+      .eq("tenant_id", tenantId).eq("outlet_id", outletId).eq("status", "succeeded")
+      .gte("occurred_at", range.startAt).lt("occurred_at", range.endAt)
+      .order("occurred_at").order("payment_id"));
+    const orderIds = [...new Set(payments.map((payment) => payment.order_id).filter((id) => typeof id === "string"))];
+    const orders: any[] = [];
+    const orderItems: any[] = [];
     for (let index = 0; index < orderIds.length; index += 100) {
       const batch = orderIds.slice(index, index + 100);
-      const historyQuery = client.from("pos_sync_events").select("entity_type,entity_id,action,occurred_at,payload")
-        .eq("tenant_id", body.tenantId).eq("outlet_id", body.outletId).eq("entity_type", "order")
-        .in("entity_id", batch).lt("occurred_at", range.endAt).order("occurred_at", { ascending: false }).order("event_id", { ascending: false });
-      orderHistory.push(...await fetchAll(historyQuery));
+      const [orderRows, itemRows] = await Promise.all([
+        fetchAll(client.from("pos_orders")
+          .select("order_id,subtotal_minor,tax_total_minor,total_minor")
+          .eq("tenant_id", tenantId).eq("outlet_id", outletId).in("order_id", batch)),
+        fetchAll(client.from("pos_order_items")
+          .select("order_id,line_id,menu_item_id,name,quantity,line_total_minor,voided_at")
+          .eq("tenant_id", tenantId).eq("outlet_id", outletId).in("order_id", batch)),
+      ]);
+      orders.push(...orderRows);
+      orderItems.push(...itemRows);
     }
-    const report = aggregateCloudDailyReport({
+    const [voidedItems, shifts] = await Promise.all([
+      fetchAll(client.from("pos_order_items")
+        .select("order_id,line_id,quantity,line_total_minor,voided_at")
+        .eq("tenant_id", tenantId).eq("outlet_id", outletId)
+        .gte("voided_at", range.startAt).lt("voided_at", range.endAt)
+        .order("voided_at").order("order_id").order("line_id")),
+      fetchAll(client.from("pos_shifts")
+        .select("shift_id,status,closed_at,expected_cash_minor,counted_cash_minor,variance_minor")
+        .eq("tenant_id", tenantId).eq("outlet_id", outletId).eq("status", "closed")
+        .gte("closed_at", range.startAt).lt("closed_at", range.endAt)
+        .order("closed_at").order("shift_id")),
+    ]);
+    const report = aggregateCloudProjectionReport({
       date, timeZone: outlet.timezone, outletName: outlet.name, currency: outlet.currency,
-      ...range, events, orderHistory,
+      ...range, payments, orders, orderItems, voidedItems, shifts,
     });
     return json(200, report, origin);
   } catch (error) {

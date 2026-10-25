@@ -1,5 +1,11 @@
 function amount(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  const parsed = typeof value === 'string' && /^-?\d+$/.test(value) ? Number(value) : value;
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function signedAmount(value) {
+  const parsed = typeof value === 'string' && /^-?\d+$/.test(value) ? Number(value) : value;
+  return Number.isSafeInteger(parsed) ? parsed : 0;
 }
 
 function snapshotFor(event) {
@@ -118,5 +124,94 @@ export function aggregateCloudDailyReport({ date, timeZone, outletName, currency
     items: [...itemsById.values()].sort((a, b) => b.salesMinor - a.salesMinor || a.name.localeCompare(b.name)),
     voids: { lineCount: voidedLines.size, quantity: voidQuantity, amountMinor: voidAmountMinor },
     shifts: { closedCount, expectedCashMinor, countedCashMinor, varianceMinor },
+  };
+}
+
+export function aggregateCloudProjectionReport({ date, timeZone, outletName, currency, startAt, endAt,
+  payments, orders, orderItems, voidedItems, shifts }) {
+  const orderById = new Map(orders.map(order => [order.order_id, order]));
+  const paidOrderIds = new Set();
+  const tenderByMethod = new Map();
+  const refundsByOrder = new Map();
+  let refundCount = 0;
+  let refundAmountMinor = 0;
+
+  for (const payment of payments) {
+    const method = payment.method;
+    const value = amount(payment.amount_minor);
+    if (!['cash', 'upi', 'card'].includes(method) || value === 0 || typeof payment.order_id !== 'string') continue;
+    const tender = tenderByMethod.get(method) ?? { method, amountMinor: 0, paymentCount: 0 };
+    if (payment.entry_type === 'tender') {
+      tender.amountMinor += value;
+      tender.paymentCount += 1;
+      paidOrderIds.add(payment.order_id);
+    } else if (payment.entry_type === 'refund') {
+      tender.amountMinor -= value;
+      refundCount += 1;
+      refundAmountMinor += value;
+      refundsByOrder.set(payment.order_id, (refundsByOrder.get(payment.order_id) ?? 0) + value);
+    } else continue;
+    tenderByMethod.set(method, tender);
+  }
+
+  let grossSubtotal = 0;
+  let grossTax = 0;
+  let grossSales = 0;
+  const itemsById = new Map();
+  for (const orderId of paidOrderIds) {
+    const order = orderById.get(orderId);
+    if (!order) continue;
+    grossSubtotal += amount(order.subtotal_minor);
+    grossTax += amount(order.tax_total_minor);
+    grossSales += amount(order.total_minor);
+  }
+  for (const line of orderItems) {
+    if (!paidOrderIds.has(line.order_id) || line.voided_at || typeof line.name !== 'string') continue;
+    const key = `${line.menu_item_id ?? ''}\u0000${line.name}`;
+    const item = itemsById.get(key) ?? { menuItemId: line.menu_item_id ?? '', name: line.name, quantity: 0, salesMinor: 0 };
+    item.quantity += amount(line.quantity);
+    item.salesMinor += amount(line.line_total_minor);
+    itemsById.set(key, item);
+  }
+
+  let refundTaxMinor = 0;
+  for (const [orderId, refunded] of refundsByOrder) {
+    const order = orderById.get(orderId);
+    const total = amount(order?.total_minor);
+    if (order && total > 0) refundTaxMinor += Math.round(amount(order.tax_total_minor) * refunded / total);
+  }
+
+  const voidIds = new Set();
+  let voidQuantity = 0;
+  let voidAmountMinor = 0;
+  for (const line of voidedItems) {
+    if (!line.voided_at || Date.parse(line.voided_at) < Date.parse(startAt) || Date.parse(line.voided_at) >= Date.parse(endAt)) continue;
+    const key = `${line.order_id}\u0000${line.line_id}`;
+    if (voidIds.has(key)) continue;
+    voidIds.add(key);
+    voidQuantity += amount(line.quantity);
+    voidAmountMinor += amount(line.line_total_minor);
+  }
+
+  const closedShifts = shifts.filter(shift => shift.status === 'closed' && shift.closed_at
+    && Date.parse(shift.closed_at) >= Date.parse(startAt) && Date.parse(shift.closed_at) < Date.parse(endAt));
+  return {
+    date, timeZone, outletName, currency, startAt, endAt, generatedAt: new Date().toISOString(),
+    totals: {
+      paidOrderCount: paidOrderIds.size,
+      subtotalMinor: grossSubtotal - (refundAmountMinor - refundTaxMinor),
+      taxTotalMinor: grossTax - refundTaxMinor,
+      salesMinor: grossSales - refundAmountMinor,
+    },
+    refunds: { count: refundCount, amountMinor: refundAmountMinor },
+    tenders: [...tenderByMethod.values()].sort((a, b) => a.method.localeCompare(b.method)),
+    items: [...itemsById.values()].sort((a, b) => b.salesMinor - a.salesMinor || a.name.localeCompare(b.name)),
+    voids: { lineCount: voidIds.size, quantity: voidQuantity, amountMinor: voidAmountMinor },
+    shifts: {
+      closedCount: closedShifts.length,
+      expectedCashMinor: closedShifts.reduce((sum, shift) => sum + amount(shift.expected_cash_minor), 0),
+      countedCashMinor: closedShifts.reduce((sum, shift) => sum + amount(shift.counted_cash_minor), 0),
+      varianceMinor: closedShifts.reduce((sum, shift) => sum + signedAmount(shift.variance_minor), 0),
+    },
   };
 }

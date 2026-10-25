@@ -21,6 +21,12 @@ npm run dev
 
 Vite serves the web client on port 5173 and proxies API/WebSocket traffic to the edge server on port 3001. From the server workspace, the edge server creates `apps/server/.data/common-table.db` in SQLite WAL mode and starts its mock ESC/POS TCP listener on `127.0.0.1:9100`.
 
+## Supabase schema and local Auth
+
+The tracked `supabase/migrations` directory includes the migrations already applied to the dedicated `common-table-pos` project, followed by the cloud order, payment, shift, cash movement, and audit projections. The local Supabase Auth Site URL is `http://localhost:5173`, matching Vite; it is separate from the hosted project's Auth settings. For a local Supabase stack, install Docker and run `npx supabase start` followed by `npx supabase db reset`. The local stack is configured not to load sample business records by default.
+
+For hosted sign-up links, configure Supabase **Authentication → URL Configuration** with Site URL `https://common-table-pos.vercel.app` and allow `https://common-table-pos.vercel.app/admin`. A custom confirmation email template must use the requested `{{ .RedirectTo }}` value when constructing the link. The manager app already requests this URL explicitly. Vercel preview deployments intentionally have no production Supabase credentials.
+
 ## Build and run as one edge process
 
 ```sh
@@ -48,10 +54,10 @@ The root `vercel.json` builds the monorepo and publishes `apps/web/dist`. It hos
 
 ## Prototype boundaries
 
-- The Indore menu and tax remain training data. Outlet identity is configurable through environment settings. The `/admin` route supports tenant/outlet setup, cloud menu administration, staff invitations, and terminal enrollment/revocation. Staff invite links are returned for the manager to share manually; no staff invitation email is sent. Local edge sessions and role-based API permissions are implemented and covered by the mock-auth integration test; a real second-user invite and a paired outlet terminal still need pilot verification.
+- The Indore menu and tax remain training data. Outlet identity is configurable through environment settings. The `/admin` route supports tenant/outlet setup, cloud menu administration, staff invitations, and terminal enrollment/revocation. Its one-time terminal configuration includes the browser-safe Supabase URL/key, outlet/terminal identifiers, a local session-signing secret, and the terminal sync key; keep the copied configuration in the outlet server's private `.env`. Staff invite links are returned for the manager to share manually; no staff invitation email is sent. Local edge sessions and role-based API permissions are implemented and covered by the mock-auth integration test; a real second-user invite and an on-site terminal install still need pilot verification.
 - Demo cash/UPI/card tenders are records only. No payment provider is called.
 - Orders made while disconnected are stored in the browser's IndexedDB outbox and retried with the same command ID, preventing duplicate orders on server retries. Browser offline storage is per device/browser profile. Use the app once while connected before relying on the cached shell; across devices on a LAN, deploy with HTTPS.
-- SQLite is the outlet edge database. A terminal-authenticated pull refreshes the managed outlet menu into SQLite as an atomic snapshot; menu versions use ETags, and order acceptance continues from the local copy during WAN loss. A durable local outbox syncs append-only business events to Supabase; the cloud currently stores an event log, not normalized sales/order projections. The edge's Daily reports page reads local SQLite for timezone-aware sales, tax, tender, item, void, and shift closeout totals and exports CSV; it is unavailable from the Vercel-only preview. Offline menu editing and merge-conflict resolution are not implemented.
+- SQLite is the outlet edge database. A terminal-authenticated pull refreshes the managed outlet menu into SQLite as an atomic snapshot; menu versions use ETags, and order acceptance continues from the local copy during WAN loss. A durable local outbox syncs append-only business events to Supabase; a database trigger transactionally maintains tenant/outlet-scoped order, line, payment, shift, cash movement, and audit projections. The deployed `pos-reports` function reads those projections under the caller's manager RLS policy; its UI requires a deployed frontend and authenticated manager session. The edge's Daily reports page reads local SQLite for timezone-aware sales, tax, tender, item, void, and shift closeout totals and exports CSV; it is unavailable from the Vercel-only preview. Offline menu editing and merge-conflict resolution are not implemented.
 - The printer formats ESC/POS-compatible KOTs and receipts and sends them to a mock TCP socket. Validate byte width and printer-specific command support against the chosen hardware before connecting a real printer.
 
 ## Main routes
