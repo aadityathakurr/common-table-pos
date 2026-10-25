@@ -52,6 +52,8 @@ Vercel is a good home for the hosted web/control plane. The local edge process r
 
 **Cashier browser verification (2026-10-25):** found and fixed the saved-order checkout gap: previously a selected unpaid order showed no saved lines and could not be charged. The local browser flow now reopens the order, shows saved items and totals, records payment, updates the tender report, processes a partial refund, and closes the shift at zero variance. This run used a disposable SQLite database and did not write test sales to Supabase.
 
+**Production browser verification (2026-10-25):** after the currency releases, the signed-in owner portal loaded the account, all 43 menu items, and the cloud daily report. The public preview loaded its 43-item cached menu, added a sample item to the temporary cart, and blocked kitchen submission with the outlet-edge requirement; the page was reloaded to clear the cart. No preview order or menu write was made. Vercel production deployment reached `READY`, `/admin` returned HTTP 200, the browser console had no warnings/errors, and Vercel returned no production error logs for the preceding 30 minutes.
+
 ### 3. Payments, receipts, and shift close
 
 - Keep cash/manual tender recording explicit; add split tender, refunds/reversals, and immutable payment events.
