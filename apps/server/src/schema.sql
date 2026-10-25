@@ -104,3 +104,19 @@ CREATE TABLE IF NOT EXISTS audit_events (
   action TEXT NOT NULL, reason TEXT, payload_json TEXT NOT NULL DEFAULT '{}', occurred_at TEXT NOT NULL,
   FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id)
 );
+CREATE TABLE IF NOT EXISTS sync_outbox (
+  outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE,
+  entity_type TEXT NOT NULL CHECK(entity_type IN ('order','payment','shift','cash_movement','audit')),
+  entity_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+  next_attempt_at TEXT,
+  last_error TEXT,
+  synced_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sync_outbox_pending
+  ON sync_outbox(next_attempt_at,outbox_id) WHERE synced_at IS NULL;

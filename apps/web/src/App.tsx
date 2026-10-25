@@ -12,6 +12,7 @@ const CONTEXT_CACHE='common-table.edge-context.v1';
 interface EdgeContext {tenantId:string;tenantName:string;outletId:string;outletName:string;terminalId:string;terminalName:string;locationLabel:string;currency:string;taxRateBps:number;}
 interface CloudMenuContext {tenantId:string;outletId:string;outletName?:string;currency?:string;}
 interface CloudMenuRow {item_id:string;category_id:string;name:string;price_minor:number;emoji:string;color:string;tag:string|null;vegetarian:boolean;available:boolean;kitchen_station:string;modifiers:ModifierOption[]|null;}
+interface SyncStatus {configured:boolean;pending:number;failed:number;lastSyncedAt:string|null;lastError:string|null;}
 function readCachedContext():EdgeContext|null{
   try{const value=localStorage.getItem(CONTEXT_CACHE);if(!value)return null;const parsed=JSON.parse(value) as Partial<EdgeContext>;return parsed.tenantId&&parsed.outletId&&parsed.terminalId?parsed as EdgeContext:null;}catch{return null;}
 }
@@ -45,6 +46,7 @@ function App(){
   const [checkoutOpen,setCheckoutOpen]=useState(false);
   const [shiftOpen,setShiftOpen]=useState(false);
   const [shiftSummary,setShiftSummary]=useState<ShiftSummary|null>(null);
+  const [syncStatus,setSyncStatus]=useState<SyncStatus|null>(null);
   const [shiftBusy,setShiftBusy]=useState(false);
   const [openingFloat,setOpeningFloat]=useState('500');
   const [countedCash,setCountedCash]=useState('');
@@ -76,6 +78,7 @@ function App(){
   const refreshQueue=useCallback(async()=>{try{setQueue(await listQueuedOrders());}catch{notify('This browser could not open its local offline queue.');}},[notify]);
   const refreshOrders=useCallback(async()=>{try{const response=await fetch('/api/orders');if(!response.ok)throw new Error();setOrders(await response.json() as OrderRecord[]);}catch{/* The cached client keeps rendering while the local edge server is unreachable. */}},[]);
   const refreshShift=useCallback(async()=>{try{const response=await fetch('/api/shifts/current');if(!response.ok)throw new Error();const payload=await response.json() as {shift:ShiftSummary|null};setShiftSummary(payload.shift);}catch{/* Shift controls stay unavailable when the local edge is unreachable. */}},[]);
+  const refreshSyncStatus=useCallback(async()=>{try{const response=await fetch('/api/sync/status');if(!response.ok)throw new Error();setSyncStatus(await response.json() as SyncStatus);}catch{setSyncStatus(null);}},[]);
 
   const flushQueue=useCallback(async()=>{
     const pending=await listQueuedOrders().catch(()=>[]);
@@ -93,7 +96,7 @@ function App(){
   },[notify]);
 
   useEffect(()=>{
-    void refreshQueue();void refreshOrders();void refreshShift();
+    void refreshQueue();void refreshOrders();void refreshShift();void refreshSyncStatus();
     fetch('/api/context').then(response=>response.ok?response.json():null).then((context:EdgeContext|null)=>{
       if(!context||typeof context.tenantId!=='string'||typeof context.outletId!=='string'||typeof context.terminalId!=='string')return;
       setOutletContext(context);setTaxRateBps(context.taxRateBps);try{localStorage.setItem(CONTEXT_CACHE,JSON.stringify(context));}catch{/* The current session can still work without caching outlet setup. */}
@@ -129,9 +132,9 @@ function App(){
     }
     const onOnline=()=>{setOnline(true);void flushQueue();};const onOffline=()=>setOnline(false);
     window.addEventListener('online',onOnline);window.addEventListener('offline',onOffline);
-    const retry=window.setInterval(()=>{void flushQueue();void refreshOrders();void refreshShift();},5000);
+    const retry=window.setInterval(()=>{void flushQueue();void refreshOrders();void refreshShift();void refreshSyncStatus();},5000);
     return()=>{window.removeEventListener('online',onOnline);window.removeEventListener('offline',onOffline);window.clearInterval(retry);};
-  },[flushQueue,refreshOrders,refreshQueue,refreshShift]);
+  },[flushQueue,refreshOrders,refreshQueue,refreshShift,refreshSyncStatus]);
 
   useEffect(()=>{const timer=window.setInterval(()=>setClock(new Date()),30000);return()=>window.clearInterval(timer);},[]);
 
@@ -233,7 +236,7 @@ function App(){
     <main className="flex min-w-0 flex-1 flex-col">
       <header className="flex h-[58px] items-center justify-between border-b border-[#e7ece8] bg-white/70 px-4 md:px-8">
         <div className="flex items-center gap-2 text-[10px] text-[#89958f]"><span className="md:hidden font-bold text-[#28694f]">ct</span><span>{outletContext?.outletName??'Common Table POS'}</span><span className="text-[#c3cbc6]">/</span><strong className="font-semibold text-[#405149]">{page==='pos'?'Point of sale':'Kitchen display'}</strong></div>
-        <div className="flex items-center gap-2 sm:gap-4"><button onClick={()=>setShiftOpen(true)} aria-haspopup="dialog" className="flex items-center gap-2 rounded-full border border-[#e6ebe7] px-2.5 py-1.5 text-[9px] text-[#65736c]"><i className={`size-1.5 rounded-full ${shiftSummary?.shift.status==='open'?'bg-[#55a877]':'bg-[#d79543]'}`} />{shiftSummary?.shift.status==='open'?shiftSummary.shift.shiftNumber:'No shift open'}</button><button onClick={testPrinter} title="Send test to mock printer" className="grid size-7 place-items-center rounded-full border border-[#e6ebe7] bg-white text-[#7d8983]"><Printer size={13}/></button><button title="Help" className="grid size-7 place-items-center rounded-full border border-[#e6ebe7] bg-white text-[#7d8983]"><CircleHelp size={13}/></button><div className="text-right text-[8px] tracking-[.6px] text-[#97a19b]">{clock.toLocaleDateString('en-IN',{weekday:'short',month:'short',day:'2-digit'}).toUpperCase()} <strong className="block text-[10px] tracking-normal text-[#42534b]">{clock.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})}</strong></div></div>
+        <div className="flex items-center gap-2 sm:gap-4"><span title={syncStatus?.lastError??(syncStatus?.lastSyncedAt?`Last cloud sync ${new Date(syncStatus.lastSyncedAt).toLocaleString('en-IN')}`:'Sync state from the outlet edge')} className={`hidden items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-[9px] sm:flex ${!syncStatus?.configured?'border-[#e6ebe7] text-[#78857d]':syncStatus.failed?'border-[#f0d9d2] bg-[#fff6f3] text-[#a34f3d]':syncStatus.pending?'border-[#f0e2c9] bg-[#fffaf1] text-[#9a6c2b]':'border-[#dce9df] bg-[#f5faf6] text-[#467652]'}`}><i className={`size-1.5 rounded-full ${!syncStatus?.configured?'bg-[#a4ada7]':syncStatus.failed?'bg-[#c66955]':syncStatus.pending?'bg-[#d69b45]':'bg-[#55a877]'}`} />{!syncStatus?'Sync status':!syncStatus.configured?'Sync not configured':syncStatus.failed?`${syncStatus.failed} failed`:syncStatus.pending?`${syncStatus.pending} queued`:syncStatus.lastSyncedAt?'Queue clear':'Sync ready'}</span><button onClick={()=>setShiftOpen(true)} aria-haspopup="dialog" className="flex items-center gap-2 rounded-full border border-[#e6ebe7] px-2.5 py-1.5 text-[9px] text-[#65736c]"><i className={`size-1.5 rounded-full ${shiftSummary?.shift.status==='open'?'bg-[#55a877]':'bg-[#d79543]'}`} />{shiftSummary?.shift.status==='open'?shiftSummary.shift.shiftNumber:'No shift open'}</button><button onClick={testPrinter} title="Send test to mock printer" className="grid size-7 place-items-center rounded-full border border-[#e6ebe7] bg-white text-[#7d8983]"><Printer size={13}/></button><button title="Help" className="grid size-7 place-items-center rounded-full border border-[#e6ebe7] bg-white text-[#7d8983]"><CircleHelp size={13}/></button><div className="text-right text-[8px] tracking-[.6px] text-[#97a19b]">{clock.toLocaleDateString('en-IN',{weekday:'short',month:'short',day:'2-digit'}).toUpperCase()} <strong className="block text-[10px] tracking-normal text-[#42534b]">{clock.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})}</strong></div></div>
       </header>
 
       {page==='pos'?<section className="mx-auto w-full max-w-[1540px] flex-1 px-3 py-5 sm:px-5 lg:px-8">

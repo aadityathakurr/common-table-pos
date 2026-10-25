@@ -26,6 +26,13 @@ export const EDGE_CONFIG = Object.freeze({
   taxRateBps: integerSetting('POS_TAX_RATE_BPS', Number(process.env.DEMO_TAX_RATE_BPS ?? 500)),
 });
 
+const configuredSupabaseUrl = (process.env.POS_SYNC_URL?.trim()
+  ?? `${(process.env.VITE_SUPABASE_URL ?? '').trim().replace(/\/$/, '')}/functions/v1/pos-sync`).trim();
+export const SYNC_CONFIG = Object.freeze({
+  url: configuredSupabaseUrl === '/functions/v1/pos-sync' ? '' : configuredSupabaseUrl,
+  terminalKey: process.env.POS_TERMINAL_KEY?.trim() ?? '',
+});
+
 export function checkEdgeConfiguration(): void {
   const required: Array<keyof typeof EDGE_CONFIG> = [
     'tenantId', 'tenantName', 'outletId', 'outletName', 'terminalId', 'terminalName', 'actorId', 'timezone', 'currency',

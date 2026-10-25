@@ -6,9 +6,10 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
-import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TAX_RATE_BPS, DEMO_TENANT, DEMO_TERMINAL } from './database.js';
+import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TAX_RATE_BPS, DEMO_TENANT, DEMO_TERMINAL, enqueueSyncEvent, syncOutboxStatus } from './database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
 import { formatKitchenTicket, formatReceipt, sendToMockPrinter, startMockPrinter } from './printer.js';
+import { getSyncStatus, startSyncWorker } from './sync.js';
 
 const app=express();
 const httpServer=createServer(app);
@@ -81,8 +82,10 @@ function kitchenOrders():KitchenOrder[]{
   return rows.map(row=>mapOrder(row));
 }
 function audit(entityType:string,entityId:string,action:string,reason:string|null,payload:Record<string,unknown>={}){
+  const eventId=createId();const occurredAt=new Date().toISOString();
   db.prepare(`INSERT INTO audit_events(id,tenant_id,outlet_id,actor_id,terminal_id,entity_type,entity_id,action,reason,payload_json,occurred_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(createId(),DEMO_TENANT,DEMO_OUTLET,DEMO_ACTOR,DEMO_TERMINAL,entityType,entityId,action,reason,JSON.stringify(payload),new Date().toISOString());
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(eventId,DEMO_TENANT,DEMO_OUTLET,DEMO_ACTOR,DEMO_TERMINAL,entityType,entityId,action,reason,JSON.stringify(payload),occurredAt);
+  enqueueSyncEvent('audit',entityId,action,{entityType,entityId,actorId:DEMO_ACTOR,terminalId:DEMO_TERMINAL,reason,payload},occurredAt,eventId);
 }
 function createOrder(command:CreateOrderCommand):{order:OrderRecord;duplicate:boolean}{
   const existing=db.prepare('SELECT * FROM orders WHERE command_id=?').get(command.commandId) as Record<string,unknown>|undefined;
@@ -126,6 +129,12 @@ function createOrder(command:CreateOrderCommand):{order:OrderRecord;duplicate:bo
     const insertTicket=db.prepare(`INSERT INTO kitchen_tickets(id,tenant_id,outlet_id,order_id,station,status,created_at) VALUES(?,?,?,?,?,'new',?)`);
     for(const station of stations)insertTicket.run(createId(),DEMO_TENANT,DEMO_OUTLET,orderId,station,timestamp);
     audit('order',orderId,'order.sent_to_kitchen',null,{orderNumber,terminalId:DEMO_TERMINAL,lineCount:prepared.length});
+    enqueueSyncEvent('order',orderId,'order.created',{id:orderId,commandId:command.commandId,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,
+      terminalId:DEMO_TERMINAL,orderNumber,orderType:command.orderType,tableLabel:command.orderType==='dine_in'?command.tableLabel:null,
+      guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),status:'sent',note:command.note?.slice(0,140)??null,
+      currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:DEMO_TAX_RATE_BPS,totalMinor,createdAt:timestamp,updatedAt:timestamp,
+      lines:prepared.map(line=>({id:line.id,menuItemId:line.menuItemId,name:line.name,category:line.category,quantity:line.quantity,
+        unitPriceMinor:line.basePriceMinor,lineTotalMinor:line.lineTotalMinor,kitchenStation:line.kitchenStation,note:line.note,modifiers:line.modifiers}))},timestamp);
   });
   create();
   const order=orderById(orderId)!;
@@ -163,6 +172,7 @@ app.get('/api/orders',(_req,res)=>{
   const rows=db.prepare('SELECT * FROM orders WHERE tenant_id=? AND outlet_id=? ORDER BY created_at DESC LIMIT 100').all(DEMO_TENANT,DEMO_OUTLET) as Array<Record<string,unknown>>;
   return res.json(rows.map(mapOrder));
 });
+app.get('/api/sync/status',(_req,res)=>res.json({...getSyncStatus(),outbox:syncOutboxStatus()}));
 app.get('/api/shifts/current',(_req,res)=>{
   const row=db.prepare("SELECT id FROM shifts WHERE tenant_id=? AND outlet_id=? AND status='open'").get(DEMO_TENANT,DEMO_OUTLET) as {id:string}|undefined;
   return res.json({shift:row?shiftSummary(row.id):null});
@@ -182,6 +192,8 @@ app.post('/api/shifts/open',(req,res)=>{
     db.prepare(`INSERT INTO shifts(id,command_id,tenant_id,outlet_id,terminal_id,actor_id,shift_number,opening_float_minor,status,opened_at)
       VALUES(?,?,?,?,?,?,?,?,'open',?)`).run(id,body.commandId,DEMO_TENANT,DEMO_OUTLET,DEMO_TERMINAL,DEMO_ACTOR,shiftNumber,openingFloatMinor,openedAt);
     audit('shift',id,'shift.opened',null,{shiftNumber,openingFloatMinor});
+    enqueueSyncEvent('shift',id,'shift.opened',{id,shiftNumber,status:'open',openedAt,openingFloatMinor,
+      tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,terminalId:DEMO_TERMINAL},openedAt);
   })();}catch(error){return fail(res,409,error instanceof Error?error.message:'Unable to open shift.');}
   return res.status(201).json(shiftSummary(id));
 });
@@ -196,9 +208,12 @@ app.post('/api/shifts/:shiftId/cash-movements',(req,res)=>{
   const shift=db.prepare("SELECT id FROM shifts WHERE id=? AND tenant_id=? AND outlet_id=? AND status='open'").get(req.params.shiftId,DEMO_TENANT,DEMO_OUTLET);
   if(!shift)return fail(res,409,'Open a shift before recording cash movement.');
   db.transaction(()=>{
+    const movementId=createId();const occurredAt=new Date().toISOString();
     db.prepare(`INSERT INTO cash_movements(id,command_id,tenant_id,outlet_id,shift_id,terminal_id,actor_id,movement_type,amount_minor,reason,created_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(createId(),body.commandId,DEMO_TENANT,DEMO_OUTLET,req.params.shiftId,DEMO_TERMINAL,DEMO_ACTOR,body.type,amountMinor,reason,new Date().toISOString());
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(movementId,body.commandId,DEMO_TENANT,DEMO_OUTLET,req.params.shiftId,DEMO_TERMINAL,DEMO_ACTOR,body.type,amountMinor,reason,occurredAt);
     audit('shift',req.params.shiftId,`shift.${body.type}`,reason,{amountMinor,commandId:body.commandId});
+    enqueueSyncEvent('cash_movement',movementId,`shift.${body.type}`,{id:movementId,commandId:body.commandId,shiftId:req.params.shiftId,
+      movementType:body.type,amountMinor,reason,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,terminalId:DEMO_TERMINAL,actorId:DEMO_ACTOR},occurredAt);
   })();
   return res.status(201).json(shiftSummary(req.params.shiftId));
 });
@@ -217,6 +232,8 @@ app.post('/api/shifts/:shiftId/close',(req,res)=>{
     db.prepare(`UPDATE shifts SET status='closed',closed_at=?,close_command_id=?,counted_cash_minor=?,expected_cash_minor=?,variance_minor=? WHERE id=? AND status='open'`)
       .run(closedAt,body.commandId,countedCashMinor,summary.expectedCashMinor,varianceMinor,req.params.shiftId);
     audit('shift',req.params.shiftId,'shift.closed',null,{countedCashMinor,expectedCashMinor:summary.expectedCashMinor,varianceMinor});
+    enqueueSyncEvent('shift',req.params.shiftId,'shift.closed',{...summary.shift,status:'closed',closedAt,countedCashMinor,
+      expectedCashMinor:summary.expectedCashMinor,varianceMinor,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,terminalId:DEMO_TERMINAL},closedAt);
   })();
   return res.json(shiftSummary(req.params.shiftId));
 });
@@ -240,6 +257,7 @@ app.patch('/api/orders/:orderId/status',(req,res)=>{
     db.prepare('UPDATE orders SET status=?,updated_at=? WHERE id=?').run(nextStatus,timestamp,before.id);
     db.prepare('UPDATE kitchen_tickets SET status=?,ready_at=? WHERE order_id=?').run(nextStatus==='ready'?'ready':nextStatus==='preparing'?'preparing':nextStatus==='cancelled'?'voided':'new',nextStatus==='ready'?timestamp:null,before.id);
     audit('order',before.id,`order.${nextStatus}`,null);
+    enqueueSyncEvent('order',before.id,`order.${nextStatus}`,{...orderById(before.id)!},timestamp);
   });update();
   const after=orderById(before.id)!;publish('order.updated',after);return res.json(after);
 });
@@ -257,12 +275,16 @@ app.post('/api/orders/:orderId/payment',(req,res)=>{
   const shift=db.prepare("SELECT id FROM shifts WHERE id=? AND tenant_id=? AND outlet_id=? AND status='open'").get(body.shiftId,DEMO_TENANT,DEMO_OUTLET);
   if(!shift)return fail(res,409,'This payment must be assigned to an open shift.');
   const timestamp=new Date().toISOString();
+  const paymentId=createId();
   const pay=db.transaction(()=>{
     const invoiceNumber=allocateNumber('invoice','INV');
     db.prepare('INSERT INTO payment_events(id,command_id,tenant_id,outlet_id,order_id,terminal_id,method,amount_minor,status,shift_id,created_at) VALUES(?,?,?,?,?,?,?,? ,\'succeeded\',?,?)')
-      .run(createId(),body.commandId,DEMO_TENANT,DEMO_OUTLET,before.id,DEMO_TERMINAL,method,before.totalMinor,body.shiftId,timestamp);
+      .run(paymentId,body.commandId,DEMO_TENANT,DEMO_OUTLET,before.id,DEMO_TERMINAL,method,before.totalMinor,body.shiftId,timestamp);
     db.prepare('UPDATE orders SET status=\'paid\',payment_method=?,invoice_number=?,updated_at=? WHERE id=?').run(method,invoiceNumber,timestamp,before.id);
     audit('order',before.id,'order.payment_recorded',null,{method,invoiceNumber,amountMinor:before.totalMinor,shiftId:body.shiftId});
+    enqueueSyncEvent('payment',paymentId,'payment.recorded',{id:paymentId,commandId:body.commandId,orderId:before.id,
+      shiftId:body.shiftId,method,amountMinor:before.totalMinor,status:'succeeded',invoiceNumber,createdAt:timestamp,
+      tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,terminalId:DEMO_TERMINAL,order:orderById(before.id)!},timestamp);
   });pay();
   const order=orderById(before.id)!;publish('order.updated',order);
   void sendToMockPrinter(formatReceipt(order)).catch(error=>console.error('Receipt printer is not reachable:',error));
@@ -290,6 +312,7 @@ wss.on('connection',webSocket=>{
 });
 
 const printer=startMockPrinter();
+const stopSyncWorker=startSyncWorker();
 httpServer.listen(port,'0.0.0.0',()=>console.log(`🍽️  Common Table edge server listening on http://0.0.0.0:${port}`));
-function shutdown(){httpServer.close();wss.close();printer.close();db.close();}
+function shutdown(){httpServer.close();wss.close();printer.close();stopSyncWorker();db.close();}
 process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);

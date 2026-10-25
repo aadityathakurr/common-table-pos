@@ -63,3 +63,59 @@ export function allocateNumber(counterName: 'order'|'invoice'|'shift', prefix: '
 }
 
 export function createId(): string { return randomUUID(); }
+
+export interface PendingSyncEvent {
+  eventId: string;
+  entityType: 'order'|'payment'|'shift'|'cash_movement'|'audit';
+  entityId: string;
+  action: string;
+  occurredAt: string;
+  payload: Record<string, unknown>;
+  attemptCount: number;
+}
+
+const insertSyncEvent = db.prepare(`INSERT INTO sync_outbox
+  (event_id,entity_type,entity_id,action,occurred_at,payload_json,created_at)
+  VALUES(?,?,?,?,?,?,?)`);
+
+export function enqueueSyncEvent(entityType: PendingSyncEvent['entityType'], entityId: string, action: string,
+  payload: Record<string, unknown>, occurredAt: string, eventId = createId()): void {
+  insertSyncEvent.run(eventId,entityType,entityId,action,occurredAt,JSON.stringify(payload),new Date().toISOString());
+}
+
+export function pendingSyncEvents(limit = 50): PendingSyncEvent[] {
+  const rows = db.prepare(`SELECT event_id,entity_type,entity_id,action,occurred_at,payload_json,attempt_count
+    FROM sync_outbox WHERE synced_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+    ORDER BY outbox_id LIMIT ?`).all(new Date().toISOString(),limit) as Array<{
+      event_id:string;entity_type:PendingSyncEvent['entityType'];entity_id:string;action:string;occurred_at:string;payload_json:string;attempt_count:number;
+    }>;
+  return rows.map(row=>({eventId:row.event_id,entityType:row.entity_type,entityId:row.entity_id,action:row.action,
+    occurredAt:row.occurred_at,payload:JSON.parse(row.payload_json) as Record<string,unknown>,attemptCount:row.attempt_count}));
+}
+
+export function acknowledgeSyncEvents(eventIds: string[]): void {
+  if (!eventIds.length) return;
+  const update = db.prepare('UPDATE sync_outbox SET synced_at=?,next_attempt_at=NULL,last_error=NULL WHERE event_id=? AND synced_at IS NULL');
+  const syncedAt = new Date().toISOString();
+  db.transaction(()=>{for(const eventId of eventIds)update.run(syncedAt,eventId);})();
+}
+
+export function failSyncEvents(eventIds: string[], errorMessage: string): void {
+  if (!eventIds.length) return;
+  const update = db.prepare(`UPDATE sync_outbox SET attempt_count=attempt_count+1,last_error=?,
+    next_attempt_at=? WHERE event_id=? AND synced_at IS NULL`);
+  const now=Date.now();
+  db.transaction(()=>{for(const eventId of eventIds){
+    const row=db.prepare('SELECT attempt_count FROM sync_outbox WHERE event_id=? AND synced_at IS NULL').get(eventId) as {attempt_count:number}|undefined;
+    if(!row)continue;
+    const delayMs=Math.min(5*60_000,1000*2**Math.min(row.attempt_count,8));
+    update.run(errorMessage.slice(0,240),new Date(now+delayMs).toISOString(),eventId);
+  }})();
+}
+
+export function syncOutboxStatus(){
+  return db.prepare(`SELECT
+    COALESCE(SUM(CASE WHEN synced_at IS NULL THEN 1 ELSE 0 END),0) AS pending,
+    COALESCE(SUM(CASE WHEN synced_at IS NULL AND attempt_count>0 THEN 1 ELSE 0 END),0) AS failed,
+    MAX(synced_at) AS lastSyncedAt FROM sync_outbox`).get() as {pending:number;failed:number;lastSyncedAt:string|null};
+}
