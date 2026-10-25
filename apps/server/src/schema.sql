@@ -29,6 +29,12 @@ CREATE TABLE IF NOT EXISTS menu_modifiers (
   UNIQUE(tenant_id,outlet_id,id)
 );
 CREATE INDEX IF NOT EXISTS modifiers_by_item ON menu_modifiers(tenant_id,outlet_id,menu_item_id,group_name,sort_order);
+CREATE TABLE IF NOT EXISTS menu_sync_state (
+  tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, version TEXT NOT NULL,
+  last_synced_at TEXT NOT NULL, last_error TEXT,
+  PRIMARY KEY(tenant_id,outlet_id),
+  FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id)
+);
 CREATE TABLE IF NOT EXISTS outlet_counters (
   tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, counter_name TEXT NOT NULL, next_value INTEGER NOT NULL,
   PRIMARY KEY(tenant_id,outlet_id,counter_name),
@@ -61,6 +67,19 @@ CREATE TABLE IF NOT EXISTS order_lines (
   FOREIGN KEY(tenant_id,outlet_id,menu_item_id) REFERENCES menu_items(tenant_id,outlet_id,id)
 );
 CREATE INDEX IF NOT EXISTS order_lines_by_order ON order_lines(tenant_id,outlet_id,order_id);
+CREATE TABLE IF NOT EXISTS order_line_voids (
+  order_line_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, order_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL, reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 3 AND 120), voided_at TEXT NOT NULL,
+  FOREIGN KEY(tenant_id,outlet_id,order_id) REFERENCES orders(tenant_id,outlet_id,id),
+  FOREIGN KEY(order_line_id) REFERENCES order_lines(id)
+);
+CREATE INDEX IF NOT EXISTS order_line_voids_by_order ON order_line_voids(tenant_id,outlet_id,order_id);
+CREATE TABLE IF NOT EXISTS order_edit_commands (
+  command_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, order_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK(action IN ('lines_added','line_voided','order_voided')),
+  request_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
+  FOREIGN KEY(tenant_id,outlet_id,order_id) REFERENCES orders(tenant_id,outlet_id,id)
+);
 CREATE TABLE IF NOT EXISTS kitchen_tickets (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, order_id TEXT NOT NULL,
   station TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('new','preparing','ready','voided')),
@@ -93,11 +112,13 @@ CREATE TABLE IF NOT EXISTS payment_events (
   id TEXT PRIMARY KEY, command_id TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL,
   order_id TEXT NOT NULL, terminal_id TEXT NOT NULL, method TEXT NOT NULL CHECK(method IN ('cash','upi','card')),
   amount_minor INTEGER NOT NULL CHECK(amount_minor >= 0), status TEXT NOT NULL CHECK(status IN ('succeeded','failed')),
-  shift_id TEXT,
+  shift_id TEXT, entry_type TEXT NOT NULL DEFAULT 'tender' CHECK(entry_type IN ('tender','refund')),
+  refund_of TEXT REFERENCES payment_events(id), refund_reason TEXT,
   provider_reference TEXT, created_at TEXT NOT NULL,
   FOREIGN KEY(tenant_id,outlet_id,order_id) REFERENCES orders(tenant_id,outlet_id,id),
   FOREIGN KEY(tenant_id,outlet_id,shift_id) REFERENCES shifts(tenant_id,outlet_id,id)
 );
+CREATE INDEX IF NOT EXISTS payments_by_refund ON payment_events(tenant_id,outlet_id,refund_of,status);
 CREATE TABLE IF NOT EXISTS audit_events (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, actor_id TEXT NOT NULL,
   terminal_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,

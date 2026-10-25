@@ -53,10 +53,25 @@ export interface OrderLine {
   note?: string;
   kitchenStation: string;
   modifiers: ModifierOption[];
+  voidedAt?: string;
+  voidReason?: string;
+}
+
+export interface AddOrderLinesCommand {
+  commandId: string;
+  lines: OrderLineDraft[];
+}
+
+export interface VoidOrderLineCommand {
+  commandId: string;
+  reason: string;
 }
 
 export interface KitchenOrder {
   id: string;
+  ticketId?: string;
+  kitchenStation?: string;
+  ticketStatus?: 'new' | 'preparing' | 'ready' | 'voided';
   orderNumber: string;
   orderType: OrderType;
   tableLabel: string | null;
@@ -84,8 +99,9 @@ export interface PaymentCommand {
   commandId: string;
   orderId: string;
   shiftId: string;
-  method: PaymentMethod;
-  amountMinor: number;
+  method?: PaymentMethod;
+  amountMinor?: number;
+  tenders?: Array<{ method: PaymentMethod; amountMinor: number }>;
 }
 
 export interface ShiftRecord {
@@ -106,6 +122,22 @@ export interface ShiftSummary {
   cashInMinor: number;
   cashOutMinor: number;
   expectedCashMinor: number;
+}
+
+export interface DailySalesReport {
+  date: string;
+  timeZone: string;
+  outletName: string;
+  currency: string;
+  startAt: string;
+  endAt: string;
+  generatedAt: string;
+  totals: { paidOrderCount: number; subtotalMinor: number; taxTotalMinor: number; salesMinor: number };
+  refunds: { count: number; amountMinor: number };
+  tenders: Array<{ method: PaymentMethod; amountMinor: number; paymentCount: number }>;
+  items: Array<{ menuItemId: string; name: string; quantity: number; salesMinor: number }>;
+  voids: { lineCount: number; quantity: number; amountMinor: number };
+  shifts: { closedCount: number; expectedCashMinor: number; countedCashMinor: number; varianceMinor: number };
 }
 
 export interface CashMovementCommand {

@@ -1,0 +1,421 @@
+import assert from 'node:assert/strict';
+import { createHash, randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+import { test } from 'node:test';
+import WebSocket from 'ws';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+const tenantId = 'test-tenant';
+const outletId = 'test-outlet';
+const terminalId = 'test-terminal';
+const terminalKey = 'test-terminal-key-'.padEnd(48, 'x');
+const modifiers = [{ id: 'cloud-modifier', group: 'Size', name: 'Large', priceDeltaMinor: 50 }];
+const items = [
+  { id: 'cloud-poha', name: 'Indori Poha', category: 'Breakfast', priceMinor: 500, emoji: '🍲', color: '#dceee2',
+    tag: null, vegetarian: true, available: true, kitchenStation: 'Hot kitchen', modifiers },
+  { id: 'cloud-chai', name: 'Masala Chai', category: 'Beverages', priceMinor: 200, emoji: '☕', color: '#f4e8d5',
+    tag: null, vegetarian: true, available: true, kitchenStation: 'Beverage station', modifiers: [] },
+];
+const version = createHash('sha256').update(JSON.stringify(items)).digest('hex');
+let upstreamAvailable = true;
+const seenEtags = [];
+let serverLogs = '';
+let sessionCookie = '';
+
+const upstream = createServer(async (request, response) => {
+  const token = request.headers.authorization?.replace(/^Bearer\s+/i, '') ?? '';
+  const identity = {
+    'owner-token': { id: 'owner-user', email: 'owner@example.test', role: 'owner' },
+    'cashier-token': { id: 'cashier-user', email: 'cashier@example.test', role: 'cashier' },
+    'kitchen-token': { id: 'kitchen-user', email: 'kitchen@example.test', role: 'kitchen' },
+  }[token];
+  if (request.url === '/auth/v1/user') {
+    response.writeHead(identity ? 200 : 401, { 'content-type': 'application/json' })
+      .end(JSON.stringify(identity ? { id: identity.id, email: identity.email, user_metadata: { display_name: identity.role } } : { error: 'invalid token' }));
+    return;
+  }
+  if (request.url?.startsWith('/rest/v1/tenant_memberships?')) {
+    const rows = identity?.role === 'owner' ? [{ role: 'owner', status: 'active' }] : [];
+    response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(rows));
+    return;
+  }
+  if (request.url?.startsWith('/rest/v1/outlet_memberships?')) {
+    const rows = identity && identity.role !== 'owner' ? [{ role: identity.role, status: 'active' }] : [];
+    response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(rows));
+    return;
+  }
+  if (request.headers['x-pos-terminal-key'] !== terminalKey) {
+    response.writeHead(401, { 'content-type': 'application/json' }).end('{"error":"bad key"}');
+    return;
+  }
+  if (!upstreamAvailable) {
+    response.writeHead(503, { 'content-type': 'application/json' }).end('{"error":"simulated WAN outage"}');
+    return;
+  }
+  if (request.method === 'GET') {
+    seenEtags.push(request.headers['if-none-match'] ?? null);
+    const etag = `"${version}"`;
+    if (request.headers['if-none-match'] === etag) {
+      response.writeHead(304, { etag, 'cache-control': 'no-store' }).end();
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json', etag, 'cache-control': 'no-store' })
+      .end(JSON.stringify({ tenantId, outletId, version, items }));
+    return;
+  }
+  if (request.method === 'POST') {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    const payload = JSON.parse(body);
+    response.writeHead(200, { 'content-type': 'application/json' })
+      .end(JSON.stringify({ acceptedEventIds: payload.events.map((event) => event.eventId) }));
+    return;
+  }
+  response.writeHead(405).end();
+});
+
+async function listen(target, port = 0) {
+  await new Promise((resolveListen, reject) => {
+    target.once('error', reject);
+    target.listen(port, '127.0.0.1', resolveListen);
+  });
+  return target.address().port;
+}
+
+async function waitFor(check, message, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const value = await check();
+      if (value) return value;
+    } catch { /* The local edge may still be starting or restarting. */ }
+    await delay(100);
+  }
+  throw new Error(`${message}. Server output: ${serverLogs.slice(-1800)}`);
+}
+
+function startEdge({ port, databasePath, upstreamUrl }) {
+  const child = spawn(process.execPath, ['apps/server/dist/index.js'], {
+    cwd: root,
+    env: {
+      ...process.env,
+      NODE_ENV: 'production', PORT: String(port), POS_DATABASE_PATH: databasePath,
+      POS_TENANT_ID: tenantId, POS_TENANT_NAME: 'Test Cafe', POS_OUTLET_ID: outletId,
+      POS_OUTLET_NAME: 'Test Outlet', POS_TERMINAL_ID: terminalId, POS_TERMINAL_NAME: 'Counter 1',
+      POS_LOCATION_LABEL: 'Test Location', POS_ACTOR_ID: 'test-manager', POS_TIMEZONE: 'Asia/Kolkata', POS_CURRENCY: 'INR', POS_TAX_RATE_BPS: '500',
+      POS_SYNC_URL: upstreamUrl, POS_TERMINAL_KEY: terminalKey,
+      VITE_SUPABASE_URL: new URL(upstreamUrl).origin, VITE_SUPABASE_PUBLISHABLE_KEY: 'test-publishable-key',
+      POS_SESSION_SECRET: 'test-session-secret-that-is-at-least-32-bytes', POS_COOKIE_SECURE: 'false',
+      MOCK_PRINTER_HOST: '127.0.0.1', MOCK_PRINTER_PORT: '0',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.on('data', (chunk) => { serverLogs = (serverLogs + chunk.toString()).slice(-5000); });
+  child.stderr.on('data', (chunk) => { serverLogs = (serverLogs + chunk.toString()).slice(-5000); });
+  return child;
+}
+
+async function stopEdge(child) {
+  if (child.exitCode !== null) return;
+  child.kill('SIGTERM');
+  await Promise.race([new Promise((resolveExit) => child.once('exit', resolveExit)), delay(3000)]);
+  if (child.exitCode === null) child.kill('SIGKILL');
+}
+
+async function jsonRequest(baseUrl, path, init) {
+  const headers = new Headers(init?.headers);
+  if (sessionCookie) headers.set('cookie', sessionCookie);
+  const response = await fetch(`${baseUrl}${path}`, { ...init, headers });
+  const body = await response.json();
+  return { response, body };
+}
+
+async function receiveSocketMessage(url, cookie) {
+  return new Promise((resolveMessage, rejectMessage) => {
+    const socket = new WebSocket(url, { headers: cookie ? { cookie } : {} });
+    socket.once('message', (data) => {
+      try { resolveMessage({ message: JSON.parse(data.toString()), statusCode: 101 }); }
+      catch (error) { rejectMessage(error); }
+      socket.close();
+    });
+    socket.once('unexpected-response', (_request, response) => resolveMessage({ statusCode: response.statusCode }));
+    socket.once('error', rejectMessage);
+  });
+}
+
+test('managed menu sync is local-first across WAN loss and an edge restart', { timeout: 45000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'common-table-menu-sync-'));
+  const databasePath = join(directory, 'edge.sqlite');
+  const upstreamPort = await listen(upstream);
+  const edgePortServer = createServer();
+  const edgePort = await listen(edgePortServer);
+  await new Promise((resolveClose) => edgePortServer.close(resolveClose));
+  const upstreamUrl = `http://127.0.0.1:${upstreamPort}/functions/v1/pos-sync`;
+  const baseUrl = `http://127.0.0.1:${edgePort}`;
+  let child;
+  t.after(async () => {
+    if (child) await stopEdge(child);
+    await new Promise((resolveClose) => upstream.close(resolveClose));
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  upstreamAvailable = true;
+  serverLogs = '';
+  child = startEdge({ port: edgePort, databasePath, upstreamUrl });
+  await waitFor(async () => (await fetch(`${baseUrl}/api/ready`)).ok, 'edge server did not become ready');
+  const unauthenticatedSocket = await receiveSocketMessage(`${baseUrl.replace(/^http/, 'ws')}/socket`);
+  assert.equal(unauthenticatedSocket.statusCode, 401, 'WebSocket data requires an outlet session');
+  assert.equal((await jsonRequest(baseUrl, '/api/orders')).response.status, 401, 'order data is unavailable without a staff session');
+  const ownerLogin = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer owner-token' } });
+  assert.equal(ownerLogin.response.status, 200);
+  assert.equal(ownerLogin.body.role, 'owner');
+  const cookieHeader = ownerLogin.response.headers.get('set-cookie');
+  assert.match(cookieHeader, /HttpOnly/);
+  assert.match(cookieHeader, /SameSite=Strict/);
+  assert.doesNotMatch(cookieHeader, /; Secure/);
+  sessionCookie = cookieHeader.split(';', 1)[0];
+  assert.equal((await jsonRequest(baseUrl, '/api/auth/session')).body.userId, 'owner-user');
+  const kitchenLogin = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer kitchen-token' } });
+  assert.equal(kitchenLogin.response.status, 200);
+  sessionCookie = kitchenLogin.response.headers.get('set-cookie').split(';', 1)[0];
+  assert.equal((await jsonRequest(baseUrl, '/api/kitchen')).response.status, 200);
+  assert.equal((await jsonRequest(baseUrl, '/api/orders')).response.status, 403, 'kitchen staff cannot read the cashier order list');
+  assert.equal((await jsonRequest(baseUrl, '/api/reports/daily')).response.status, 403, 'kitchen staff cannot read financial reports');
+  assert.equal((await jsonRequest(baseUrl, '/api/orders', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).response.status, 403);
+  const cashierLogin = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer cashier-token' } });
+  assert.equal(cashierLogin.response.status, 200);
+  sessionCookie = cashierLogin.response.headers.get('set-cookie').split(';', 1)[0];
+  assert.equal((await jsonRequest(baseUrl, '/api/reports/daily')).response.status, 403, 'cashiers cannot read manager reports');
+  const ownerSession = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer owner-token' } });
+  sessionCookie = ownerSession.response.headers.get('set-cookie').split(';', 1)[0];
+  await waitFor(async () => {
+    const { body } = await jsonRequest(baseUrl, '/api/sync/status');
+    return body.menu?.version === version;
+  }, 'cloud menu did not hydrate into SQLite');
+
+  const firstMenu = await jsonRequest(baseUrl, '/api/menu');
+  assert.equal(firstMenu.body.length, 2);
+  assert.equal(firstMenu.body[0].name, 'Indori Poha');
+  assert.equal(firstMenu.body[0].priceMinor, 500);
+  assert.equal(firstMenu.body[0].modifiers[0].priceDeltaMinor, 50);
+
+  upstreamAvailable = false;
+  const commandId = randomUUID();
+  const created = await jsonRequest(baseUrl, '/api/orders', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ commandId, tenantId, outletId, terminalId, orderType: 'takeaway', guestCount: 1,
+      lines: [{ menuItemId: 'cloud-poha', quantity: 1, modifierIds: ['cloud-modifier'] }] }),
+  });
+  assert.equal(created.response.status, 201);
+  assert.equal(created.body.totalMinor, 578, 'configured tax is included in the accepted order total');
+  assert.equal((await jsonRequest(baseUrl, '/api/menu')).body.length, 2);
+
+  const addCommandId = randomUUID();
+  const addition = { commandId: addCommandId, lines: [{ menuItemId: 'cloud-chai', quantity: 1 }] };
+  const added = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/lines`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(addition),
+  });
+  assert.equal(added.response.status, 201);
+  assert.equal(added.body.totalMinor, 788);
+  const replayedAddition = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/lines`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(addition),
+  });
+  assert.equal(replayedAddition.response.status, 200);
+  assert.equal(replayedAddition.body.lines.length, 2);
+
+  const kitchen = await jsonRequest(baseUrl, '/api/kitchen');
+  assert.equal(kitchen.body.length, 2, 'one order creates separate tickets per kitchen station');
+  const hotTicket = kitchen.body.find((ticket) => ticket.kitchenStation === 'Hot kitchen');
+  const beverageTicket = kitchen.body.find((ticket) => ticket.kitchenStation === 'Beverage station');
+  assert.deepEqual(hotTicket.lines.map((line) => line.menuItemId), ['cloud-poha']);
+  assert.deepEqual(beverageTicket.lines.map((line) => line.menuItemId), ['cloud-chai']);
+  assert.equal(hotTicket.ticketStatus, 'new');
+  assert.equal(beverageTicket.ticketStatus, 'new');
+
+  const beverageStatusUrl = `/api/orders/${created.body.id}/stations/${encodeURIComponent('Beverage station')}/status`;
+  const kitchenSession = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer kitchen-token' } });
+  sessionCookie = kitchenSession.response.headers.get('set-cookie').split(';', 1)[0];
+  const kitchenSocket = await receiveSocketMessage(`${baseUrl.replace(/^http/, 'ws')}/socket`, sessionCookie);
+  assert.equal(kitchenSocket.message.type, 'kitchen.snapshot');
+  assert.equal('totalMinor' in kitchenSocket.message.payload[0], false, 'kitchen sockets do not receive sales totals');
+  assert.equal('unitPriceMinor' in kitchenSocket.message.payload[0].lines[0], false, 'kitchen sockets do not receive item prices');
+  const modifiedKitchenLine = kitchenSocket.message.payload.flatMap((ticket) => ticket.lines).find((line) => line.modifiers.length > 0);
+  assert.equal(modifiedKitchenLine.modifiers[0].priceDeltaMinor, 0, 'kitchen sockets do not receive modifier prices');
+  const forbiddenKitchenVoid = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/lines/${added.body.lines.find((line) => line.menuItemId === 'cloud-chai').id}/void`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ commandId: randomUUID(), reason: 'not allowed' }),
+  });
+  assert.equal(forbiddenKitchenVoid.response.status, 403, 'kitchen staff cannot void order items');
+  const preparingBeverage = await jsonRequest(baseUrl, beverageStatusUrl, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'preparing' }),
+  });
+  assert.equal(preparingBeverage.body.status, 'preparing');
+  assert.equal('totalMinor' in preparingBeverage.body, false, 'kitchen status responses do not expose order totals');
+  let stationTickets = (await jsonRequest(baseUrl, '/api/kitchen')).body;
+  assert.equal(stationTickets.find((ticket) => ticket.kitchenStation === 'Beverage station').ticketStatus, 'preparing');
+  assert.equal(stationTickets.find((ticket) => ticket.kitchenStation === 'Hot kitchen').ticketStatus, 'new');
+  const ownerAfterKitchen = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer owner-token' } });
+  sessionCookie = ownerAfterKitchen.response.headers.get('set-cookie').split(';', 1)[0];
+
+  const readyBeverage = await jsonRequest(baseUrl, beverageStatusUrl, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'ready' }),
+  });
+  assert.equal(readyBeverage.body.status, 'sent', 'the order remains open while the hot kitchen ticket is new');
+  const preparingHot = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/stations/${encodeURIComponent('Hot kitchen')}/status`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'preparing' }),
+  });
+  assert.equal(preparingHot.body.status, 'preparing');
+  const readyHot = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/stations/${encodeURIComponent('Hot kitchen')}/status`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'ready' }),
+  });
+  assert.equal(readyHot.body.status, 'ready', 'the order becomes ready when every active station is ready');
+  const replayReady = await jsonRequest(baseUrl, beverageStatusUrl, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'ready' }),
+  });
+  assert.equal(replayReady.body.status, 'ready', 'repeating the same ticket transition is idempotent');
+
+  const chaiLine = added.body.lines.find((line) => line.menuItemId === 'cloud-chai');
+  const voidCommandId = randomUUID();
+  const voidBody = { commandId: voidCommandId, reason: 'Guest changed mind' };
+  const voided = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/lines/${chaiLine.id}/void`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(voidBody),
+  });
+  assert.equal(voided.response.status, 200);
+  assert.equal(voided.body.totalMinor, 578);
+  assert.equal(voided.body.lines.find((line) => line.id === chaiLine.id).voidReason, 'Guest changed mind');
+  stationTickets = (await jsonRequest(baseUrl, '/api/kitchen')).body;
+  assert.equal(stationTickets.length, 1, 'voiding the last item removes only its station ticket');
+  assert.equal(stationTickets[0].kitchenStation, 'Hot kitchen');
+  assert.equal(stationTickets[0].ticketStatus, 'ready');
+  assert.equal(voided.body.status, 'ready');
+  const replayedVoid = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/lines/${chaiLine.id}/void`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(voidBody),
+  });
+  assert.equal(replayedVoid.body.lines.filter((line) => line.voidedAt).length, 1);
+  const queued = await jsonRequest(baseUrl, '/api/sync/status');
+  assert.ok(queued.body.pending >= 1, 'order events remain in the durable outbox while WAN is down');
+
+  await stopEdge(child);
+  child = undefined;
+  upstreamAvailable = true;
+  serverLogs = '';
+  child = startEdge({ port: edgePort, databasePath, upstreamUrl });
+  await waitFor(async () => {
+    const { body } = await jsonRequest(baseUrl, '/api/orders');
+    return body.some((order) => order.commandId === commandId);
+  }, 'accepted order was lost after edge restart');
+  await waitFor(async () => {
+    const { body } = await jsonRequest(baseUrl, '/api/sync/status');
+    return body.pending === 0 && body.menu?.version === version;
+  }, 'outbox did not sync after WAN returned');
+  assert.ok(seenEtags.some((etag) => etag === `"${version}"`), 'edge requests a 304 when the cloud menu is unchanged');
+  const restoredMenu = await jsonRequest(baseUrl, '/api/menu');
+  assert.deepEqual(restoredMenu.body.map((item) => item.id), ['cloud-poha', 'cloud-chai']);
+  const restoredOrder = (await jsonRequest(baseUrl, '/api/orders')).body.find((order) => order.commandId === commandId);
+  assert.equal(restoredOrder.totalMinor, 578);
+  assert.equal(restoredOrder.status, 'ready');
+  assert.equal(restoredOrder.lines.find((line) => line.menuItemId === 'cloud-chai').voidReason, 'Guest changed mind');
+  const restoredTickets = (await jsonRequest(baseUrl, '/api/kitchen')).body;
+  assert.equal(restoredTickets.length, 1);
+  assert.equal(restoredTickets[0].ticketStatus, 'ready');
+
+  const openedShift = await jsonRequest(baseUrl, '/api/shifts/open', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ commandId: randomUUID(), openingFloatMinor: 50000 }),
+  });
+  assert.equal(openedShift.response.status, 201);
+  const splitPaymentCommand = { commandId: randomUUID(), orderId: created.body.id, shiftId: openedShift.body.shift.id,
+    tenders: [{ method: 'cash', amountMinor: 300 }, { method: 'upi', amountMinor: 278 }] };
+  const invalidSplit = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/payment`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...splitPaymentCommand, commandId: randomUUID(), tenders: [{ method: 'cash', amountMinor: 300 }, { method: 'upi', amountMinor: 200 }] }),
+  });
+  assert.equal(invalidSplit.response.status, 409, 'tender amounts must equal the invoice total');
+  const payment = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/payment`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(splitPaymentCommand),
+  });
+  assert.equal(payment.body.status, 'paid');
+  assert.equal(payment.body.invoiceNumber, 'J-INV-000001');
+  const replayPayment = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/payment`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(splitPaymentCommand),
+  });
+  assert.equal(replayPayment.response.status, 200, 'a repeated split tender command returns the original paid order');
+  const cashierSession = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer cashier-token' } });
+  const cashierCookie = cashierSession.response.headers.get('set-cookie').split(';', 1)[0];
+  const refundCommand = { commandId: randomUUID(), paymentId: '', shiftId: openedShift.body.shift.id, amountMinor: 100, reason: 'Guest changed mind' };
+  const paymentEvents = await jsonRequest(baseUrl, '/api/sync/status');
+  assert.ok(paymentEvents.body.pending >= 4, 'order and both tender events are durably queued');
+  const tenderList = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/payments`);
+  assert.equal(tenderList.response.status, 200);
+  const originalUpi = tenderList.body.tenders.find((tender) => tender.method === 'upi');
+  refundCommand.paymentId = originalUpi.id;
+  assert.equal(originalUpi.refundableMinor, 278);
+  const cashierPaymentList = await fetch(`${baseUrl}/api/orders/${created.body.id}/payments`, { headers: { cookie: cashierCookie } });
+  assert.equal(cashierPaymentList.status, 403, 'cashiers cannot inspect manager refund controls');
+  const cashierRefund = await fetch(`${baseUrl}/api/orders/${created.body.id}/refunds`, {
+    method: 'POST', headers: { cookie: cashierCookie, 'content-type': 'application/json' }, body: JSON.stringify(refundCommand),
+  });
+  assert.equal(cashierRefund.status, 403, 'cashiers cannot issue manager-only refunds');
+  const ownerSessionAfterCashier = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer owner-token' } });
+  sessionCookie = ownerSessionAfterCashier.response.headers.get('set-cookie').split(';', 1)[0];
+  const refund = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/refunds`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(refundCommand),
+  });
+  assert.equal(refund.response.status, 201);
+  assert.equal(refund.body.refund.amountMinor, 100);
+  const replayRefund = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/refunds`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(refundCommand),
+  });
+  assert.equal(replayRefund.response.status, 200, 'refund retries return the original refund event');
+  const overRefund = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/refunds`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...refundCommand, commandId: randomUUID(), amountMinor: 179 }),
+  });
+  assert.equal(overRefund.response.status, 409, 'refunds cannot exceed the remaining amount on their original tender');
+  const alteredReplay = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/refunds`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...refundCommand, amountMinor: 101 }),
+  });
+  assert.equal(alteredReplay.response.status, 409, 'reusing a refund command with changed values is rejected');
+  const closedShift = await jsonRequest(baseUrl, `/api/shifts/${openedShift.body.shift.id}/close`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ commandId: randomUUID(), countedCashMinor: 50300 }),
+  });
+  assert.equal(closedShift.body.shift.varianceMinor, 0);
+
+  const report = await jsonRequest(baseUrl, '/api/reports/daily');
+  assert.equal(report.response.status, 200);
+  assert.equal(report.body.totals.paidOrderCount, 1);
+  assert.equal(report.body.totals.subtotalMinor, 455);
+  assert.equal(report.body.totals.salesMinor, 478);
+  assert.equal(report.body.totals.taxTotalMinor, 23, 'tax refunds are allocated proportionally to the original order tax');
+  assert.deepEqual(report.body.refunds, { count: 1, amountMinor: 100 });
+  assert.deepEqual(report.body.tenders, [
+    { method: 'cash', amountMinor: 300, paymentCount: 1 },
+    { method: 'upi', amountMinor: 178, paymentCount: 1 },
+  ]);
+  assert.deepEqual(report.body.items.map((item) => ({ name: item.name, quantity: item.quantity, salesMinor: item.salesMinor })), [
+    { name: 'Indori Poha', quantity: 1, salesMinor: 550 },
+  ], 'voided items are excluded from paid item sales');
+  assert.deepEqual(report.body.voids, { lineCount: 1, quantity: 1, amountMinor: 200 });
+  assert.deepEqual(report.body.shifts, { closedCount: 1, expectedCashMinor: 50300, countedCashMinor: 50300, varianceMinor: 0 });
+  const start = new Date(report.body.startAt);
+  assert.equal(start.getUTCHours(), 18, 'Asia/Kolkata report days start at local midnight');
+  assert.equal(start.getUTCMinutes(), 30);
+  const invalidDate = await fetch(`${baseUrl}/api/reports/daily?date=2026-02-30`, { headers: { cookie: sessionCookie } });
+  assert.equal(invalidDate.status, 400);
+  const csv = await fetch(`${baseUrl}/api/reports/daily.csv?date=${report.body.date}`, { headers: { cookie: sessionCookie } });
+  assert.equal(csv.status, 200);
+  assert.match(csv.headers.get('content-type'), /text\/csv/);
+  const csvText = await csv.text();
+  assert.match(csvText, /net_sales/);
+  assert.match(csvText, /refunds/);
+  assert.match(csvText, /Indori Poha/);
+  assert.match(csvText, /closed_shifts/);
+});

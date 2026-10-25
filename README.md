@@ -28,9 +28,19 @@ npm run build
 npm start
 ```
 
-When `apps/web/dist` exists, Express serves the client and API on port 3001. Copy `.env.example` to `.env` and set the outlet's `POS_*` values before a production run. Demo identity defaults are allowed only in development; production requires explicit tenant, outlet, terminal, and actor configuration. The default tax rate is a demo value, not a tax configuration for a real outlet.
+When `apps/web/dist` exists, Express serves the client and API on port 3001. Copy `.env.example` to `.env` and set the outlet's `POS_*` values before a production run. Production also requires a random `POS_SESSION_SECRET` of at least 32 characters and the Supabase project URL and publishable key. `POS_ACTOR_ID` remains a development fallback; order, void, payment, and shift audit records use the signed-in staff user's ID. The default tax rate is a demo value, not a tax configuration for a real outlet.
 
-The server adds an `x-request-id` response header and emits one JSON request log per HTTP request. `GET /api/health` is the liveness endpoint; `GET /api/ready` checks required outlet configuration and SQLite integrity; `GET /api/context` returns the configured outlet identity needed by the POS UI. To create a SQLite-consistent backup while the edge server is running, build first and run `npm --workspace @common-table/server run backup`. Set `POS_BACKUP_PATH` to choose the destination. Verify that the backup log reports `integrity: "ok"`; store backups outside the outlet device and practice restoration before pilot use.
+The server adds an `x-request-id` response header and emits one JSON request log per HTTP request. `GET /api/health` is the liveness endpoint; `GET /api/ready` checks required outlet configuration and SQLite integrity; `GET /api/context` returns the configured outlet identity needed by the POS UI. Protected API routes require a staff session. Sign in through `/admin` on the same outlet edge origin; Supabase verifies the user and outlet membership, then the edge sets a signed `HttpOnly` cookie that keeps working during a WAN outage. Owner/manager, cashier, kitchen, and viewer roles have separate route permissions. Kitchen API and WebSocket snapshots omit order and item prices.
+
+To create a SQLite-consistent backup while the edge server is running, build first and run `npm --workspace @common-table/server run backup`. Set `POS_BACKUP_PATH` to choose the destination. Verify that the backup log reports `integrity: "ok"`; store backups outside the outlet device. To restore, stop the edge service and run:
+
+```sh
+POS_RESTORE_SOURCE=/path/to/verified-backup.db \
+POS_RESTORE_PATH=/path/to/common-table.db \
+npm --workspace @common-table/server run restore
+```
+
+The restore command checks SQLite integrity, foreign keys, and the configured tenant/outlet before replacement. If the destination exists, it creates and verifies a `.pre-restore-<timestamp>.db` safety copy. Confirm `database.restore.completed` and `integrity: "ok"`, then start the edge and check `/api/ready` before allowing service.
 
 ## Vercel deployment
 
@@ -38,15 +48,18 @@ The root `vercel.json` builds the monorepo and publishes `apps/web/dist`. It hos
 
 ## Prototype boundaries
 
-- The menu, staff, and tax are demo data. Outlet identity is configurable through environment settings. The `/admin` manager route creates tenants/outlets, staff invitations, and cloud terminal records; local edge staff authentication, terminal-key pairing, managed menu administration, retention, and cloud order sync still need implementation. Staff invite links are returned for the manager to share manually; no staff invitation email is sent.
+- The Indore menu and tax remain training data. Outlet identity is configurable through environment settings. The `/admin` route supports tenant/outlet setup, cloud menu administration, staff invitations, and terminal enrollment/revocation. Staff invite links are returned for the manager to share manually; no staff invitation email is sent. Local edge sessions and role-based API permissions are implemented and covered by the mock-auth integration test; a real second-user invite and a paired outlet terminal still need pilot verification.
 - Demo cash/UPI/card tenders are records only. No payment provider is called.
 - Orders made while disconnected are stored in the browser's IndexedDB outbox and retried with the same command ID, preventing duplicate orders on server retries. Browser offline storage is per device/browser profile. Use the app once while connected before relying on the cached shell; across devices on a LAN, deploy with HTTPS.
-- SQLite is the outlet edge database. `db/migrations/0001_core.sql` is the initial PostgreSQL cloud schema direction; cloud replication and conflict resolution are not wired into this prototype.
+- SQLite is the outlet edge database. A terminal-authenticated pull refreshes the managed outlet menu into SQLite as an atomic snapshot; menu versions use ETags, and order acceptance continues from the local copy during WAN loss. A durable local outbox syncs append-only business events to Supabase; the cloud currently stores an event log, not normalized sales/order projections. The edge's Daily reports page reads local SQLite for timezone-aware sales, tax, tender, item, void, and shift closeout totals and exports CSV; it is unavailable from the Vercel-only preview. Offline menu editing and merge-conflict resolution are not implemented.
 - The printer formats ESC/POS-compatible KOTs and receipts and sends them to a mock TCP socket. Validate byte width and printer-specific command support against the chosen hardware before connecting a real printer.
 
 ## Main routes
 
-- `GET /api/health`, `/api/ready`, `/api/context`, `/api/menu`, `/api/orders`, `/api/kitchen`
-- `POST /api/orders`, `PATCH /api/orders/:orderId/status`
+- Public: `GET /api/health`, `/api/ready`, `/api/context`. Staff session: `GET/POST/DELETE /api/auth/session`.
+- Protected: `/api/menu`, `/api/orders`, `/api/kitchen`, `/api/sync/status`, and report routes; permissions vary by staff role.
+- `GET /api/reports/daily`, `/api/reports/daily.csv` (outlet-local business date; local SQLite data)
+- `POST /api/orders`, `POST /api/orders/:orderId/lines`, `POST /api/orders/:orderId/lines/:lineId/void`, `POST /api/orders/:orderId/void`
+- `PATCH /api/orders/:orderId/status`, `/api/orders/:orderId/stations/:station/status`
 - `POST /api/orders/:orderId/payment`, `/api/printer/test`
 - WebSocket `/socket` provides an initial kitchen snapshot and order updates

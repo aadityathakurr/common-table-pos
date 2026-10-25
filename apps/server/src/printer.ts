@@ -32,7 +32,7 @@ export function formatKitchenTicket(order: KitchenOrder): Buffer {
   const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text(`${EDGE_CONFIG.tenantName}\n${EDGE_CONFIG.outletName}\n`),command(ESC,0x45,0),
     text('KITCHEN ORDER\n'),command(ESC,0x61,0),text(line('=')+'\n'),text(columns('ORDER',order.orderNumber)+'\n'),
     text(columns(order.orderType==='dine_in'?(order.tableLabel??'DINE IN'):'TAKEAWAY',new Date(order.createdAt).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}))+'\n'),text(line()+'\n')];
-  for(const item of order.lines){parts.push(command(ESC,0x45,1),text(`${item.quantity} x ${item.name}\n`),command(ESC,0x45,0));for(const modifier of item.modifiers)parts.push(text(`    + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor)})`:''}\n`));for(const row of wrap(item.note??''))if(row)parts.push(text(`    ${row}\n`));}
+  for(const item of order.lines){parts.push(command(ESC,0x45,1),text(`${item.voidedAt?'VOID ':''}${item.quantity} x ${item.name}\n`),command(ESC,0x45,0));if(item.voidReason)parts.push(text(`    REASON: ${item.voidReason}\n`));if(!item.voidedAt){for(const modifier of item.modifiers)parts.push(text(`    + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor)})`:''}\n`));for(const row of wrap(item.note??''))if(row)parts.push(text(`    ${row}\n`));}}
   if(order.note)parts.push(text(line()+ '\n'),text('NOTE: '+wrap(order.note).join('\n')+'\n'));
   parts.push(text(line('=')+'\n\n'),command(GS,0x56,0x41,0x03));
   return Buffer.concat(parts);
@@ -43,7 +43,7 @@ export function formatReceipt(order: OrderRecord): Buffer {
     text(`${EDGE_CONFIG.locationLabel}\n`),text(line('=')+'\n'),text(`INVOICE  ${order.invoiceNumber??'PENDING'}\n`),
     text(`ORDER    ${order.orderNumber}\n`),text(`${new Date(order.createdAt).toLocaleString('en-IN')}\n`),
     text(`${order.orderType==='dine_in'?(order.tableLabel??'Dine in'):'Takeaway'} - ${order.guestCount} guest(s)\n`),text(line()+'\n')];
-  for(const item of order.lines){parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor))+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor)})`:''}\n`));}
+  for(const item of order.lines.filter(line=>!line.voidedAt)){parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor))+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor)})`:''}\n`));}
   parts.push(text(line()+'\n'),text(columns('Subtotal',money(order.subtotalMinor))+'\n'),
     text(columns(`Tax (demo ${order.taxRateBps/100}%)`,money(order.taxTotalMinor))+'\n'),
     command(ESC,0x45,1),text(columns('TOTAL',money(order.totalMinor))+'\n'),command(ESC,0x45,0),

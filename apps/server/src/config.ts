@@ -24,6 +24,10 @@ export const EDGE_CONFIG = Object.freeze({
   timezone: setting('POS_TIMEZONE', 'Asia/Kolkata'),
   currency: setting('POS_CURRENCY', 'INR'),
   taxRateBps: integerSetting('POS_TAX_RATE_BPS', Number(process.env.DEMO_TAX_RATE_BPS ?? 500)),
+  sessionSecret: setting('POS_SESSION_SECRET', 'common-table-development-session-secret'),
+  supabaseUrl: process.env.VITE_SUPABASE_URL?.trim() ?? '',
+  supabasePublishableKey: process.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim() ?? '',
+  secureSessionCookie: process.env.POS_COOKIE_SECURE?.trim() === 'true' || (process.env.NODE_ENV === 'production' && process.env.POS_COOKIE_SECURE?.trim() !== 'false'),
 });
 
 const configuredSupabaseUrl = (process.env.POS_SYNC_URL?.trim()
@@ -39,4 +43,10 @@ export function checkEdgeConfiguration(): void {
   ];
   if (required.some((key) => !EDGE_CONFIG[key])) throw new Error('Outlet configuration is incomplete.');
   if (!/^[A-Z]{3}$/.test(EDGE_CONFIG.currency)) throw new Error('POS_CURRENCY must be a three-letter ISO currency code.');
+  if (EDGE_CONFIG.sessionSecret.length < 32) throw new Error('POS_SESSION_SECRET must contain at least 32 characters.');
+  const hasSupabaseUrl=Boolean(EDGE_CONFIG.supabaseUrl);
+  const hasSupabaseKey=Boolean(EDGE_CONFIG.supabasePublishableKey);
+  if (hasSupabaseUrl!==hasSupabaseKey) throw new Error('Configure both the Supabase Auth URL and publishable key.');
+  if (process.env.NODE_ENV==='production'&&(!hasSupabaseUrl||!hasSupabaseKey))
+    throw new Error('Supabase Auth URL and publishable key are required in production.');
 }
