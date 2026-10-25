@@ -14,7 +14,11 @@ export interface EdgeStaffSession {
 }
 
 const COOKIE_NAME = 'ct_pos_session';
-const SESSION_TTL_SECONDS = 12 * 60 * 60;
+// A persistent local session survives restarts and WAN loss. Activity on the
+// outlet edge renews it locally, so an actively used cashier terminal does not
+// need Supabase to refresh its session. Explicit sign-out still clears it.
+const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const SESSION_RENEWAL_THRESHOLD_SECONDS = SESSION_TTL_SECONDS / 2;
 const SESSION_SECRET = EDGE_CONFIG.sessionSecret;
 const supabaseUrl = EDGE_CONFIG.supabaseUrl.replace(/\/$/, '');
 const publishableKey = EDGE_CONFIG.supabasePublishableKey;
@@ -82,6 +86,11 @@ export function sessionCookie(session: EdgeStaffSession, secure: boolean): strin
   return `${COOKIE_NAME}=${encoded}.${signature}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_TTL_SECONDS}${secure ? '; Secure' : ''}`;
 }
 
+export function refreshStaffSession(session: EdgeStaffSession, now = Math.floor(Date.now() / 1000)): EdgeStaffSession {
+  if (session.expiresAt - now > SESSION_RENEWAL_THRESHOLD_SECONDS) return session;
+  return { ...session, expiresAt: now + SESSION_TTL_SECONDS };
+}
+
 export function clearedSessionCookie(secure: boolean): string {
   return `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? '; Secure' : ''}`;
 }
@@ -140,7 +149,12 @@ export function requireRoles(...roles: StaffRole[]): RequestHandler {
 export function sessionMiddleware(): RequestHandler {
   return (request, response, next) => {
     const session = readStaffSession(request);
-    if (session) { response.locals.staff = session; next(); return; }
+    if (session) {
+      const refreshed = refreshStaffSession(session);
+      response.locals.staff = refreshed;
+      if (refreshed !== session) response.setHeader('Set-Cookie', sessionCookie(refreshed, EDGE_CONFIG.secureSessionCookie));
+      next(); return;
+    }
     if (process.env.NODE_ENV !== 'production') { next(); return; }
     response.status(401).json({ error: 'Sign in to this outlet before continuing.' });
   };

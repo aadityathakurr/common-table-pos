@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
@@ -34,10 +35,16 @@ async function waitForReady(baseUrl, child, readLogs) {
 
 test('production edge validates staff identity and enforces cashier, kitchen, viewer and manager permissions', { timeout: 30000 }, async t => {
   const mockPort = await availablePort();
+  let supabaseUnavailable = false;
+  let supabaseAuthRequests = 0;
   const mock = createHttpServer((request, response) => {
     response.setHeader('access-control-allow-origin', '*');
     const token = request.headers.authorization?.replace(/^Bearer /, '') ?? '';
     response.setHeader('content-type', 'application/json');
+    if (request.url?.startsWith('/auth/v1/') || request.url?.startsWith('/rest/v1/tenant_memberships') || request.url?.startsWith('/rest/v1/outlet_memberships')) {
+      supabaseAuthRequests += 1;
+      if (supabaseUnavailable) { response.writeHead(503); response.end(JSON.stringify({ message: 'offline' })); return; }
+    }
     if (request.url === '/auth/v1/user') {
       if (token === 'invalid') { response.writeHead(401); response.end(JSON.stringify({ message: 'invalid token' })); return; }
       const role = token.split(':')[0];
@@ -59,23 +66,28 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
   const port = await availablePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   let output = '';
-  const child = spawn(process.execPath, ['apps/server/dist/index.js'], {
-    cwd: root,
-    env: {
-      ...process.env,
-      NODE_ENV: 'production', PORT: String(port), POS_DATABASE_PATH: join(directory, 'edge.sqlite'),
-      POS_TENANT_ID: 'auth-test-tenant', POS_TENANT_NAME: 'Auth Test Cafe', POS_OUTLET_ID: 'auth-test-outlet',
-      POS_OUTLET_NAME: 'Auth Test Outlet', POS_TERMINAL_ID: 'auth-test-terminal', POS_TERMINAL_NAME: 'Counter 1',
-      POS_LOCATION_LABEL: 'Test outlet', POS_ACTOR_ID: 'test-actor',
-      POS_TAX_RATE_BPS: '500', POS_CURRENCY: 'INR', POS_TIMEZONE: 'Asia/Kolkata', POS_SESSION_SECRET: secret,
-      POS_COOKIE_SECURE: 'false', VITE_SUPABASE_URL: `http://127.0.0.1:${mockPort}`,
-      VITE_SUPABASE_PUBLISHABLE_KEY: 'test-publishable-key', POS_SYNC_URL: '', POS_SYNC_TERMINAL_KEY: '',
-      MOCK_PRINTER_HOST: '127.0.0.1', MOCK_PRINTER_PORT: '0',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  child.stdout.on('data', chunk => { output = (output + chunk.toString()).slice(-5000); });
-  child.stderr.on('data', chunk => { output = (output + chunk.toString()).slice(-5000); });
+  const edgeEnvironment = {
+    ...process.env,
+    NODE_ENV: 'production', PORT: String(port), POS_DATABASE_PATH: join(directory, 'edge.sqlite'),
+    POS_TENANT_ID: 'auth-test-tenant', POS_TENANT_NAME: 'Auth Test Cafe', POS_OUTLET_ID: 'auth-test-outlet',
+    POS_OUTLET_NAME: 'Auth Test Outlet', POS_TERMINAL_ID: 'auth-test-terminal', POS_TERMINAL_NAME: 'Counter 1',
+    POS_LOCATION_LABEL: 'Test outlet', POS_ACTOR_ID: 'test-actor',
+    POS_TAX_RATE_BPS: '500', POS_CURRENCY: 'INR', POS_TIMEZONE: 'Asia/Kolkata', POS_SESSION_SECRET: secret,
+    POS_COOKIE_SECURE: 'false', POS_AUTO_BACKUP: 'false', VITE_SUPABASE_URL: `http://127.0.0.1:${mockPort}`,
+    VITE_SUPABASE_PUBLISHABLE_KEY: 'test-publishable-key', POS_SYNC_URL: '', POS_SYNC_TERMINAL_KEY: '',
+    MOCK_PRINTER_HOST: '127.0.0.1', MOCK_PRINTER_PORT: '0',
+  };
+  function startEdge() {
+    const edge = spawn(process.execPath, ['apps/server/dist/index.js'], {
+      cwd: root,
+      env: edgeEnvironment,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    edge.stdout.on('data', chunk => { output = (output + chunk.toString()).slice(-5000); });
+    edge.stderr.on('data', chunk => { output = (output + chunk.toString()).slice(-5000); });
+    return edge;
+  }
+  let child = startEdge();
   t.after(async () => {
     if (child.exitCode === null) {
       child.kill('SIGTERM');
@@ -107,6 +119,23 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
   assert.equal(cashier.response.status, 200);
   assert.equal(cashier.body.role, 'cashier');
   assert.match(cashier.response.headers.get('set-cookie') ?? '', /HttpOnly/);
+  const revokedMembership = await fetch(`${baseUrl}/api/auth/session`, {
+    method: 'POST', headers: { authorization: 'Bearer no-outlet:token', cookie: cashier.cookie },
+  });
+  assert.equal(revokedMembership.status, 403);
+  assert.match(revokedMembership.headers.get('set-cookie') ?? '', /Max-Age=0/,
+    'an explicit online outlet-access denial clears a previously valid offline cookie');
+  const nearExpiry = { ...cashier.body, expiresAt: Math.floor(Date.now() / 1000) + 60 };
+  const encodedSession = Buffer.from(JSON.stringify(nearExpiry)).toString('base64url');
+  const signedSession = createHmac('sha256', secret).update(encodedSession).digest('base64url');
+  const nearExpiryCookie = `ct_pos_session=${encodedSession}.${signedSession}`;
+  const renewedResponse = await fetch(`${baseUrl}/api/orders`, { headers: { cookie: nearExpiryCookie } });
+  assert.equal(renewedResponse.status, 200, 'the local edge accepts the verified session without checking Supabase again');
+  const renewedCookie = renewedResponse.headers.get('set-cookie');
+  assert.match(renewedCookie ?? '', /Max-Age=2592000/, 'active local use renews the persistent cookie for 30 days');
+  const renewedPayload = JSON.parse(Buffer.from(renewedCookie.split('=')[1].split('.')[0], 'base64url').toString());
+  assert.ok(renewedPayload.expiresAt > Math.floor(Date.now() / 1000) + 29 * 24 * 60 * 60,
+    'offline session renewal extends its signed local expiry');
   assert.equal((await fetch(`${baseUrl}/api/support/diagnostics.json`, { headers: { cookie: cashier.cookie } })).status, 403);
   const cashierKitchen = await fetch(`${baseUrl}/api/kitchen`, { headers: { cookie: cashier.cookie } });
   assert.equal(cashierKitchen.status, 403);
@@ -120,17 +149,32 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
     body: JSON.stringify({ commandId: 'cashier-refund-command', paymentId: 'p', shiftId: 's', amountMinor: 1, reason: 'test' }),
   });
   assert.equal(cashierRefund.status, 403);
+  const cashierReceiptReprint = await fetch(`${baseUrl}/api/orders/missing/receipt/reprint`, {
+    method: 'POST', headers: { cookie: cashier.cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ reason: 'customer copy' }),
+  });
+  assert.equal(cashierReceiptReprint.status, 404, 'cashiers may request a paid receipt reprint');
 
   const kitchen = await authenticate('kitchen');
   assert.equal(kitchen.response.status, 200);
   assert.equal((await fetch(`${baseUrl}/api/kitchen`, { headers: { cookie: kitchen.cookie } })).status, 200);
   assert.equal((await fetch(`${baseUrl}/api/orders`, { headers: { cookie: kitchen.cookie } })).status, 403);
+  const kitchenReceiptReprint = await fetch(`${baseUrl}/api/orders/missing/receipt/reprint`, {
+    method: 'POST', headers: { cookie: kitchen.cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ reason: 'customer copy' }),
+  });
+  assert.equal(kitchenReceiptReprint.status, 403);
   assert.equal((await fetch(`${baseUrl}/api/support/diagnostics.json`, { headers: { cookie: kitchen.cookie } })).status, 403);
 
   const viewer = await authenticate('viewer');
   assert.equal(viewer.response.status, 200);
   assert.equal((await fetch(`${baseUrl}/api/reports/daily`, { headers: { cookie: viewer.cookie } })).status, 200);
   assert.equal((await fetch(`${baseUrl}/api/orders`, { headers: { cookie: viewer.cookie } })).status, 403);
+  const viewerReceiptReprint = await fetch(`${baseUrl}/api/orders/missing/receipt/reprint`, {
+    method: 'POST', headers: { cookie: viewer.cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ reason: 'customer copy' }),
+  });
+  assert.equal(viewerReceiptReprint.status, 403);
   assert.equal((await fetch(`${baseUrl}/api/support/diagnostics.json`, { headers: { cookie: viewer.cookie } })).status, 403);
 
   const manager = await authenticate('manager');
@@ -159,4 +203,15 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
   const tamperedSignatureChar = manager.cookie[signatureStart] === 'a' ? 'b' : 'a';
   const tamperedCookie = `${manager.cookie.slice(0, signatureStart)}${tamperedSignatureChar}${manager.cookie.slice(signatureStart + 1)}`;
   assert.equal((await fetch(`${baseUrl}/api/orders`, { headers: { cookie: tamperedCookie } })).status, 401);
+
+  const probesBeforeRestart = supabaseAuthRequests;
+  await new Promise(resolve => { child.once('exit', resolve); child.kill('SIGTERM'); });
+  supabaseUnavailable = true;
+  child = startEdge();
+  await waitForReady(baseUrl, child, () => output);
+  const offlineAfterRestart = await fetch(`${baseUrl}/api/orders`, { headers: { cookie: manager.cookie } });
+  assert.equal(offlineAfterRestart.status, 200, 'a verified local session survives edge restart while Supabase is unavailable');
+  assert.equal(supabaseAuthRequests, probesBeforeRestart, 'offline local requests do not contact Supabase Auth or membership APIs');
+  assert.equal((await offlineAfterRestart.json()).length, 0);
+  assert.equal((await fetch(`${baseUrl}/api/orders`)).status, 401, 'restart does not make unauthenticated local access public');
 });

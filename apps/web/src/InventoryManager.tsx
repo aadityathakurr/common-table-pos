@@ -4,7 +4,7 @@ import { Archive, PackagePlus, RefreshCw, Scale } from 'lucide-react';
 import { supabase } from './supabase';
 
 type Unit = 'each'|'g'|'kg'|'ml'|'l'|'portion'|'pack';
-type MovementType = 'receipt'|'waste'|'count_adjustment';
+type MovementType = 'receipt'|'waste'|'count_adjustment'|'sale_consumption';
 interface InventoryItem {
   inventory_item_id: string;
   name: string;
@@ -25,19 +25,24 @@ interface InventoryMovement {
   reason: string;
   occurred_at: string;
 }
+interface MenuItemOption { item_id: string; name: string; available: boolean; }
+interface RecipeComponent { menu_item_id: string; inventory_item_id: string; quantity_per_sale: number; }
 interface Props { tenantId: string; outletId: string; userId: string; }
 
 const units: Unit[] = ['each','g','kg','ml','l','portion','pack'];
 const inputClass = 'h-10 w-full rounded-xl border border-[#dfe6df] bg-white px-3 text-sm text-[#263b30] outline-none focus:border-[#4a8a61]';
 const buttonClass = 'inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-[#286a4f] px-3.5 text-sm font-semibold text-white transition hover:bg-[#1f563f] disabled:cursor-not-allowed disabled:opacity-55';
-const movementName: Record<MovementType,string> = { receipt:'Received', waste:'Waste', count_adjustment:'Stock count' };
+const movementName: Record<MovementType,string> = { receipt:'Received', waste:'Waste', count_adjustment:'Stock count', sale_consumption:'Used in sale' };
 const quantity = (value:number) => Number(value).toLocaleString('en-IN',{maximumFractionDigits:3});
 
 export default function InventoryManager({tenantId,outletId,userId}:Props) {
   const [items,setItems] = useState<InventoryItem[]>([]);
   const [movements,setMovements] = useState<InventoryMovement[]>([]);
+  const [menuItems,setMenuItems] = useState<MenuItemOption[]>([]);
+  const [recipes,setRecipes] = useState<RecipeComponent[]>([]);
   const [itemDraft,setItemDraft] = useState({name:'',sku:'',unit:'each' as Unit,reorderLevel:'0'});
   const [movementDraft,setMovementDraft] = useState({itemId:'',type:'receipt' as MovementType,quantity:'',reason:''});
+  const [recipeDraft,setRecipeDraft] = useState({menuItemId:'',inventoryItemId:'',quantityPerSale:''});
   const [busy,setBusy] = useState(false);
   const [error,setError] = useState('');
   const [notice,setNotice] = useState('');
@@ -49,21 +54,33 @@ export default function InventoryManager({tenantId,outletId,userId}:Props) {
     if(!supabase)return;
     setBusy(true);setError('');
     try {
-      const [itemResult,movementResult] = await Promise.all([
+      const [itemResult,movementResult,menuResult,recipeResult] = await Promise.all([
         supabase.from('inventory_stock_balances').select('inventory_item_id,name,sku,unit,reorder_level,active,on_hand,low_stock')
           .eq('tenant_id',tenantId).eq('outlet_id',outletId).order('name'),
         supabase.from('inventory_movements').select('movement_id,inventory_item_id,movement_type,request_quantity,expected_balance,quantity_delta,reason,occurred_at')
           .eq('tenant_id',tenantId).eq('outlet_id',outletId).order('occurred_at',{ascending:false}).order('movement_id',{ascending:false}).limit(50),
+        supabase.from('menu_items').select('item_id,name,available').eq('tenant_id',tenantId).eq('outlet_id',outletId).order('name'),
+        supabase.from('inventory_recipe_components').select('menu_item_id,inventory_item_id,quantity_per_sale')
+          .eq('tenant_id',tenantId).eq('outlet_id',outletId).order('menu_item_id').order('inventory_item_id'),
       ]);
       if(itemResult.error)throw itemResult.error;
       if(movementResult.error)throw movementResult.error;
+      if(menuResult.error)throw menuResult.error;
+      if(recipeResult.error)throw recipeResult.error;
       const nextItems=((itemResult.data??[]) as InventoryItem[]).map(item=>({...item,
         reorder_level:Number(item.reorder_level),on_hand:Number(item.on_hand),active:Boolean(item.active),low_stock:Boolean(item.low_stock)}));
       const nextMovements=((movementResult.data??[]) as InventoryMovement[]).map(movement=>({...movement,
         request_quantity:Number(movement.request_quantity),expected_balance:movement.expected_balance===null?null:Number(movement.expected_balance),
         quantity_delta:Number(movement.quantity_delta)}));
       setItems(nextItems);setMovements(nextMovements);
+      const nextMenuItems=(menuResult.data??[]) as MenuItemOption[];
+      setMenuItems(nextMenuItems);
+      setRecipes(((recipeResult.data??[]) as RecipeComponent[]).map(recipe=>({...recipe,quantity_per_sale:Number(recipe.quantity_per_sale)})));
       setMovementDraft(current=>({...current,itemId:nextItems.some(item=>item.inventory_item_id===current.itemId)?current.itemId:nextItems.find(item=>item.active)?.inventory_item_id??''}));
+      setRecipeDraft(current=>({...current,
+        menuItemId:nextMenuItems.some(item=>item.item_id===current.menuItemId)?current.menuItemId:nextMenuItems[0]?.item_id??'',
+        inventoryItemId:nextItems.some(item=>item.inventory_item_id===current.inventoryItemId&&item.active)?current.inventoryItemId:nextItems.find(item=>item.active)?.inventory_item_id??'',
+      }));
     } catch(cause) { setError(cause instanceof Error?cause.message:'Could not load outlet inventory.'); }
     finally { setBusy(false); }
   },[tenantId,outletId]);
@@ -127,6 +144,39 @@ export default function InventoryManager({tenantId,outletId,userId}:Props) {
     finally { setBusy(false); }
   }
 
+  async function saveRecipe(event:FormEvent) {
+    event.preventDefault();if(!supabase)return;
+    const menuItem=menuItems.find(item=>item.item_id===recipeDraft.menuItemId);
+    const stockItem=items.find(item=>item.inventory_item_id===recipeDraft.inventoryItemId&&item.active);
+    const amount=Number(recipeDraft.quantityPerSale);
+    if(!menuItem||!stockItem||!Number.isFinite(amount)||amount<=0||amount>1_000_000_000||Math.round(amount*1000)!==amount*1000){
+      setError('Choose a menu item and active stock item, then enter a positive recipe quantity with up to three decimal places.');return;
+    }
+    setBusy(true);setError('');setNotice('');
+    try {
+      const {error:saveError}=await supabase.from('inventory_recipe_components').upsert({
+        tenant_id:tenantId,outlet_id:outletId,menu_item_id:menuItem.item_id,inventory_item_id:stockItem.inventory_item_id,
+        quantity_per_sale:amount,created_by:userId,updated_at:new Date().toISOString(),
+      },{onConflict:'tenant_id,outlet_id,menu_item_id,inventory_item_id'});
+      if(saveError)throw saveError;
+      setRecipeDraft(current=>({...current,quantityPerSale:''}));
+      setNotice(`Recipe usage saved for ${menuItem.name}.`);await load();
+    } catch(cause) { setError(cause instanceof Error?cause.message:'Could not save recipe usage.'); }
+    finally { setBusy(false); }
+  }
+
+  async function removeRecipe(recipe:RecipeComponent) {
+    if(!supabase)return;
+    setBusy(true);setError('');setNotice('');
+    try {
+      const {error:deleteError}=await supabase.from('inventory_recipe_components').delete()
+        .eq('tenant_id',tenantId).eq('outlet_id',outletId).eq('menu_item_id',recipe.menu_item_id).eq('inventory_item_id',recipe.inventory_item_id);
+      if(deleteError)throw deleteError;
+      setNotice('Recipe usage removed.');await load();
+    } catch(cause) { setError(cause instanceof Error?cause.message:'Could not remove recipe usage.'); }
+    finally { setBusy(false); }
+  }
+
   return <section className="mt-5 rounded-2xl border border-[#e1e8e1] bg-white p-6" aria-labelledby="inventory-heading">
     <div className="flex flex-wrap items-center justify-between gap-3">
       <div><p className="text-[10px] font-bold uppercase tracking-[.16em] text-[#829087]">Outlet stock</p><h2 id="inventory-heading" className="mt-1 text-lg font-bold">Inventory</h2>
@@ -161,6 +211,20 @@ export default function InventoryManager({tenantId,outletId,userId}:Props) {
       </form>
     </div>
 
+    <div className="mt-5 rounded-xl border border-[#e6ebe6] bg-[#fbfcfb] p-4">
+      <div><h3 className="text-sm font-semibold">Recipe usage</h3><p className="mt-1 text-xs text-[#839087]">Stock used for one sold menu item. The outlet edge applies saved recipes on paid orders, including while offline after its next configuration sync.</p></div>
+      <form onSubmit={saveRecipe} className="mt-3 grid gap-3 sm:grid-cols-[1fr_1fr_150px_auto]">
+        <label className="text-xs font-medium">Menu item<select className={`${inputClass} mt-1`} required value={recipeDraft.menuItemId} onChange={e=>setRecipeDraft({...recipeDraft,menuItemId:e.target.value})}><option value="">Select menu item</option>{menuItems.map(item=><option key={item.item_id} value={item.item_id}>{item.name}{item.available?'':' · unavailable'}</option>)}</select></label>
+        <label className="text-xs font-medium">Ingredient or supply<select className={`${inputClass} mt-1`} required value={recipeDraft.inventoryItemId} onChange={e=>setRecipeDraft({...recipeDraft,inventoryItemId:e.target.value})}><option value="">Select stock item</option>{items.filter(item=>item.active).map(item=><option key={item.inventory_item_id} value={item.inventory_item_id}>{item.name} · {item.unit}</option>)}</select></label>
+        <label className="text-xs font-medium">Quantity per sale<input className={`${inputClass} mt-1`} type="number" min="0.001" step="0.001" required value={recipeDraft.quantityPerSale} onChange={e=>setRecipeDraft({...recipeDraft,quantityPerSale:e.target.value})}/></label>
+        <button className={`${buttonClass} self-end`} disabled={busy||!menuItems.length||!items.some(item=>item.active)}>Save recipe</button>
+      </form>
+      {recipes.length?<ul className="mt-4 divide-y divide-[#edf0ed] rounded-lg border border-[#e6ebe6] bg-white">{recipes.map(recipe=>{
+        const product=menuItems.find(item=>item.item_id===recipe.menu_item_id);const ingredient=items.find(item=>item.inventory_item_id===recipe.inventory_item_id);
+        return <li key={`${recipe.menu_item_id}:${recipe.inventory_item_id}`} className="flex flex-wrap items-center gap-3 px-3 py-2 text-xs"><strong className="flex-1">{product?.name??'Removed menu item'}</strong><span className="text-[#718077]">uses {quantity(recipe.quantity_per_sale)} {ingredient?.unit??'unit(s)'} {ingredient?.name??'stock item'}</span><button type="button" className="min-h-8 rounded-md border border-[#e6ebe6] px-2 text-[10px] font-semibold text-[#8e5145]" aria-label={`Remove ${ingredient?.name??'stock item'} from ${product?.name??'menu item'} recipe`} disabled={busy} onClick={()=>void removeRecipe(recipe)}>Remove</button></li>;
+      })}</ul>:<p className="mt-3 rounded-lg bg-white px-3 py-4 text-center text-xs text-[#8d9991]">No recipe usage configured yet.</p>}
+    </div>
+
     <div className="mt-5 overflow-x-auto rounded-xl border border-[#e6ebe6]">
       <table className="w-full min-w-[600px] text-left text-xs"><thead className="bg-[#f7f9f7] text-[10px] uppercase tracking-wide text-[#86938a]"><tr><th className="px-3 py-2.5">Stock item</th><th className="px-3 py-2.5">SKU</th><th className="px-3 py-2.5 text-right">On hand</th><th className="px-3 py-2.5 text-right">Reorder</th><th className="px-3 py-2.5">Status</th><th className="px-3 py-2.5"/></tr></thead><tbody className="divide-y divide-[#edf0ed]">
         {items.map(item=><tr key={item.inventory_item_id} className={!item.active?'text-[#a1aaa4]':''}><td className="px-3 py-2.5 font-semibold text-[#43554a]">{item.name}<small className="ml-1 font-normal text-[#96a098]">{item.unit}</small></td><td className="px-3 py-2.5">{item.sku??'—'}</td><td className="px-3 py-2.5 text-right font-semibold">{quantity(item.on_hand)}</td><td className="px-3 py-2.5 text-right">{quantity(item.reorder_level)}</td><td className="px-3 py-2.5"><span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${!item.active?'bg-[#f0f2f0] text-[#7d8881]':item.low_stock?'bg-[#fff3e0] text-[#9b6a1f]':'bg-[#edf6ef] text-[#4e805e]'}`}>{!item.active?'Archived':item.low_stock?'Low stock':'In stock'}</span></td><td className="px-3 py-2.5 text-right"><button type="button" className="rounded-md p-1.5 text-[#819087] hover:bg-[#f0f5f0]" title={item.active?'Archive item':'Restore item'} aria-label={`${item.active?'Archive':'Restore'} ${item.name}`} disabled={busy} onClick={()=>void setItemActive(item)}><Archive size={14}/></button></td></tr>)}
@@ -171,6 +235,6 @@ export default function InventoryManager({tenantId,outletId,userId}:Props) {
     <div className="mt-5"><h3 className="text-sm font-semibold">Recent stock activity</h3>{movements.length?<ul className="mt-2 divide-y divide-[#edf0ed] rounded-xl border border-[#e6ebe6]">
       {movements.map(movement=>{const item=itemById.get(movement.inventory_item_id);return <li key={movement.movement_id} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2.5 text-xs"><strong className="min-w-36 text-[#43554a]">{item?.name??'Inventory item'}</strong><span className="text-[#718077]">{movementName[movement.movement_type]}</span><span className={`font-semibold ${movement.quantity_delta<0?'text-[#a45c4c]':'text-[#4b7b56]'}`}>{movement.quantity_delta>0?'+':''}{quantity(movement.quantity_delta)} {item?.unit??''}</span><span className="min-w-36 flex-1 text-[#7f8c83]">{movement.reason}</span><time className="text-[10px] text-[#98a29b]">{new Date(movement.occurred_at).toLocaleString('en-IN')}</time></li>;})}
     </ul>:<p className="mt-2 rounded-xl bg-[#f8faf8] px-3 py-5 text-center text-xs text-[#8d9991]">No stock movements recorded.</p>}</div>
-    <p className="mt-4 rounded-xl border border-[#efe5ce] bg-[#fffaf0] p-3 text-[10px] leading-5 text-[#8a7857]">Inventory changes require an internet connection in this release. Stock movements are append-only, outlet-scoped, and audited; offline stock entry, recipe consumption, suppliers, purchasing, and transfers are still in the roadmap.</p>
+    <p className="mt-4 rounded-xl border border-[#efe5ce] bg-[#fffaf0] p-3 text-[10px] leading-5 text-[#8a7857]">Receipts, wastage, and physical counts require an internet connection. Paid-order recipe consumption is recorded locally by the outlet edge during outages and synced idempotently when it reconnects.</p>
   </section>;
 }

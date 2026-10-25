@@ -3,15 +3,16 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AddOrderLinesCommand, CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderLineDraft, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
-import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, enqueueSyncEvent, syncOutboxStatus } from './database.js';
+import { allocateNumber, createId, db, DATABASE_PATH, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, discardStaleInventoryCount, enqueueSyncEvent, listInventoryCountConflicts, localInventoryBalances, recordManualInventoryMovement, recordPaidOrderInventoryConsumption, syncOutboxStatus } from './database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
 import { formatKitchenTicket, formatReceipt, printerStatus, sendToPrinter, startPrinterAdapter } from './printer.js';
 import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from './reports.js';
-import { getSyncStatus, startSyncWorker } from './sync.js';
-import { clearedSessionCookie, createStaffSession, currentStaff, readStaffSession, readStaffSessionCookie, requireRoles, sessionCookie, sessionMiddleware, StaffAuthError } from './auth.js';
+import { getSyncStatus, startSyncWorker, syncMenuOnce } from './sync.js';
+import { clearedSessionCookie, createStaffSession, currentStaff, readStaffSession, readStaffSessionCookie, refreshStaffSession, requireRoles, sessionCookie, sessionMiddleware, StaffAuthError } from './auth.js';
+import { startAutomaticBackups } from './automatic-backup.js';
 
 const app=express();
 const httpServer=createServer(app);
@@ -51,7 +52,7 @@ function publish(type:ServerMessage['type'],payload:ServerMessage['payload']){
 function mapLines(orderId:string):OrderLine[]{
   return (db.prepare(`SELECT l.id,l.menu_item_id AS menuItemId,l.item_name_snapshot AS name,l.category_snapshot AS category,
     l.quantity,l.unit_price_minor AS unitPriceMinor,l.modifiers_json AS modifiersJson,l.line_total_minor AS lineTotalMinor,
-    l.kitchen_station AS kitchenStation,l.note,v.voided_at AS voidedAt,v.reason AS voidReason
+    l.kitchen_station AS kitchenStation,l.note,l.tax_code_snapshot AS taxCode,l.tax_rate_bps AS taxRateBps,v.voided_at AS voidedAt,v.reason AS voidReason
     FROM order_lines l LEFT JOIN order_line_voids v ON v.order_line_id=l.id WHERE l.order_id=? ORDER BY l.rowid`).all(orderId) as Array<OrderLine & {note:string|null;modifiersJson:string;voidedAt:string|null;voidReason:string|null}>)
     .map(line=>({...line,modifiers:JSON.parse(line.modifiersJson) as OrderLine['modifiers'],note:line.note??undefined,
       ...(line.voidedAt?{voidedAt:line.voidedAt,voidReason:line.voidReason??undefined}:{})}));
@@ -129,7 +130,7 @@ function audit(entityType:string,entityId:string,action:string,reason:string|nul
     VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(eventId,DEMO_TENANT,DEMO_OUTLET,actorId,DEMO_TERMINAL,entityType,entityId,action,reason,JSON.stringify(payload),occurredAt);
   enqueueSyncEvent('audit',entityId,action,{entityType,entityId,actorId,terminalId:DEMO_TERMINAL,reason,payload},occurredAt,eventId);
 }
-type PreparedOrderLine={id:string;menuItemId:string;name:string;category:string;kitchenStation:string;quantity:number;basePriceMinor:number;modifiers:OrderLine['modifiers'];lineTotalMinor:number;note:string|null};
+type PreparedOrderLine={id:string;menuItemId:string;name:string;category:string;kitchenStation:string;quantity:number;basePriceMinor:number;modifiers:OrderLine['modifiers'];lineTotalMinor:number;taxCode:string|null;taxRateBps:number;note:string|null};
 function prepareLines(lines:OrderLineDraft[]):PreparedOrderLine[]{
   if(!Array.isArray(lines)||lines.length===0||lines.length>50)throw new Error('An order change needs between 1 and 50 items.');
   return lines.map(line=>{
@@ -146,14 +147,17 @@ function prepareLines(lines:OrderLineDraft[]):PreparedOrderLine[]{
     const groupCounts=new Map<string,number>();for(const modifier of modifiers)groupCounts.set(modifier.group,(groupCounts.get(modifier.group)??0)+1);
     for(const [group,count] of groupCounts)if(group!=='Add-on'&&count>1)throw new Error(`Select only one ${group.toLowerCase()} option.`);
     const basePriceMinor=Number(menu.price_minor);const unitPriceMinor=basePriceMinor+modifiers.reduce((sum,modifier)=>sum+modifier.priceDeltaMinor,0);
-    return {id:createId(),menuItemId:String(menu.id),name:String(menu.name),category:String(menu.category),kitchenStation:String(menu.kitchen_station),quantity,basePriceMinor,modifiers,lineTotalMinor:Math.round(unitPriceMinor*quantity),note:line.note?.slice(0,140)??null};
+    const taxCode=menu.tax_code==null?null:String(menu.tax_code);
+    const taxRateBps=menu.tax_rate_bps==null?EDGE_CONFIG.taxRateBps:Number(menu.tax_rate_bps);
+    if(!Number.isSafeInteger(taxRateBps)||taxRateBps<0||taxRateBps>10_000)throw new Error(`Menu item ${String(menu.name)} has an invalid tax rate.`);
+    return {id:createId(),menuItemId:String(menu.id),name:String(menu.name),category:String(menu.category),kitchenStation:String(menu.kitchen_station),quantity,basePriceMinor,modifiers,lineTotalMinor:Math.round(unitPriceMinor*quantity),taxCode,taxRateBps,note:line.note?.slice(0,140)??null};
   });
 }
 function recalculateOrder(orderId:string,timestamp:string){
-  const subtotal=Number((db.prepare(`SELECT COALESCE(SUM(l.line_total_minor),0) AS subtotal FROM order_lines l
-    LEFT JOIN order_line_voids v ON v.order_line_id=l.id WHERE l.order_id=? AND v.order_line_id IS NULL`).get(orderId) as {subtotal:number}).subtotal);
-  const taxRate=Number((db.prepare('SELECT tax_rate_bps FROM orders WHERE id=?').get(orderId) as {tax_rate_bps:number}).tax_rate_bps);
-  const tax=Math.round(subtotal*taxRate/10000);
+  const totals=db.prepare(`SELECT COALESCE(SUM(l.line_total_minor),0) AS subtotal,
+    COALESCE(SUM(ROUND(l.line_total_minor*l.tax_rate_bps/10000.0)),0) AS tax FROM order_lines l
+    LEFT JOIN order_line_voids v ON v.order_line_id=l.id WHERE l.order_id=? AND v.order_line_id IS NULL`).get(orderId) as {subtotal:number;tax:number};
+  const subtotal=Number(totals.subtotal);const tax=Number(totals.tax);
   db.prepare('UPDATE orders SET subtotal_minor=?,tax_total_minor=?,total_minor=?,updated_at=? WHERE id=?').run(subtotal,tax,subtotal+tax,timestamp,orderId);
 }
 function rememberEdit(commandId:string,orderId:string,action:'lines_added'|'line_voided'|'order_voided',request:unknown,timestamp:string){
@@ -169,9 +173,9 @@ function editReplay(commandId:string,orderId:string,action:'lines_added'|'line_v
   return true;
 }
 function persistAddedLines(orderId:string,lines:PreparedOrderLine[],timestamp:string){
-  const insert=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-  for(const line of lines)insert.run(line.id,DEMO_TENANT,DEMO_OUTLET,orderId,line.menuItemId,line.name,line.category,line.basePriceMinor,JSON.stringify(line.modifiers),line.quantity,line.lineTotalMinor,line.kitchenStation,line.note);
+  const insert=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note,tax_code_snapshot,tax_rate_bps)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  for(const line of lines)insert.run(line.id,DEMO_TENANT,DEMO_OUTLET,orderId,line.menuItemId,line.name,line.category,line.basePriceMinor,JSON.stringify(line.modifiers),line.quantity,line.lineTotalMinor,line.kitchenStation,line.note,line.taxCode,line.taxRateBps);
   const known=new Set((db.prepare('SELECT station FROM kitchen_tickets WHERE order_id=?').all(orderId) as Array<{station:string}>).map(ticket=>ticket.station));
   const insertTicket=db.prepare(`INSERT INTO kitchen_tickets(id,tenant_id,outlet_id,order_id,station,status,created_at) VALUES(?,?,?,?,?,'new',?)`);
   for(const station of new Set(lines.map(line=>line.kitchenStation))){
@@ -189,7 +193,7 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
   if(command.orderType==='dine_in'&&!command.tableLabel?.trim())throw new Error('Choose a table for dine-in orders.');
   const prepared=prepareLines(command.lines);
   const subtotalMinor=prepared.reduce((sum,line)=>sum+line.lineTotalMinor,0);
-  const taxTotalMinor=Math.round(subtotalMinor*EDGE_CONFIG.taxRateBps/10000);
+  const taxTotalMinor=prepared.reduce((sum,line)=>sum+Math.round(line.lineTotalMinor*line.taxRateBps/10000),0);
   const totalMinor=subtotalMinor+taxTotalMinor;
   const orderId=randomUUID();const timestamp=new Date().toISOString();
   const create=db.transaction(()=>{
@@ -200,9 +204,9 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
       orderType:command.orderType,tableLabel:command.orderType==='dine_in'?command.tableLabel:null,guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),
       note:command.note?.slice(0,140)??null,currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,
     });
-    const insertLine=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-    for(const line of prepared)insertLine.run(line.id,DEMO_TENANT,DEMO_OUTLET,orderId,line.menuItemId,line.name,line.category,line.basePriceMinor,JSON.stringify(line.modifiers),line.quantity,line.lineTotalMinor,line.kitchenStation,line.note);
+    const insertLine=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note,tax_code_snapshot,tax_rate_bps)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    for(const line of prepared)insertLine.run(line.id,DEMO_TENANT,DEMO_OUTLET,orderId,line.menuItemId,line.name,line.category,line.basePriceMinor,JSON.stringify(line.modifiers),line.quantity,line.lineTotalMinor,line.kitchenStation,line.note,line.taxCode,line.taxRateBps);
     const stations=new Set(prepared.map(line=>line.kitchenStation));
     const insertTicket=db.prepare(`INSERT INTO kitchen_tickets(id,tenant_id,outlet_id,order_id,station,status,created_at) VALUES(?,?,?,?,?,'new',?)`);
     for(const station of stations)insertTicket.run(createId(),DEMO_TENANT,DEMO_OUTLET,orderId,station,timestamp);
@@ -212,7 +216,8 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
       guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),status:'sent',note:command.note?.slice(0,140)??null,
       currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,
       lines:prepared.map(line=>({id:line.id,menuItemId:line.menuItemId,name:line.name,category:line.category,quantity:line.quantity,
-        unitPriceMinor:line.basePriceMinor,lineTotalMinor:line.lineTotalMinor,kitchenStation:line.kitchenStation,note:line.note,modifiers:line.modifiers}))},timestamp);
+        unitPriceMinor:line.basePriceMinor,lineTotalMinor:line.lineTotalMinor,kitchenStation:line.kitchenStation,note:line.note,
+        taxCode:line.taxCode,taxRateBps:line.taxRateBps,modifiers:line.modifiers}))},timestamp);
   });
   create();
   const order=orderById(orderId)!;
@@ -245,6 +250,8 @@ app.get('/api/auth/session',(req,res)=>{
     res.setHeader('Set-Cookie',sessionCookie(session,EDGE_CONFIG.secureSessionCookie));
   }
   if(!session)return fail(res,401,'Sign in to this outlet before continuing.');
+  const refreshed=refreshStaffSession(session);
+  if(refreshed!==session){session=refreshed;res.setHeader('Set-Cookie',sessionCookie(session,EDGE_CONFIG.secureSessionCookie));}
   return res.json({userId:session.userId,email:session.email,displayName:session.displayName,role:session.role,tenantId:session.tenantId,outletId:session.outletId,expiresAt:session.expiresAt});
 });
 app.post('/api/auth/session',async(req,res)=>{
@@ -257,6 +264,7 @@ app.post('/api/auth/session',async(req,res)=>{
     return res.json({userId:session.userId,email:session.email,displayName:session.displayName,role:session.role,tenantId:session.tenantId,outletId:session.outletId,expiresAt:session.expiresAt});
   }catch(error){
     const authError=error instanceof StaffAuthError?error:new StaffAuthError('Could not verify this staff session.',503);
+    if(authError.status===403)res.setHeader('Set-Cookie',clearedSessionCookie(EDGE_CONFIG.secureSessionCookie));
     return fail(res,authError.status,authError.message);
   }
 });
@@ -282,6 +290,43 @@ app.get('/api/menu',requireRoles('owner','manager','cashier','kitchen','viewer')
   const modifiers=db.prepare(`SELECT id,menu_item_id AS menuItemId,group_name AS "group",name,price_delta_minor AS priceDeltaMinor FROM menu_modifiers WHERE tenant_id=? AND outlet_id=? AND active=1 ORDER BY sort_order`)
     .all(DEMO_TENANT,DEMO_OUTLET) as Array<Record<string,unknown>>;
   res.json(rows.map(row=>({...row,priceMinor:Number(row.priceMinor),vegetarian:Boolean(row.vegetarian),available:Boolean(row.available),modifiers:modifiers.filter(modifier=>modifier.menuItemId===row.id).map(({menuItemId,...modifier})=>({...modifier,priceDeltaMinor:Number(modifier.priceDeltaMinor)}))})));
+});
+app.get('/api/inventory',requireRoles('owner','manager'),(_req,res)=>res.json(localInventoryBalances().map(item=>({...item,active:Boolean(item.active),lowStock:Boolean(item.lowStock)}))));
+app.post('/api/inventory/movements',requireRoles('owner','manager'),(req,res)=>{
+  const body=req.body as Record<string,unknown>;
+  const movementType=body.movementType;
+  const quantity=Number(body.quantity);
+  const expectedBalance=body.expectedBalance===null?null:Number(body.expectedBalance);
+  const reason=typeof body.reason==='string'?body.reason.trim():'';
+  if(typeof body.commandId!=='string'||body.commandId.trim().length<8||body.commandId.length>160
+    ||typeof body.inventoryItemId!=='string'||body.inventoryItemId.length>120
+    ||!['receipt','waste','count_adjustment'].includes(String(movementType))
+    ||!Number.isFinite(quantity)||quantity<0||quantity>1_000_000_000||Math.round(quantity*1000)!==quantity*1000
+    ||(movementType!=='count_adjustment'&&quantity<=0)
+    ||(movementType==='count_adjustment'&&(expectedBalance===null||!Number.isFinite(expectedBalance)||Math.abs(expectedBalance)>1_000_000_000))
+    ||(movementType!=='count_adjustment'&&body.expectedBalance!==null)
+    ||reason.length<3||reason.length>120||/[\u0000-\u001f\u007f]/.test(reason))
+    return fail(res,400,'Enter a valid inventory item, movement, quantity, and reason.');
+  try{
+    const result=recordManualInventoryMovement({commandId:body.commandId.trim(),inventoryItemId:body.inventoryItemId,
+      movementType:movementType as 'receipt'|'waste'|'count_adjustment',quantity,expectedBalance,reason,
+      actorId:currentStaff(res).userId,occurredAt:new Date().toISOString()});
+    const inventory=localInventoryBalances().map(item=>({...item,active:Boolean(item.active),lowStock:Boolean(item.lowStock)}));
+    return res.status(result.duplicate?200:201).json({movementId:result.movementId,duplicate:result.duplicate,inventory});
+  }catch(error){return fail(res,409,error instanceof Error?error.message:'Could not record inventory movement.');}
+});
+app.get('/api/inventory/conflicts',requireRoles('owner','manager'),(_req,res)=>res.json(listInventoryCountConflicts()));
+app.post('/api/inventory/conflicts/:movementId/discard',requireRoles('owner','manager'),async(req,res)=>{
+  const movementId=routeParam(req,'movementId');
+  if(!/^[0-9a-f-]{36}$/i.test(movementId))return fail(res,400,'Choose a valid conflicted count.');
+  const body=req.body as Record<string,unknown>;
+  const reason=typeof body.reason==='string'?body.reason.trim():'';
+  if(reason.length<3||reason.length>120||/[\u0000-\u001f\u007f]/.test(reason))return fail(res,400,'Enter a reason between 3 and 120 characters.');
+  if(!await syncMenuOnce())return fail(res,503,'Could not refresh the cloud stock balance. Reconnect and try again; the count was not changed.');
+  try{
+    discardStaleInventoryCount(movementId,currentStaff(res).userId,reason,new Date().toISOString());
+    return res.json({inventory:localInventoryBalances().map(item=>({...item,active:Boolean(item.active),lowStock:Boolean(item.lowStock)})),conflicts:listInventoryCountConflicts()});
+  }catch(error){return fail(res,409,error instanceof Error?error.message:'Could not resolve the stale count.');}
 });
 app.get('/api/kitchen',requireRoles('owner','manager','kitchen'),(_req,res)=>res.json(kitchenSnapshot()));
 app.get('/api/reports/daily',requireRoles('owner','manager','viewer'),(req,res)=>{
@@ -576,6 +621,7 @@ app.post('/api/orders/:orderId/payment',requireRoles('owner','manager','cashier'
         shiftId:body.shiftId,method:payment.method,amountMinor:payment.amountMinor,status:'succeeded',invoiceNumber,createdAt:timestamp,
         tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,terminalId:DEMO_TERMINAL},timestamp);
     });
+    recordPaidOrderInventoryConsumption(before.id,before.orderNumber,currentStaff(res).userId,timestamp);
     const singleMethod=payments.every(payment=>payment.method===payments[0]?.method)?payments[0]?.method:null;
     db.prepare('UPDATE orders SET status=\'paid\',payment_method=?,invoice_number=?,updated_at=? WHERE id=?').run(singleMethod,invoiceNumber,timestamp,before.id);
     audit('order',before.id,'order.payment_recorded',null,{payments:payments.map(({method,amountMinor})=>({method,amountMinor})),invoiceNumber,amountMinor:before.totalMinor,shiftId:body.shiftId},currentStaff(res).userId);
@@ -583,6 +629,30 @@ app.post('/api/orders/:orderId/payment',requireRoles('owner','manager','cashier'
   const order=orderById(before.id)!;publish('order.updated',order);
   queuePrint(formatReceipt(order),'Receipt');
   return res.json(order);
+});
+app.post('/api/orders/:orderId/receipt/reprint',requireRoles('owner','manager','cashier'),async(req,res)=>{
+  const body=req.body as {reason?:unknown};
+  if(typeof body.reason!=='string'||body.reason.trim().length<3||body.reason.trim().length>120)
+    return fail(res,400,'Enter a reprint reason between 3 and 120 characters.');
+  const order=orderById(routeParam(req,'orderId'));
+  if(!order)return fail(res,404,'Order not found.');
+  if(order.status!=='paid'||!order.invoiceNumber)return fail(res,409,'Only paid orders with an invoice can be reprinted.');
+  const printer=printerStatus();
+  if(printer.mode==='disabled')return fail(res,503,'Printer output is disabled on this edge.');
+  const actor=currentStaff(res);
+  audit('receipt',order.id,'receipt.reprint_requested',body.reason.trim(),
+    {orderNumber:order.orderNumber,invoiceNumber:order.invoiceNumber,printerMode:printer.mode},actor.userId);
+  try{
+    await sendToPrinter(formatReceipt(order));
+    audit('receipt',order.id,'receipt.reprint_dispatched',body.reason.trim(),
+      {orderNumber:order.orderNumber,invoiceNumber:order.invoiceNumber,printerMode:printer.mode},actor.userId);
+    return res.json({status:'dispatched',invoiceNumber:order.invoiceNumber,printerMode:printer.mode});
+  }catch(error){
+    audit('receipt',order.id,'receipt.reprint_failed',body.reason.trim(),
+      {orderNumber:order.orderNumber,invoiceNumber:order.invoiceNumber,printerMode:printer.mode,
+        error:error instanceof Error?error.message:'Printer connection failed.'},actor.userId);
+    return fail(res,502,'The receipt could not be sent to the printer. Check the printer connection and retry.');
+  }
 });
 app.post('/api/orders/:orderId/refunds',requireRoles('owner','manager'),(req,res)=>{
   const body=req.body as {commandId?:unknown;paymentId?:unknown;shiftId?:unknown;amountMinor?:unknown;reason?:unknown};
@@ -663,6 +733,22 @@ wss.on('connection',(webSocket,request)=>{
 
 const printer=startPrinterAdapter();
 const stopSyncWorker=startSyncWorker();
+const backupSetting=process.env.POS_AUTO_BACKUP?.trim().toLowerCase();
+if(backupSetting!==undefined&&backupSetting!=='true'&&backupSetting!=='false')throw new Error('POS_AUTO_BACKUP must be true or false.');
+const backupRetentionDays=Number(process.env.POS_AUTO_BACKUP_RETENTION_DAYS??7);
+if(!Number.isSafeInteger(backupRetentionDays)||backupRetentionDays<1||backupRetentionDays>365)throw new Error('POS_AUTO_BACKUP_RETENTION_DAYS must be an integer from 1 to 365.');
+const stopAutomaticBackups=backupSetting==='false'||(backupSetting===undefined&&process.env.NODE_ENV!=='production')
+  ? async()=>{}
+  : startAutomaticBackups({database:db,databasePath:DATABASE_PATH,backupDirectory:resolve(process.env.POS_BACKUP_DIR?.trim()||join(dirname(DATABASE_PATH),'backups')),retentionDays:backupRetentionDays,tenantId:EDGE_CONFIG.tenantId,outletId:EDGE_CONFIG.outletId});
 httpServer.listen(port,'0.0.0.0',()=>console.log(`🍽️  Common Table edge server listening on http://0.0.0.0:${port}`));
-function shutdown(){httpServer.close();wss.close();printer?.close();stopSyncWorker();db.close();}
+let shuttingDown=false;
+function shutdown(){
+  if(shuttingDown)return;
+  shuttingDown=true;
+  for(const socket of wss.clients)socket.terminate();
+  const httpClosed=new Promise<void>(resolve=>httpServer.close(()=>resolve()));
+  const webSocketsClosed=new Promise<void>(resolve=>wss.close(()=>resolve()));
+  printer?.close();
+  void Promise.allSettled([stopSyncWorker(),stopAutomaticBackups(),httpClosed,webSocketsClosed]).finally(()=>db.close());
+}
 process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);

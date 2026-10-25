@@ -80,6 +80,35 @@ export function buildDailySalesReport(date = localBusinessDate()): DailySalesRep
         AND p.order_id=o.id AND p.status='succeeded' AND p.entry_type='tender' AND p.created_at>=? AND p.created_at<?)
     GROUP BY l.menu_item_id,l.item_name_snapshot ORDER BY sales_minor DESC,name`)
     .all(...scope) as Array<{ menu_item_id: string; name: string; quantity: number; sales_minor: number }>;
+  const taxRows = db.prepare(`SELECT o.id AS order_id,o.total_minor,o.tax_total_minor,l.tax_code_snapshot AS tax_code,
+      l.tax_rate_bps,l.line_total_minor
+    FROM orders o JOIN order_lines l ON l.order_id=o.id AND l.tenant_id=o.tenant_id AND l.outlet_id=o.outlet_id
+    LEFT JOIN order_line_voids v ON v.order_line_id=l.id
+    WHERE o.tenant_id=? AND o.outlet_id=? AND o.status='paid' AND v.order_line_id IS NULL
+      AND EXISTS (SELECT 1 FROM payment_events p WHERE p.tenant_id=o.tenant_id AND p.outlet_id=o.outlet_id
+        AND p.order_id=o.id AND p.status='succeeded' AND p.entry_type='tender' AND p.created_at>=? AND p.created_at<?)`)
+    .all(...scope) as Array<{order_id:string;total_minor:number;tax_total_minor:number;tax_code:string|null;tax_rate_bps:number;line_total_minor:number}>;
+  const refundsByOrder = db.prepare(`SELECT order_id,SUM(amount_minor) AS amount_minor FROM payment_events
+    WHERE tenant_id=? AND outlet_id=? AND status='succeeded' AND entry_type='refund' AND created_at>=? AND created_at<? GROUP BY order_id`)
+    .all(...scope) as Array<{order_id:string;amount_minor:number}>;
+  const taxByOrder = new Map<string,{total:number;taxTotal:number;buckets:Map<string,{taxCode:string|null;taxRateBps:number;taxMinor:number}>}>();
+  for (const row of taxRows) {
+    const order=taxByOrder.get(row.order_id)??{total:Number(row.total_minor),taxTotal:Number(row.tax_total_minor),buckets:new Map()};
+    const taxCode=row.tax_code??null;const taxRateBps=Number(row.tax_rate_bps);const key=`${taxRateBps}:${taxCode??''}`;
+    const bucket=order.buckets.get(key)??{taxCode,taxRateBps,taxMinor:0};
+    bucket.taxMinor+=Math.round(Number(row.line_total_minor)*taxRateBps/10000);order.buckets.set(key,bucket);taxByOrder.set(row.order_id,order);
+  }
+  const refundByOrder=new Map(refundsByOrder.map(row=>[row.order_id,Number(row.amount_minor)]));
+  const taxBreakdownMap=new Map<string,{taxCode:string|null;taxRateBps:number;taxMinor:number}>();
+  for(const [orderId,order] of taxByOrder){
+    const refund=Math.min(order.total,refundByOrder.get(orderId)??0);const targetRefundTax=order.total?Math.round(order.taxTotal*refund/order.total):0;
+    let allocated=0;const buckets=[...order.buckets.values()];
+    buckets.forEach((bucket,index)=>{
+      const refundTax=index===buckets.length-1?targetRefundTax-allocated:(order.total?Math.round(bucket.taxMinor*refund/order.total):0);
+      allocated+=refundTax;const key=`${bucket.taxRateBps}:${bucket.taxCode??''}`;
+      const aggregate=taxBreakdownMap.get(key)??{...bucket,taxMinor:0};aggregate.taxMinor+=bucket.taxMinor-refundTax;taxBreakdownMap.set(key,aggregate);
+    });
+  }
   const voids = db.prepare(`SELECT COUNT(*) AS line_count,COALESCE(SUM(l.quantity),0) AS quantity,
       COALESCE(SUM(l.line_total_minor),0) AS amount_minor
     FROM order_line_voids v JOIN order_lines l ON l.id=v.order_line_id
@@ -93,6 +122,7 @@ export function buildDailySalesReport(date = localBusinessDate()): DailySalesRep
     date, timeZone: EDGE_CONFIG.timezone, outletName: EDGE_CONFIG.outletName, currency: EDGE_CONFIG.currency,
     ...range, generatedAt: new Date().toISOString(),
     totals: { paidOrderCount: Number(totals.paid_order_count), subtotalMinor: Number(totals.subtotal_minor), taxTotalMinor: Number(totals.tax_total_minor), salesMinor: Number(totals.sales_minor) },
+    taxBreakdown: [...taxBreakdownMap.values()].sort((a,b)=>a.taxRateBps-b.taxRateBps||(a.taxCode??'').localeCompare(b.taxCode??'')),
     refunds: { count: Number(refunds.refund_count), amountMinor: Number(refunds.amount_minor) },
     tenders: tenders.map(row => ({ method: row.method, amountMinor: Number(row.amount_minor), paymentCount: Number(row.payment_count) })),
     items: items.map(row => ({ menuItemId: row.menu_item_id, name: row.name, quantity: Number(row.quantity), salesMinor: Number(row.sales_minor) })),
@@ -114,6 +144,7 @@ export function dailySalesCsv(report: DailySalesReport): string {
     ['sales', 'paid_orders', report.totals.paidOrderCount, '', report.currency, report.timeZone],
     ['sales', 'subtotal', '', report.totals.subtotalMinor, report.currency, ''],
     ['sales', 'tax', '', report.totals.taxTotalMinor, report.currency, ''],
+    ...report.taxBreakdown.map(row => ['tax_rate', `${(row.taxRateBps/100).toFixed(2)}%`, '', row.taxMinor, report.currency, row.taxCode ?? 'unclassified']),
     ['sales', 'net_sales', '', report.totals.salesMinor, report.currency, 'after refunds'],
     ['refunds', 'refunds', report.refunds.count, report.refunds.amountMinor, report.currency, ''],
     ...report.tenders.map(row => ['tender', row.method, row.paymentCount, row.amountMinor, report.currency, '']),

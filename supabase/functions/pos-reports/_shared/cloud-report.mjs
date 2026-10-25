@@ -60,6 +60,7 @@ export function aggregateCloudDailyReport({ date, timeZone, outletName, currency
   let grossTax = 0;
   let grossSales = 0;
   const itemsById = new Map();
+  const taxByOrder = new Map();
   for (const orderId of paidOrderIds) {
     const order = latestSnapshots.get(orderId)?.order;
     if (!order) continue;
@@ -73,6 +74,15 @@ export function aggregateCloudDailyReport({ date, timeZone, outletName, currency
       item.quantity += amount(line.quantity);
       item.salesMinor += amount(line.lineTotalMinor);
       itemsById.set(key, item);
+      const rate = Number.isSafeInteger(line.taxRateBps) ? line.taxRateBps : Number(line.taxRateBps ?? order.taxRateBps ?? 0);
+      const code = typeof line.taxCode === 'string' ? line.taxCode : null;
+      const tax = Math.round(amount(line.lineTotalMinor) * rate / 10000);
+      const buckets = taxByOrder.get(orderId) ?? new Map();
+      const taxKey = `${rate}:${code ?? ''}`;
+      const bucket = buckets.get(taxKey) ?? { taxCode: code, taxRateBps: rate, taxMinor: 0 };
+      bucket.taxMinor += tax;
+      buckets.set(taxKey, bucket);
+      taxByOrder.set(orderId, buckets);
     }
   }
 
@@ -82,6 +92,25 @@ export function aggregateCloudDailyReport({ date, timeZone, outletName, currency
     if (order && amount(order.totalMinor) > 0) {
       refundTaxMinor += Math.round(amount(order.taxTotalMinor) * refunded / amount(order.totalMinor));
     }
+  }
+
+  const taxBreakdown = new Map();
+  for (const orderId of paidOrderIds) {
+    const order = latestSnapshots.get(orderId)?.order;
+    const buckets = [...(taxByOrder.get(orderId)?.values() ?? [])];
+    const total = amount(order?.totalMinor);
+    const refund = Math.min(total, refundAmounts.get(orderId) ?? 0);
+    const targetRefundTax = total > 0 ? Math.round(amount(order?.taxTotalMinor) * refund / total) : 0;
+    let allocated = 0;
+    buckets.forEach((bucket, index) => {
+      const refundTax = index === buckets.length - 1 ? targetRefundTax - allocated
+        : total > 0 ? Math.round(bucket.taxMinor * refund / total) : 0;
+      allocated += refundTax;
+      const key = `${bucket.taxRateBps}:${bucket.taxCode ?? ''}`;
+      const aggregate = taxBreakdown.get(key) ?? { ...bucket, taxMinor: 0 };
+      aggregate.taxMinor += bucket.taxMinor - refundTax;
+      taxBreakdown.set(key, aggregate);
+    });
   }
 
   const voidedLines = new Map();
@@ -119,6 +148,7 @@ export function aggregateCloudDailyReport({ date, timeZone, outletName, currency
       taxTotalMinor: grossTax - refundTaxMinor,
       salesMinor: grossSales - refundAmountMinor,
     },
+    taxBreakdown: [...taxBreakdown.values()].sort((a, b) => a.taxRateBps - b.taxRateBps || (a.taxCode ?? '').localeCompare(b.taxCode ?? '')),
     refunds: { count: refundCount, amountMinor: refundAmountMinor },
     tenders: [...tenders.values()].sort((a, b) => a.method.localeCompare(b.method)),
     items: [...itemsById.values()].sort((a, b) => b.salesMinor - a.salesMinor || a.name.localeCompare(b.name)),
@@ -158,6 +188,7 @@ export function aggregateCloudProjectionReport({ date, timeZone, outletName, cur
   let grossTax = 0;
   let grossSales = 0;
   const itemsById = new Map();
+  const taxByOrder = new Map();
   for (const orderId of paidOrderIds) {
     const order = orderById.get(orderId);
     if (!order) continue;
@@ -172,6 +203,16 @@ export function aggregateCloudProjectionReport({ date, timeZone, outletName, cur
     item.quantity += amount(line.quantity);
     item.salesMinor += amount(line.line_total_minor);
     itemsById.set(key, item);
+    const order = orderById.get(line.order_id);
+    const rate = Number.isSafeInteger(line.tax_rate_bps) ? line.tax_rate_bps : Number(line.tax_rate_bps ?? 0);
+    const code = typeof line.tax_code === 'string' ? line.tax_code : null;
+    const tax = Math.round(amount(line.line_total_minor) * rate / 10000);
+    const buckets = taxByOrder.get(line.order_id) ?? new Map();
+    const taxKey = `${rate}:${code ?? ''}`;
+    const bucket = buckets.get(taxKey) ?? { taxCode: code, taxRateBps: rate, taxMinor: 0 };
+    bucket.taxMinor += tax;
+    buckets.set(taxKey, bucket);
+    taxByOrder.set(line.order_id, buckets);
   }
 
   let refundTaxMinor = 0;
@@ -179,6 +220,25 @@ export function aggregateCloudProjectionReport({ date, timeZone, outletName, cur
     const order = orderById.get(orderId);
     const total = amount(order?.total_minor);
     if (order && total > 0) refundTaxMinor += Math.round(amount(order.tax_total_minor) * refunded / total);
+  }
+
+  const taxBreakdown = new Map();
+  for (const orderId of paidOrderIds) {
+    const order = orderById.get(orderId);
+    const buckets = [...(taxByOrder.get(orderId)?.values() ?? [])];
+    const total = amount(order?.total_minor);
+    const refund = Math.min(total, refundsByOrder.get(orderId) ?? 0);
+    const targetRefundTax = total > 0 ? Math.round(amount(order?.tax_total_minor) * refund / total) : 0;
+    let allocated = 0;
+    buckets.forEach((bucket, index) => {
+      const refundTax = index === buckets.length - 1 ? targetRefundTax - allocated
+        : total > 0 ? Math.round(bucket.taxMinor * refund / total) : 0;
+      allocated += refundTax;
+      const key = `${bucket.taxRateBps}:${bucket.taxCode ?? ''}`;
+      const aggregate = taxBreakdown.get(key) ?? { ...bucket, taxMinor: 0 };
+      aggregate.taxMinor += bucket.taxMinor - refundTax;
+      taxBreakdown.set(key, aggregate);
+    });
   }
 
   const voidIds = new Set();
@@ -203,6 +263,7 @@ export function aggregateCloudProjectionReport({ date, timeZone, outletName, cur
       taxTotalMinor: grossTax - refundTaxMinor,
       salesMinor: grossSales - refundAmountMinor,
     },
+    taxBreakdown: [...taxBreakdown.values()].sort((a, b) => a.taxRateBps - b.taxRateBps || (a.taxCode ?? '').localeCompare(b.taxCode ?? '')),
     refunds: { count: refundCount, amountMinor: refundAmountMinor },
     tenders: [...tenderByMethod.values()].sort((a, b) => a.method.localeCompare(b.method)),
     items: [...itemsById.values()].sort((a, b) => b.salesMinor - a.salesMinor || a.name.localeCompare(b.name)),

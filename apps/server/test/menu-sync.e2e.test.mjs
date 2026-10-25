@@ -18,9 +18,9 @@ const terminalKey = 'test-terminal-key-'.padEnd(48, 'x');
 const modifiers = [{ id: 'cloud-modifier', group: 'Size', name: 'Large', priceDeltaMinor: 50 }];
 const items = [
   { id: 'cloud-poha', name: 'Indori Poha', category: 'Breakfast', priceMinor: 500, emoji: '🍲', color: '#dceee2',
-    tag: null, vegetarian: true, available: true, kitchenStation: 'Hot kitchen', modifiers },
+    tag: null, vegetarian: true, available: true, kitchenStation: 'Hot kitchen', modifiers, taxCode: '1101', taxRateBps: 500 },
   { id: 'cloud-chai', name: 'Masala Chai', category: 'Beverages', priceMinor: 200, emoji: '☕', color: '#f4e8d5',
-    tag: null, vegetarian: true, available: true, kitchenStation: 'Beverage station', modifiers: [] },
+    tag: null, vegetarian: true, available: true, kitchenStation: 'Beverage station', modifiers: [], taxRateBps: 0 },
 ];
 let outletConfig = { name: 'Managed Test Outlet', timezone: 'UTC', currency: 'USD', taxRateBps: 1000,
   receiptName: 'Test Cafe', receiptAddress: '10 Test Street', receiptPhone: '+91 98765 43210', gstin: '22AAAAA0000A1Z5', receiptFooter: 'Thanks for visiting' };
@@ -28,11 +28,14 @@ let layout = { areas: [{ id: 'area-main', name: 'Main floor', sortOrder: 0, tabl
   { id: 'table-1', name: 'Table 01', capacity: 2, sortOrder: 0 },
   { id: 'table-2', name: 'Table 02', capacity: 4, sortOrder: 1 },
 ] }], stations: [{ id: 'station-hot', name: 'Hot kitchen', sortOrder: 0 }, { id: 'station-sweets', name: 'Sweets', sortOrder: 1 }] };
+let inventoryItems = [{ id: '00000000-0000-4000-8000-000000000001', name: 'Poha', unit: 'g', reorderLevel: 50, active: true, onHand: 500 }];
+let recipes = [{ menuItemId: 'cloud-poha', inventoryItemId: inventoryItems[0].id, quantityPerSale: 60 }];
+const acceptedInventoryEventIds = new Set();
 function localFloorPlan(occupiedTables = []) {
   return { ...layout, areas: layout.areas.map(area => ({ ...area, tables: area.tables.map(table => ({ ...table, occupied: occupiedTables.includes(table.name) })) })) };
 }
 function snapshotVersion() {
-  return createHash('sha256').update(JSON.stringify({ outletConfig, items, layout })).digest('hex');
+  return createHash('sha256').update(JSON.stringify({ outletConfig, items, layout, inventoryItems, recipes })).digest('hex');
 }
 let version = snapshotVersion();
 let upstreamAvailable = true;
@@ -79,15 +82,36 @@ const upstream = createServer(async (request, response) => {
       return;
     }
     response.writeHead(200, { 'content-type': 'application/json', etag, 'cache-control': 'no-store' })
-      .end(JSON.stringify({ tenantId, outletId, version: currentVersion, outletConfig, items, layout }));
+      .end(JSON.stringify({ tenantId, outletId, version: currentVersion, outletConfig, items, inventoryItems, recipes, layout }));
     return;
   }
   if (request.method === 'POST') {
     let body = '';
     for await (const chunk of request) body += chunk;
     const payload = JSON.parse(body);
+    const acceptedEventIds = [];
+    const rejectedEvents = [];
+    for (const event of payload.events) {
+      if (event.entityType === 'inventory') {
+        if (acceptedInventoryEventIds.has(event.eventId)) { acceptedEventIds.push(event.eventId); continue; }
+        const stock = inventoryItems.find((item) => item.id === event.payload.inventoryItemId);
+        if (event.action === 'inventory.count_adjustment' && stock
+          && Number(event.payload.expectedBalance) !== stock.onHand) {
+          rejectedEvents.push({ eventId: event.eventId, code: '40001' });
+          continue;
+        }
+        acceptedInventoryEventIds.add(event.eventId);
+        if (stock) {
+          if(event.action==='inventory.receipt')stock.onHand+=Number(event.payload.quantity);
+          else if(event.action==='inventory.count_adjustment')stock.onHand=Number(event.payload.quantity);
+          else stock.onHand-=Number(event.payload.quantity);
+        }
+      }
+      acceptedEventIds.push(event.eventId);
+    }
+    version = snapshotVersion();
     response.writeHead(200, { 'content-type': 'application/json' })
-      .end(JSON.stringify({ acceptedEventIds: payload.events.map((event) => event.eventId) }));
+      .end(JSON.stringify({ acceptedEventIds, rejectedEvents }));
     return;
   }
   response.writeHead(405).end();
@@ -205,6 +229,10 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.equal(cashierLogin.response.status, 200);
   sessionCookie = cashierLogin.response.headers.get('set-cookie').split(';', 1)[0];
   assert.equal((await jsonRequest(baseUrl, '/api/reports/daily')).response.status, 403, 'cashiers cannot read manager reports');
+  const cashierInventoryMovement=await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+    commandId:randomUUID(),inventoryItemId:inventoryItems[0].id,movementType:'receipt',quantity:1,expectedBalance:null,reason:'Delivery received',
+  })});
+  assert.equal(cashierInventoryMovement.response.status,403,'cashiers cannot change inventory');
   const ownerSession = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer owner-token' } });
   sessionCookie = ownerSession.response.headers.get('set-cookie').split(';', 1)[0];
   await waitFor(async () => {
@@ -220,6 +248,8 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   }, 'the paired edge applies cloud outlet settings');
   assert.deepEqual((await jsonRequest(baseUrl, '/api/floor-plan')).body, localFloorPlan(),
     'the paired edge applies the active cloud floor plan and kitchen stations');
+  assert.equal((await jsonRequest(baseUrl, '/api/inventory')).body[0].onHand, 500,
+    'the edge hydrates the cloud stock balance for offline operation');
 
   const firstMenu = await jsonRequest(baseUrl, '/api/menu');
   assert.equal(firstMenu.body.length, 2);
@@ -236,8 +266,10 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   });
   assert.equal(created.response.status, 201);
   assert.equal(created.body.subtotalMinor, 550);
-  assert.equal(created.body.taxTotalMinor, 55);
-  assert.equal(created.body.totalMinor, 605, 'cloud-configured tax is applied to the accepted order');
+  assert.equal(created.body.taxTotalMinor, 28);
+  assert.equal(created.body.totalMinor, 578, 'the item rate overrides the outlet fallback for the accepted order');
+  assert.equal(created.body.lines[0].taxCode, '1101');
+  assert.equal(created.body.lines[0].taxRateBps, 500);
   assert.equal(created.body.currency, 'USD');
   assert.equal(created.body.taxRateBps, 1000);
   assert.deepEqual((await jsonRequest(baseUrl, '/api/floor-plan')).body, localFloorPlan(['Table 01']),
@@ -250,7 +282,8 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(addition),
   });
   assert.equal(added.response.status, 201);
-  assert.equal(added.body.totalMinor, 825);
+  assert.equal(added.body.totalMinor, 778, 'an explicit zero item rate stays zero instead of inheriting outlet tax');
+  assert.equal(added.body.lines[1].taxRateBps, 0);
   const replayedAddition = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/lines`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(addition),
   });
@@ -314,7 +347,7 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(voidBody),
   });
   assert.equal(voided.response.status, 200);
-  assert.equal(voided.body.totalMinor, 605);
+  assert.equal(voided.body.totalMinor, 578);
   assert.equal(voided.body.lines.find((line) => line.id === chaiLine.id).voidReason, 'Guest changed mind');
   stationTickets = (await jsonRequest(baseUrl, '/api/kitchen')).body;
   assert.equal(stationTickets.length, 1, 'voiding the last item removes only its station ticket');
@@ -344,11 +377,12 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.equal((await jsonRequest(baseUrl, '/api/context')).body.currency, 'USD', 'cloud outlet settings survive an edge restart');
   assert.equal((await jsonRequest(baseUrl, '/api/context')).body.taxRateBps, 1000);
   assert.equal((await jsonRequest(baseUrl, '/api/context')).body.timeZone, 'UTC');
-  assert.ok(seenEtags.some((etag) => etag === `"${version}"`), 'edge requests a 304 when the cloud menu is unchanged');
+  assert.ok(seenEtags.some((etag) => etag === `"${version}"`),
+    `edge requests a 304 when the cloud menu is unchanged (${JSON.stringify({ version, seenEtags })})`);
   const restoredMenu = await jsonRequest(baseUrl, '/api/menu');
   assert.deepEqual(restoredMenu.body.map((item) => item.id), ['cloud-poha', 'cloud-chai']);
   const restoredOrder = (await jsonRequest(baseUrl, '/api/orders')).body.find((order) => order.commandId === commandId);
-  assert.equal(restoredOrder.totalMinor, 605);
+  assert.equal(restoredOrder.totalMinor, 578);
   assert.equal(restoredOrder.currency, 'USD');
   assert.equal(restoredOrder.taxRateBps, 1000);
   assert.equal(restoredOrder.status, 'ready');
@@ -363,22 +397,27 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   });
   assert.equal(openedShift.response.status, 201);
   const splitPaymentCommand = { commandId: randomUUID(), orderId: created.body.id, shiftId: openedShift.body.shift.id,
-    tenders: [{ method: 'cash', amountMinor: 300 }, { method: 'upi', amountMinor: 305 }] };
+    tenders: [{ method: 'cash', amountMinor: 300 }, { method: 'upi', amountMinor: 278 }] };
   const invalidSplit = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/payment`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ ...splitPaymentCommand, commandId: randomUUID(), tenders: [{ method: 'cash', amountMinor: 300 }, { method: 'upi', amountMinor: 200 }] }),
   });
   assert.equal(invalidSplit.response.status, 409, 'tender amounts must equal the invoice total');
+  upstreamAvailable = false;
   const payment = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/payment`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify(splitPaymentCommand),
   });
   assert.equal(payment.body.status, 'paid');
   assert.equal(payment.body.invoiceNumber, 'J-INV-000001');
+  assert.equal((await jsonRequest(baseUrl, '/api/inventory')).body[0].onHand, 440,
+    'paid orders consume recipe stock locally during WAN loss');
   const replayPayment = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/payment`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(splitPaymentCommand),
   });
   assert.equal(replayPayment.response.status, 200, 'a repeated split tender command returns the original paid order');
+  assert.equal((await jsonRequest(baseUrl, '/api/inventory')).body[0].onHand, 440,
+    'a replayed payment does not consume recipe stock twice');
   const cashierSession = await jsonRequest(baseUrl, '/api/auth/session', { method: 'POST', headers: { authorization: 'Bearer cashier-token' } });
   const cashierCookie = cashierSession.response.headers.get('set-cookie').split(';', 1)[0];
   const refundCommand = { commandId: randomUUID(), paymentId: '', shiftId: openedShift.body.shift.id, amountMinor: 100, reason: 'Guest changed mind' };
@@ -388,7 +427,7 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.equal(tenderList.response.status, 200);
   const originalUpi = tenderList.body.tenders.find((tender) => tender.method === 'upi');
   refundCommand.paymentId = originalUpi.id;
-  assert.equal(originalUpi.refundableMinor, 305);
+  assert.equal(originalUpi.refundableMinor, 278);
   const cashierPaymentList = await fetch(`${baseUrl}/api/orders/${created.body.id}/payments`, { headers: { cookie: cashierCookie } });
   assert.equal(cashierPaymentList.status, 403, 'cashiers cannot inspect manager refund controls');
   const cashierRefund = await fetch(`${baseUrl}/api/orders/${created.body.id}/refunds`, {
@@ -427,13 +466,14 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.equal(report.body.totals.paidOrderCount, 1);
   assert.equal(report.body.timeZone, 'UTC');
   assert.equal(report.body.currency, 'USD');
-  assert.equal(report.body.totals.subtotalMinor, 459);
-  assert.equal(report.body.totals.salesMinor, 505);
-  assert.equal(report.body.totals.taxTotalMinor, 46, 'tax refunds are allocated proportionally to the original order tax');
+  assert.equal(report.body.totals.subtotalMinor, 455);
+  assert.equal(report.body.totals.salesMinor, 478);
+  assert.equal(report.body.totals.taxTotalMinor, 23, 'tax refunds are allocated proportionally to the original order tax');
+  assert.deepEqual(report.body.taxBreakdown, [{ taxCode: '1101', taxRateBps: 500, taxMinor: 23 }]);
   assert.deepEqual(report.body.refunds, { count: 1, amountMinor: 100 });
   assert.deepEqual(report.body.tenders, [
     { method: 'cash', amountMinor: 300, paymentCount: 1 },
-    { method: 'upi', amountMinor: 205, paymentCount: 1 },
+    { method: 'upi', amountMinor: 178, paymentCount: 1 },
   ]);
   assert.deepEqual(report.body.items.map((item) => ({ name: item.name, quantity: item.quantity, salesMinor: item.salesMinor })), [
     { name: 'Indori Poha', quantity: 1, salesMinor: 550 },
@@ -452,7 +492,14 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.match(csvText, /net_sales/);
   assert.match(csvText, /refunds/);
   assert.match(csvText, /Indori Poha/);
+  assert.match(csvText, /tax_rate/);
   assert.match(csvText, /closed_shifts/);
+  upstreamAvailable = true;
+  await waitFor(async () => (await jsonRequest(baseUrl, '/api/sync/status')).body.pending === 0,
+    'inventory consumption did not sync after the WAN returned');
+  assert.equal(inventoryItems[0].onHand, 440, 'the synced cloud stock balance includes recipe consumption');
+  assert.equal((await jsonRequest(baseUrl, '/api/inventory')).body[0].onHand, 440,
+    'a newer cloud inventory snapshot replaces the edge movement without double counting');
 
   outletConfig = { name: 'Updated Test Outlet', timezone: 'Asia/Kolkata', currency: 'INR', taxRateBps: 500,
     receiptName: 'Updated Test Cafe', receiptAddress: '22 Sample Road', receiptPhone: '+91 12345 67890',
@@ -485,4 +532,42 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   const originalOrderAfterConfigChange = (await jsonRequest(baseUrl, '/api/orders')).body.find((order) => order.commandId === commandId);
   assert.equal(originalOrderAfterConfigChange.currency, 'USD', 'configuration updates do not rewrite historical order currency');
   assert.equal(originalOrderAfterConfigChange.taxRateBps, 1000, 'configuration updates do not rewrite historical order tax');
+
+  upstreamAvailable=false;
+  const offlineReceipt={commandId:randomUUID(),inventoryItemId:inventoryItems[0].id,movementType:'receipt',quantity:5,expectedBalance:null,reason:'Morning delivery'};
+  const receipt=await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(offlineReceipt)});
+  assert.equal(receipt.response.status,201,'manager can save an inventory receipt without WAN');
+  assert.equal(receipt.body.inventory[0].onHand,445);
+  assert.equal((await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(offlineReceipt)})).response.status,200,
+    'replaying a movement command does not duplicate stock');
+  const waste=await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+    commandId:randomUUID(),inventoryItemId:inventoryItems[0].id,movementType:'waste',quantity:2,expectedBalance:null,reason:'Spoilage recorded',
+  })});
+  assert.equal(waste.body.inventory[0].onHand,443);
+  const count={commandId:randomUUID(),inventoryItemId:inventoryItems[0].id,movementType:'count_adjustment',quantity:442,expectedBalance:443,reason:'Closing count'};
+  const savedCount=await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(count)});
+  assert.equal(savedCount.body.inventory[0].onHand,442);
+  assert.equal((await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...count,commandId:randomUUID(),expectedBalance:443})})).response.status,409,
+    'a physical count based on a stale local balance is rejected');
+  assert.ok((await jsonRequest(baseUrl,'/api/sync/status')).body.pending>=3,'offline stock movements are durable in the sync outbox');
+  inventoryItems[0].onHand += 10;
+  version = snapshotVersion();
+  upstreamAvailable=true;
+  const conflicts=await waitFor(async()=>{
+    const result=await jsonRequest(baseUrl,'/api/inventory/conflicts');
+    return result.body.length===1?result.body:null;
+  },'stale cloud count conflict was not surfaced for manager review');
+  assert.equal(conflicts[0].countedQuantity,442);
+  const retired=await jsonRequest(baseUrl,`/api/inventory/conflicts/${conflicts[0].movementId}/discard`,{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({reason:'Discard stale count and recount from refreshed balance.'})});
+  assert.equal(retired.response.status,200,retired.body.error);
+  assert.equal(retired.body.inventory[0].onHand,453,'refresh removes the rejected delta but keeps the current cloud balance');
+  assert.equal(retired.body.conflicts.length,0);
+  assert.equal((await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+    commandId:randomUUID(),inventoryItemId:inventoryItems[0].id,movementType:'count_adjustment',quantity:452,expectedBalance:453,reason:'Recount after sync conflict',
+  })})).response.status,201,'manager can record a fresh count against the refreshed cloud balance');
+  await waitFor(async()=>{
+    const [{body:status},{body:stock}]=await Promise.all([jsonRequest(baseUrl,'/api/sync/status'),jsonRequest(baseUrl,'/api/inventory')]);
+    return status.pending===0&&stock[0].onHand===452&&inventoryItems[0].onHand===452;
+  },'recount did not reconcile after retiring the stale count');
 });

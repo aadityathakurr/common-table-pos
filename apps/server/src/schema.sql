@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS menu_items (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, name TEXT NOT NULL,
   category TEXT NOT NULL, price_minor INTEGER NOT NULL CHECK(price_minor >= 0), emoji TEXT NOT NULL,
   color TEXT NOT NULL, tag TEXT, vegetarian INTEGER NOT NULL DEFAULT 0, available INTEGER NOT NULL DEFAULT 1,
-  kitchen_station TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+  kitchen_station TEXT NOT NULL, tax_code TEXT, tax_rate_bps INTEGER CHECK(tax_rate_bps BETWEEN 0 AND 10000), version INTEGER NOT NULL DEFAULT 1,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id), UNIQUE(tenant_id,outlet_id,id)
 );
@@ -31,6 +31,40 @@ CREATE TABLE IF NOT EXISTS menu_modifiers (
   UNIQUE(tenant_id,outlet_id,id)
 );
 CREATE INDEX IF NOT EXISTS modifiers_by_item ON menu_modifiers(tenant_id,outlet_id,menu_item_id,group_name,sort_order);
+CREATE TABLE IF NOT EXISTS edge_inventory_items (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, name TEXT NOT NULL,
+  unit TEXT NOT NULL, reorder_level REAL NOT NULL, active INTEGER NOT NULL CHECK(active IN (0,1)),
+  cloud_on_hand REAL NOT NULL, updated_at TEXT NOT NULL,
+  FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id), UNIQUE(tenant_id,outlet_id,id)
+);
+CREATE TABLE IF NOT EXISTS edge_inventory_recipes (
+  tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, menu_item_id TEXT NOT NULL, inventory_item_id TEXT NOT NULL,
+  quantity_per_sale REAL NOT NULL CHECK(quantity_per_sale > 0),
+  PRIMARY KEY(tenant_id,outlet_id,menu_item_id,inventory_item_id),
+  FOREIGN KEY(tenant_id,outlet_id,menu_item_id) REFERENCES menu_items(tenant_id,outlet_id,id),
+  FOREIGN KEY(tenant_id,outlet_id,inventory_item_id) REFERENCES edge_inventory_items(tenant_id,outlet_id,id)
+);
+CREATE INDEX IF NOT EXISTS edge_inventory_recipes_by_item ON edge_inventory_recipes(tenant_id,outlet_id,inventory_item_id);
+CREATE TABLE IF NOT EXISTS edge_inventory_movements (
+  id TEXT PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, command_id TEXT NOT NULL UNIQUE,
+  tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, inventory_item_id TEXT NOT NULL, order_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL, quantity REAL NOT NULL CHECK(quantity > 0), quantity_delta REAL NOT NULL CHECK(quantity_delta = -quantity),
+  reason TEXT NOT NULL, occurred_at TEXT NOT NULL, synced INTEGER NOT NULL DEFAULT 0 CHECK(synced IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS edge_inventory_movements_by_item ON edge_inventory_movements(tenant_id,outlet_id,inventory_item_id,occurred_at DESC);
+CREATE TABLE IF NOT EXISTS edge_manual_inventory_movements (
+  id TEXT PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, command_id TEXT NOT NULL UNIQUE,
+  tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, inventory_item_id TEXT NOT NULL,
+  movement_type TEXT NOT NULL CHECK(movement_type IN ('receipt','waste','count_adjustment')),
+  quantity REAL NOT NULL CHECK(quantity >= 0), expected_balance REAL,
+  quantity_delta REAL NOT NULL, reason TEXT NOT NULL, actor_id TEXT NOT NULL,
+  occurred_at TEXT NOT NULL, synced INTEGER NOT NULL DEFAULT 0 CHECK(synced IN (0,1)), superseded_at TEXT,
+  CHECK((movement_type='receipt' AND quantity>0 AND expected_balance IS NULL AND quantity_delta=quantity)
+    OR (movement_type='waste' AND quantity>0 AND expected_balance IS NULL AND quantity_delta=-quantity)
+    OR (movement_type='count_adjustment' AND expected_balance IS NOT NULL AND quantity_delta=quantity-expected_balance))
+);
+CREATE INDEX IF NOT EXISTS edge_manual_inventory_movements_by_item
+  ON edge_manual_inventory_movements(tenant_id,outlet_id,inventory_item_id,occurred_at DESC);
 CREATE TABLE IF NOT EXISTS menu_sync_state (
   tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, version TEXT NOT NULL,
   last_synced_at TEXT NOT NULL, last_error TEXT,
@@ -84,7 +118,7 @@ CREATE TABLE IF NOT EXISTS order_lines (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, order_id TEXT NOT NULL,
   menu_item_id TEXT NOT NULL, item_name_snapshot TEXT NOT NULL, category_snapshot TEXT NOT NULL,
   unit_price_minor INTEGER NOT NULL, modifiers_json TEXT NOT NULL DEFAULT '[]', quantity REAL NOT NULL CHECK(quantity > 0),
-  line_total_minor INTEGER NOT NULL, kitchen_station TEXT NOT NULL, note TEXT,
+  line_total_minor INTEGER NOT NULL, kitchen_station TEXT NOT NULL, note TEXT, tax_code_snapshot TEXT, tax_rate_bps INTEGER NOT NULL DEFAULT 0 CHECK(tax_rate_bps BETWEEN 0 AND 10000),
   FOREIGN KEY(tenant_id,outlet_id,order_id) REFERENCES orders(tenant_id,outlet_id,id),
   FOREIGN KEY(tenant_id,outlet_id,menu_item_id) REFERENCES menu_items(tenant_id,outlet_id,id)
 );
@@ -149,15 +183,17 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE TABLE IF NOT EXISTS sync_outbox (
   outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id TEXT NOT NULL UNIQUE,
-  entity_type TEXT NOT NULL CHECK(entity_type IN ('order','payment','shift','cash_movement','audit')),
+  entity_type TEXT NOT NULL CHECK(entity_type IN ('order','payment','shift','cash_movement','audit','inventory')),
   entity_id TEXT NOT NULL,
   action TEXT NOT NULL,
   occurred_at TEXT NOT NULL,
   payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
   next_attempt_at TEXT,
+  blocked INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0,1)),
   last_error TEXT,
   synced_at TEXT,
+  resolved_at TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sync_outbox_pending

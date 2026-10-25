@@ -1,6 +1,7 @@
 # Common Table POS prototype
 
 See [ROADMAP.md](ROADMAP.md) for the target architecture, delivery stages, and pilot acceptance checklist.
+See [USER_GUIDE.md](USER_GUIDE.md) for the tested cashier and manager workflows.
 
 A first vertical slice for an Indian mithai-house/QSR counter: touch-first order entry, dine-in tables, takeaway, item modifiers, kitchen display, demo tender capture, offline order outbox, and an 80 mm ESC/POS mock printer. The fictional Indore Mithai House catalogue contains 43 vegetarian training items across breakfast, chaat, North Indian food, thalis, sweets, namkeen, cookies, and beverages.
 
@@ -21,7 +22,7 @@ cp .env.example .env # optional for the local demo; use POS_* values for a real 
 npm run dev
 ```
 
-Vite serves the web client on port 5173 and proxies API/WebSocket traffic to the edge server on port 3001. From the server workspace, the edge server creates `apps/server/.data/common-table.db` in SQLite WAL mode and starts its mock ESC/POS TCP listener on `127.0.0.1:9100`.
+Vite serves the web client on port 5173 and proxies API/WebSocket traffic to the edge server's `PORT` (3001 by default). Set `POS_API_PROXY` when the edge runs at a different address. From the server workspace, the edge server creates `apps/server/.data/common-table.db` in SQLite WAL mode and starts its mock ESC/POS TCP listener on `127.0.0.1:9100`.
 
 ## Supabase schema and local Auth
 
@@ -29,18 +30,34 @@ The tracked `supabase/migrations` directory includes the migrations already appl
 
 For hosted sign-up links, configure Supabase **Authentication → URL Configuration** with Site URL `https://common-table-pos.vercel.app` and allow `https://common-table-pos.vercel.app/admin`. The Confirm signup email should link to `{{ .ConfirmationURL }}`, which carries the redirect requested by the manager app. If a custom template constructs a callback URL manually, use `{{ .RedirectTo }}` instead of `{{ .SiteURL }}` for its redirect target. Vercel preview deployments intentionally have no production Supabase credentials.
 
-## Build and run as one edge process
+## Install on a cashier laptop
+
+Use Node.js 22 or newer. In the Common Table manager portal at `/admin`, enroll this laptop as a terminal and copy its one-time edge configuration. On the laptop, install dependencies, keep the outlet database and private configuration on its local disk, then build and start the production server:
 
 ```sh
+npm ci
+cp .env.example .env
+# Replace the placeholder values with the one-time terminal configuration.
+# Do not append duplicate keys; set POS_DATABASE_PATH to a durable local path.
 npm run build
 npm start
 ```
 
-When `apps/web/dist` exists, Express serves the client and API on port 3001. Copy `.env.example` to `.env` and set the outlet's `POS_*` values before a production run. Production also requires a random `POS_SESSION_SECRET` of at least 32 characters and the Supabase project URL and publishable key. `POS_ACTOR_ID` remains a development fallback; order, void, payment, and shift audit records use the signed-in staff user's ID. The default tax rate is a demo value, not a tax configuration for a real outlet.
+The copied configuration includes the browser-safe Supabase URL/publishable key, outlet and terminal IDs, a terminal sync key, and a random session-signing secret. Keep `.env` private; do not commit it or put the terminal key or session secret in a `VITE_*` variable. Set `POS_DATABASE_PATH` to a durable local path and configure the selected printer before service. `npm start` forces production mode and fails closed if required outlet configuration is missing. Open `http://localhost:3001/admin`, sign in while online, then open the cashier POS. After that first sign-in, the local session and outlet database work without internet; records sync when the connection returns. The session expires after 30 days without local use or on explicit sign-out. An explicit online denial of outlet access clears the local session; a network failure does not. `npm run dev` is for development only and uses a local owner shortcut. The default tax rate is demo data, not a tax configuration for a real outlet.
 
-The server adds an `x-request-id` response header and emits one JSON request log per HTTP request. `GET /api/health` is the liveness endpoint; `GET /api/ready` checks required outlet configuration and SQLite integrity; `GET /api/context` returns the configured outlet identity needed by the POS UI. Protected API routes require a staff session. Sign in through `/admin` on the same outlet edge origin; Supabase verifies the user and outlet membership, then the edge sets a signed `HttpOnly` cookie that keeps working during a WAN outage. Owner/manager, cashier, kitchen, and viewer roles have separate route permissions. Kitchen API and WebSocket snapshots omit order and item prices. An owner or manager can download `GET /api/support/diagnostics.json` from the outlet edge for a support bundle containing database checks, order-state counts, sync queue health, printer mode, and runtime version. The export omits order/customer records, auth tokens, and database paths.
+On a Linux desktop with a running systemd user session, the helper can build the app and install it as a per-user service:
 
-To create a SQLite-consistent backup while the edge server is running, build first and run `npm --workspace @common-table/server run backup`. Set `POS_BACKUP_PATH` to choose the destination. Verify that the backup log reports `integrity: "ok"`; store backups outside the outlet device. To restore, stop the edge service and run:
+```sh
+./scripts/install-cashier-service.sh
+```
+
+It requires a complete outlet configuration, including an enrolled terminal sync key, and stores the SQLite database under `~/.local/share/common-table-pos/`. It starts at desktop login, restarts after a process failure, and checks `/api/ready` before reporting success. Service controls are `systemctl --user status|restart|stop common-table-pos.service`; follow logs with `journalctl --user -u common-table-pos.service -f`. To remove the service, run `systemctl --user disable --now common-table-pos.service` and remove `~/.config/systemd/user/common-table-pos.service`. Windows and macOS cashier setups can use the manual `npm start` steps above.
+
+When `apps/web/dist` exists, Express serves the client and API on port 3001. Order, void, payment, and shift audit records use the signed-in staff user's ID.
+
+The server adds an `x-request-id` response header and emits one JSON request log per HTTP request. `GET /api/health` is the liveness endpoint; `GET /api/ready` checks required outlet configuration and SQLite integrity; `GET /api/context` returns the configured outlet identity needed by the POS UI. Protected API routes require a staff session. Sign in through `/admin` on the same outlet edge origin; Supabase verifies the user and outlet membership, then the edge sets a signed `HttpOnly` cookie. Local activity renews this cookie on the laptop, so an active cashier session survives WAN loss and edge/browser restarts without calling Supabase. The cookie expires after 30 days without local use and is cleared on explicit sign-out. If an account is revoked while that laptop is offline, the revocation can only take effect after reconnection. Owner/manager, cashier, kitchen, and viewer roles have separate route permissions. Kitchen API and WebSocket snapshots omit order and item prices. An owner or manager can download `GET /api/support/diagnostics.json` from the outlet edge for a support bundle containing database checks, order-state counts, sync queue health, printer mode, and runtime version. The export omits order/customer records, auth tokens, and database paths.
+
+In production, the edge creates one integrity-checked SQLite backup per UTC day at startup (and checks hourly), keeping seven days by default. Backups go to `POS_BACKUP_DIR`, or to a `backups/` folder beside `POS_DATABASE_PATH`. Set `POS_AUTO_BACKUP=false` to disable automatic snapshots or `POS_AUTO_BACKUP_RETENTION_DAYS` to choose 1–365 days. Backups on the cashier laptop protect against application-level database problems, not loss or damage of that laptop; set `POS_BACKUP_DIR` to an encrypted external drive for a separate copy. To create an additional SQLite-consistent backup while the edge server is running, build first and run `npm --workspace @common-table/server run backup`. Set `POS_BACKUP_PATH` to choose a one-off destination. Verify that the backup log reports `integrity: "ok"`. To restore, stop the edge service and run:
 
 ```sh
 POS_RESTORE_SOURCE=/path/to/verified-backup.db \
