@@ -78,7 +78,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
   await recordTerminalSeen(client, terminal);
 
   if (request.method === "GET") {
-    const [outletResult, categoryResult, itemResult] = await Promise.all([
+    const [outletResult, categoryResult, itemResult, areaResult, tableResult, stationResult] = await Promise.all([
       client.from("outlets").select("name,timezone,currency,tax_rate_bps,receipt_name,receipt_address,receipt_phone,gstin,receipt_footer")
         .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id).maybeSingle(),
       client.from("menu_categories").select("category_id,name,sort_order,active")
@@ -87,9 +87,18 @@ Deno.serve(async (request: Request): Promise<Response> => {
       client.from("menu_items").select("item_id,category_id,name,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,modifiers,sort_order")
         .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id)
         .order("sort_order").order("item_id"),
+      client.from("dining_areas").select("area_id,name,sort_order,active")
+        .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id).eq("active", true)
+        .order("sort_order").order("area_id"),
+      client.from("dining_tables").select("table_id,area_id,name,capacity,sort_order,active")
+        .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id).eq("active", true)
+        .order("sort_order").order("table_id"),
+      client.from("kitchen_stations").select("station_id,name,sort_order,active")
+        .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id).eq("active", true)
+        .order("sort_order").order("station_id"),
     ]);
-    if (outletResult.error || !outletResult.data || categoryResult.error || itemResult.error) {
-      console.error(JSON.stringify({ event: "pos_sync.snapshot_read_failed", code: outletResult.error?.code ?? categoryResult.error?.code ?? itemResult.error?.code }));
+    if (outletResult.error || !outletResult.data || categoryResult.error || itemResult.error || areaResult.error || tableResult.error || stationResult.error) {
+      console.error(JSON.stringify({ event: "pos_sync.snapshot_read_failed", code: outletResult.error?.code ?? categoryResult.error?.code ?? itemResult.error?.code ?? areaResult.error?.code ?? tableResult.error?.code ?? stationResult.error?.code }));
       return json(503, { error: "The outlet configuration could not be read. Retry safely." });
     }
     const outletConfig = {
@@ -132,12 +141,36 @@ Deno.serve(async (request: Request): Promise<Response> => {
         modifiers: item.modifiers.map((modifier) => ({ ...modifier, priceDeltaMinor: Number(modifier.priceDeltaMinor) })),
       });
     }
-    const versionBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify({ outletConfig, items }))));
+    if ((areaResult.data?.length ?? 0) > 100 || (tableResult.data?.length ?? 0) > 500 || (stationResult.data?.length ?? 0) > 100) {
+      return json(503, { error: "The outlet floor plan exceeds its supported size." });
+    }
+    const tablesByArea = new Map<string, Array<{ id: string; name: string; capacity: number; sortOrder: number }>>();
+    for (const table of tableResult.data ?? []) {
+      if (!Number.isSafeInteger(table.capacity) || table.capacity < 1 || table.capacity > 50
+        || !Number.isSafeInteger(table.sort_order) || table.sort_order < 0 || typeof table.name !== "string"
+        || !table.name.trim() || table.name.length > 40 || /[\u0000-\u001f\u007f]/.test(table.name)) return json(503, { error: "The outlet floor plan is invalid." });
+      const rows = tablesByArea.get(table.area_id) ?? [];
+      rows.push({ id: table.table_id, name: table.name.trim(), capacity: table.capacity, sortOrder: table.sort_order });
+      tablesByArea.set(table.area_id, rows);
+    }
+    const layout = {
+      areas: (areaResult.data ?? []).map((area) => ({
+        id: area.area_id, name: area.name.trim(), sortOrder: area.sort_order,
+        tables: tablesByArea.get(area.area_id) ?? [],
+      })),
+      stations: (stationResult.data ?? []).map((station) => ({ id: station.station_id, name: station.name.trim(), sortOrder: station.sort_order })),
+    };
+    if (layout.areas.some((area) => !area.name || area.name.length > 80 || /[\u0000-\u001f\u007f]/.test(area.name) || !Number.isSafeInteger(area.sortOrder) || area.sortOrder < 0)
+      || layout.stations.some((station) => !station.name || station.name.length > 80 || /[\u0000-\u001f\u007f]/.test(station.name) || !Number.isSafeInteger(station.sortOrder) || station.sortOrder < 0)
+      || (tableResult.data ?? []).some((table) => !(areaResult.data ?? []).some((area) => area.area_id === table.area_id))) {
+      return json(503, { error: "The outlet floor plan is invalid." });
+    }
+    const versionBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify({ outletConfig, items, layout }))));
     const version = [...versionBytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
     const etag = `"${version}"`;
     const headers = { etag, "x-pos-menu-version": version };
     if (ifNoneMatchMatches(request.headers.get("if-none-match"), etag)) return noContent(304, headers);
-    return json(200, { tenantId: terminal.tenant_id, outletId: terminal.outlet_id, version, outletConfig, items }, headers);
+    return json(200, { tenantId: terminal.tenant_id, outletId: terminal.outlet_id, version, outletConfig, items, layout }, headers);
   }
 
   const contentLength = Number(request.headers.get("content-length") ?? "0");

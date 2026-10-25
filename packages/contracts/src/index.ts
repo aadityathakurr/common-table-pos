@@ -23,6 +23,31 @@ export interface MenuItem {
   modifiers: ModifierOption[];
 }
 
+export interface DiningTableConfig {
+  id: string;
+  name: string;
+  capacity: number;
+  sortOrder: number;
+}
+
+export interface DiningAreaConfig {
+  id: string;
+  name: string;
+  sortOrder: number;
+  tables: DiningTableConfig[];
+}
+
+export interface KitchenStationConfig {
+  id: string;
+  name: string;
+  sortOrder: number;
+}
+
+export interface OutletLayoutConfig {
+  areas: DiningAreaConfig[];
+  stations: KitchenStationConfig[];
+}
+
 export interface OrderLineDraft {
   menuItemId: string;
   quantity: number;

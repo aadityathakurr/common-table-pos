@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { DEMO_MENU, type MenuItem } from '@common-table/contracts';
+import { DEMO_MENU, type MenuItem, type OutletLayoutConfig } from '@common-table/contracts';
 import { applyOutletRuntimeSettings, EDGE_CONFIG, type OutletRuntimeSettings } from './config.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -55,6 +55,22 @@ const seed = db.transaction(() => {
       EDGE_CONFIG.gstin || null, EDGE_CONFIG.receiptFooter || null);
   db.prepare('INSERT OR IGNORE INTO terminals(id,tenant_id,outlet_id,name) VALUES(?,?,?,?)')
     .run(DEMO_TERMINAL, DEMO_TENANT, DEMO_OUTLET, EDGE_CONFIG.terminalName);
+  if (process.env.NODE_ENV !== 'production') {
+    const areas = [
+      { id: 'demo-area-main', name: 'Main floor', order: 0, tables: ['Table 01','Table 02','Table 03','Table 04','Table 05'] },
+      { id: 'demo-area-patio', name: 'Patio', order: 1, tables: ['Patio 01'] },
+      { id: 'demo-area-bar', name: 'Bar', order: 2, tables: ['Bar 01','Bar 02'] },
+    ];
+    const insertArea = db.prepare('INSERT OR IGNORE INTO dining_areas(id,tenant_id,outlet_id,name,sort_order) VALUES(?,?,?,?,?)');
+    const insertTable = db.prepare('INSERT OR IGNORE INTO dining_tables(id,tenant_id,outlet_id,area_id,name,capacity,sort_order) VALUES(?,?,?,?,?,?,?)');
+    for (const area of areas) {
+      insertArea.run(area.id, DEMO_TENANT, DEMO_OUTLET, area.name, area.order);
+      area.tables.forEach((name, index) => insertTable.run(`${area.id}-${index + 1}`, DEMO_TENANT, DEMO_OUTLET, area.id, name, area.name === 'Main floor' ? 2 : 4, index));
+    }
+    const stationNames = [...new Set(DEMO_MENU.map(item => item.kitchenStation))];
+    const insertStation = db.prepare('INSERT OR IGNORE INTO kitchen_stations(id,tenant_id,outlet_id,name,sort_order) VALUES(?,?,?,?,?)');
+    stationNames.forEach((name, index) => insertStation.run(`demo-station-${index + 1}`, DEMO_TENANT, DEMO_OUTLET, name, index));
+  }
   const insert = db.prepare(`INSERT OR IGNORE INTO menu_items
     (id,tenant_id,outlet_id,name,category,price_minor,emoji,color,tag,vegetarian,available,kitchen_station)
     VALUES(@id,@tenantId,@outletId,@name,@category,@priceMinor,@emoji,@color,@tag,@vegetarian,@available,@kitchenStation)`);
@@ -149,6 +165,7 @@ export function syncOutboxStatus(){
 }
 
 export interface ManagedMenuSnapshotItem extends MenuItem {}
+export type ManagedOutletLayout = OutletLayoutConfig;
 
 export function managedMenuSyncState(){
   return db.prepare('SELECT version,last_synced_at AS lastSyncedAt,last_error AS lastError FROM menu_sync_state WHERE tenant_id=? AND outlet_id=?')
@@ -168,7 +185,7 @@ export function markManagedMenuChecked(version:string, syncedAt=new Date().toISO
     .run(DEMO_TENANT,DEMO_OUTLET,version,syncedAt);
 }
 
-export function applyManagedMenuSnapshot(version:string,items:ManagedMenuSnapshotItem[],settings:OutletRuntimeSettings,syncedAt=new Date().toISOString()):void{
+export function applyManagedMenuSnapshot(version:string,items:ManagedMenuSnapshotItem[],settings:OutletRuntimeSettings,layout:ManagedOutletLayout,syncedAt=new Date().toISOString()):void{
   if(items.length>5000)throw new Error('The outlet menu exceeds the item limit.');
   const apply=db.transaction(()=>{
     db.prepare(`UPDATE outlets SET name=?,timezone=?,currency=?,tax_rate_bps=?,receipt_name=?,receipt_address=?,receipt_phone=?,gstin=?,receipt_footer=?
@@ -176,6 +193,17 @@ export function applyManagedMenuSnapshot(version:string,items:ManagedMenuSnapsho
       .run(settings.name,settings.timezone,settings.currency,settings.taxRateBps,
         settings.receiptName || null,settings.receiptAddress || null,settings.receiptPhone || null,
         settings.gstin || null,settings.receiptFooter || null,DEMO_OUTLET,DEMO_TENANT);
+    db.prepare('DELETE FROM dining_tables WHERE tenant_id=? AND outlet_id=?').run(DEMO_TENANT, DEMO_OUTLET);
+    db.prepare('DELETE FROM dining_areas WHERE tenant_id=? AND outlet_id=?').run(DEMO_TENANT, DEMO_OUTLET);
+    db.prepare('DELETE FROM kitchen_stations WHERE tenant_id=? AND outlet_id=?').run(DEMO_TENANT, DEMO_OUTLET);
+    const insertArea=db.prepare('INSERT INTO dining_areas(id,tenant_id,outlet_id,name,sort_order,active) VALUES(?,?,?,?,?,1)');
+    const insertTable=db.prepare('INSERT INTO dining_tables(id,tenant_id,outlet_id,area_id,name,capacity,sort_order,active) VALUES(?,?,?,?,?,?,?,1)');
+    const insertStation=db.prepare('INSERT INTO kitchen_stations(id,tenant_id,outlet_id,name,sort_order,active) VALUES(?,?,?,?,?,1)');
+    for(const area of layout.areas){
+      insertArea.run(area.id,DEMO_TENANT,DEMO_OUTLET,area.name,area.sortOrder);
+      for(const table of area.tables)insertTable.run(table.id,DEMO_TENANT,DEMO_OUTLET,area.id,table.name,table.capacity,table.sortOrder);
+    }
+    for(const station of layout.stations)insertStation.run(station.id,DEMO_TENANT,DEMO_OUTLET,station.name,station.sortOrder);
     db.prepare('UPDATE menu_items SET available=0,updated_at=? WHERE tenant_id=? AND outlet_id=?')
       .run(syncedAt,DEMO_TENANT,DEMO_OUTLET);
     db.prepare('UPDATE menu_modifiers SET active=0 WHERE tenant_id=? AND outlet_id=?').run(DEMO_TENANT,DEMO_OUTLET);

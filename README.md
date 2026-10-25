@@ -65,7 +65,7 @@ The root `vercel.json` builds the monorepo and publishes `apps/web/dist`. It hos
 ## Main routes
 
 - Public: `GET /api/health`, `/api/ready`, `/api/context`. Staff session: `GET/POST/DELETE /api/auth/session`.
-- Protected: `/api/menu`, `/api/orders`, `/api/kitchen`, `/api/sync/status`, and report routes; permissions vary by staff role.
+- Protected: `/api/menu`, `/api/orders`, `/api/kitchen`, `/api/floor-plan`, `/api/sync/status`, and report routes; permissions vary by staff role. The floor-plan endpoint reads the outlet's synced SQLite areas/tables/stations and marks tables occupied while an order is active.
 - `GET /api/reports/daily`, `/api/reports/daily.csv` (outlet-local business date; local SQLite data)
 - `POST /api/orders`, `POST /api/orders/:orderId/lines`, `POST /api/orders/:orderId/lines/:lineId/void`, `POST /api/orders/:orderId/void`
 - `PATCH /api/orders/:orderId/status`, `/api/orders/:orderId/stations/:station/status`

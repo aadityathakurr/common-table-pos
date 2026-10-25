@@ -37,6 +37,26 @@ CREATE TABLE IF NOT EXISTS menu_sync_state (
   PRIMARY KEY(tenant_id,outlet_id),
   FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id)
 );
+CREATE TABLE IF NOT EXISTS dining_areas (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, name TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+  FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id), UNIQUE(tenant_id,outlet_id,id),
+  UNIQUE(tenant_id,outlet_id,name)
+);
+CREATE TABLE IF NOT EXISTS dining_tables (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, area_id TEXT NOT NULL,
+  name TEXT NOT NULL, capacity INTEGER NOT NULL CHECK(capacity BETWEEN 1 AND 50),
+  sort_order INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+  FOREIGN KEY(tenant_id,outlet_id,area_id) REFERENCES dining_areas(tenant_id,outlet_id,id) ON DELETE CASCADE,
+  UNIQUE(tenant_id,outlet_id,id), UNIQUE(tenant_id,outlet_id,name)
+);
+CREATE TABLE IF NOT EXISTS kitchen_stations (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, name TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+  FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id), UNIQUE(tenant_id,outlet_id,id),
+  UNIQUE(tenant_id,outlet_id,name)
+);
+CREATE INDEX IF NOT EXISTS dining_tables_by_area ON dining_tables(tenant_id,outlet_id,area_id,sort_order);
 CREATE TABLE IF NOT EXISTS outlet_counters (
   tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, counter_name TEXT NOT NULL, next_value INTEGER NOT NULL,
   PRIMARY KEY(tenant_id,outlet_id,counter_name),
@@ -120,7 +140,6 @@ CREATE TABLE IF NOT EXISTS payment_events (
   FOREIGN KEY(tenant_id,outlet_id,order_id) REFERENCES orders(tenant_id,outlet_id,id),
   FOREIGN KEY(tenant_id,outlet_id,shift_id) REFERENCES shifts(tenant_id,outlet_id,id)
 );
-CREATE INDEX IF NOT EXISTS payments_by_refund ON payment_events(tenant_id,outlet_id,refund_of,status);
 CREATE TABLE IF NOT EXISTS audit_events (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, actor_id TEXT NOT NULL,
   terminal_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,

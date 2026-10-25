@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Banknote, BarChart3, Check, ChefHat, ChevronDown, CircleHelp, Coffee, CreditCard, Flame, LayoutGrid, LoaderCircle, MapPin, Minus, MoreHorizontal, Plus, Printer, QrCode, Search, Send, Trash2, Wifi, WifiOff, X } from 'lucide-react';
-import type { CreateOrderCommand, KitchenOrder, MenuItem, ModifierOption, OrderLine, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftSummary } from '@common-table/contracts';
+import type { CreateOrderCommand, DiningAreaConfig, DiningTableConfig, KitchenOrder, KitchenStationConfig, MenuItem, ModifierOption, OrderLine, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftSummary } from '@common-table/contracts';
 import { DEMO_MENU } from '@common-table/contracts';
 import { listQueuedOrders, queueOrder, removeQueuedOrder, type QueuedOrder } from './offline';
 import { supabase } from './supabase';
@@ -13,6 +13,12 @@ const CONTEXT_CACHE='common-table.edge-context.v1';
 interface EdgeContext {tenantId:string;tenantName:string;outletId:string;outletName:string;terminalId:string;terminalName:string;locationLabel:string;currency:string;timeZone?:string;taxRateBps:number;}
 interface CloudMenuContext {tenantId:string;outletId:string;outletName?:string;currency?:string;}
 interface CloudMenuRow {item_id:string;category_id:string;name:string;price_minor:number;emoji:string;color:string;tag:string|null;vegetarian:boolean;available:boolean;kitchen_station:string;modifiers:ModifierOption[]|null;}
+interface CloudAreaRow {area_id:string;name:string;sort_order:number;}
+interface CloudTableRow {table_id:string;area_id:string;name:string;capacity:number;sort_order:number;}
+interface CloudStationRow {station_id:string;name:string;sort_order:number;}
+interface FloorTable extends DiningTableConfig {occupied?:boolean;}
+interface FloorArea extends Omit<DiningAreaConfig,'tables'> {tables:FloorTable[];}
+interface FloorPlan {areas:FloorArea[];stations:KitchenStationConfig[];}
 interface SyncStatus {configured:boolean;pending:number;failed:number;lastSyncedAt:string|null;lastError:string|null;menu?:{version?:string;lastSyncedAt?:string;lastError:string|null};}
 interface EdgeStaffSession {userId:string;email:string;displayName:string;role:'owner'|'manager'|'cashier'|'kitchen'|'viewer';tenantId:string;outletId:string;expiresAt:number;}
 function readCachedContext():EdgeContext|null{
@@ -20,6 +26,43 @@ function readCachedContext():EdgeContext|null{
 }
 function readCloudMenuContext():CloudMenuContext|null{
   try{const value=localStorage.getItem('common-table.menu-context.v1');if(!value)return null;const parsed=JSON.parse(value) as Partial<CloudMenuContext>;return parsed.tenantId&&parsed.outletId?parsed as CloudMenuContext:null;}catch{return null;}
+}
+const DEMO_FLOOR_PLAN:FloorPlan={areas:[
+  {id:'demo-area-main',name:'Main floor',sortOrder:0,tables:['Table 01','Table 02','Table 03','Table 04','Table 05'].map((name,index)=>({id:`demo-main-${index}`,name,capacity:2,sortOrder:index}))},
+  {id:'demo-area-patio',name:'Patio',sortOrder:1,tables:[{id:'demo-patio-0',name:'Patio 01',capacity:4,sortOrder:0}]},
+  {id:'demo-area-bar',name:'Bar',sortOrder:2,tables:['Bar 01','Bar 02'].map((name,index)=>({id:`demo-bar-${index}`,name,capacity:4,sortOrder:index}))},
+],stations:[...new Set(DEMO_MENU.map(item=>item.kitchenStation))].map((name,index)=>({id:`demo-station-${index}`,name,sortOrder:index}))};
+function parseFloorPlan(value:unknown):FloorPlan|null{
+  if(!value||typeof value!=='object'||Array.isArray(value))return null;
+  const row=value as Record<string,unknown>;
+  if(!Array.isArray(row.areas)||!Array.isArray(row.stations)||row.areas.length>100||row.stations.length>100)return null;
+  const areas:FloorArea[]=[];let tableCount=0;
+  for(const candidate of row.areas){
+    if(!candidate||typeof candidate!=='object'||Array.isArray(candidate))return null;
+    const area=candidate as Record<string,unknown>;
+    if(typeof area.id!=='string'||typeof area.name!=='string'||!Number.isSafeInteger(area.sortOrder)||!Array.isArray(area.tables))return null;
+    tableCount+=area.tables.length;if(tableCount>500)return null;
+    const tables:FloorTable[]=[];
+    for(const entry of area.tables){
+      if(!entry||typeof entry!=='object'||Array.isArray(entry))return null;
+      const table=entry as Record<string,unknown>;
+      if(typeof table.id!=='string'||typeof table.name!=='string'||!Number.isSafeInteger(table.capacity)||Number(table.capacity)<1||Number(table.capacity)>50||!Number.isSafeInteger(table.sortOrder))return null;
+      tables.push({id:table.id,name:table.name,capacity:Number(table.capacity),sortOrder:Number(table.sortOrder),...(typeof table.occupied==='boolean'?{occupied:table.occupied}:{})});
+    }
+    areas.push({id:area.id,name:area.name,sortOrder:Number(area.sortOrder),tables});
+  }
+  const stations:KitchenStationConfig[]=[];
+  for(const entry of row.stations){
+    if(!entry||typeof entry!=='object'||Array.isArray(entry))return null;
+    const station=entry as Record<string,unknown>;
+    if(typeof station.id!=='string'||typeof station.name!=='string'||!Number.isSafeInteger(station.sortOrder))return null;
+    stations.push({id:station.id,name:station.name,sortOrder:Number(station.sortOrder)});
+  }
+  return {areas,stations};
+}
+function floorCacheKey(tenantId:string,outletId:string){return `common-table.floor-plan.v1:${tenantId}:${outletId}`;}
+function readSavedFloorPlan(tenantId:string,outletId:string):FloorPlan|null{
+  try{const raw=localStorage.getItem(floorCacheKey(tenantId,outletId));if(!raw)return null;const saved=JSON.parse(raw) as {layout?:unknown};return parseFloorPlan(saved.layout);}catch{return null;}
 }
 
 interface CartLine { id:string; item:MenuItem; quantity:number; modifiers:ModifierOption[]; }
@@ -38,6 +81,8 @@ function App(){
   const [search,setSearch]=useState('');
   const [orderType,setOrderType]=useState<'dine_in'|'takeaway'>('dine_in');
   const [table,setTable]=useState('Table 04');
+  const [floorPlan,setFloorPlan]=useState<FloorPlan>(DEMO_FLOOR_PLAN);
+  const [floorAreaId,setFloorAreaId]=useState('demo-area-main');
   const [cart,setCart]=useState<CartLine[]>([]);
   const [note,setNote]=useState('');
   const [orders,setOrders]=useState<OrderRecord[]>([]);
@@ -97,7 +142,9 @@ function App(){
   const canManage=!staffSession||['owner','manager'].includes(staffSession.role);
   const staffName=staffSession?.displayName??'Outlet team';
   const staffInitials=staffName.split(/\s+/).filter(Boolean).slice(0,2).map(part=>part[0]?.toUpperCase()??'').join('')||'OT';
-  const kitchenStations=['All stations',...new Set(tickets.map(ticket=>ticket.kitchenStation).filter((station):station is string=>Boolean(station)))];
+  const configuredTables=useMemo(()=>floorPlan.areas.flatMap(area=>area.tables),[floorPlan]);
+  const selectedTable=configuredTables.find(candidate=>candidate.name===table);
+  const kitchenStations=['All stations',...new Set([...floorPlan.stations.map(station=>station.name),...tickets.map(ticket=>ticket.kitchenStation).filter((station):station is string=>Boolean(station))])];
   const visibleTickets=kitchenStationFilter==='All stations'?tickets:tickets.filter(ticket=>ticket.kitchenStation===kitchenStationFilter);
 
   const notify=useCallback((message:string)=>{setToast(message);window.setTimeout(()=>setToast(''),2600);},[]);
@@ -106,6 +153,19 @@ function App(){
   const refreshKitchen=useCallback(async()=>{try{const response=await fetch('/api/kitchen',{cache:'no-store'});if(!response.ok)throw new Error();setKitchenTickets(await response.json() as KitchenOrder[]);}catch{/* Preserve the last kitchen snapshot while reconnecting. */}},[]);
   const refreshShift=useCallback(async()=>{try{const response=await fetch('/api/shifts/current');if(!response.ok)throw new Error();const payload=await response.json() as {shift:ShiftSummary|null};setShiftSummary(payload.shift);}catch{/* Shift controls stay unavailable when the local edge is unreachable. */}},[]);
   const refreshSyncStatus=useCallback(async()=>{try{const response=await fetch('/api/sync/status');if(!response.ok)throw new Error();setSyncStatus(await response.json() as SyncStatus);}catch{setSyncStatus(null);}},[]);
+  const applyFloorPlan=useCallback((next:FloorPlan)=>{
+    setFloorPlan(next);
+    setTable(current=>next.areas.flatMap(area=>area.tables).some(candidate=>candidate.name===current)?current:next.areas.flatMap(area=>area.tables)[0]?.name??'');
+    setFloorAreaId(current=>next.areas.some(area=>area.id===current)?current:next.areas[0]?.id??'');
+  },[]);
+  useEffect(()=>{
+    if(editingOrderId)return;
+    const activeNames=new Set(orders.filter(order=>['sent','preparing','ready'].includes(order.status)).map(order=>order.tableLabel).filter((name):name is string=>Boolean(name)));
+    const current=configuredTables.find(candidate=>candidate.name===table);
+    if(current&&!current.occupied&&!activeNames.has(current.name))return;
+    const next=configuredTables.find(candidate=>!candidate.occupied&&!activeNames.has(candidate.name));
+    setTable(next?.name??'');
+  },[configuredTables,editingOrderId,orders,table]);
 
   const flushQueue=useCallback(async()=>{
     const pending=await listQueuedOrders().catch(()=>[]);
@@ -125,6 +185,10 @@ function App(){
   useEffect(()=>{
     void refreshQueue();void refreshOrders();void refreshKitchen();void refreshShift();void refreshSyncStatus();
     void (async()=>{
+      const cloudContext=readCloudMenuContext();
+      const cachedContext=readCachedContext();
+      const layoutContext=cloudContext??cachedContext;
+      if(layoutContext){const saved=readSavedFloorPlan(layoutContext.tenantId,layoutContext.outletId);if(saved)applyFloorPlan(saved);}
       let edgeContext:EdgeContext|null=null;
       try{
         const response=await fetch('/api/context',{cache:'no-store'});
@@ -143,7 +207,6 @@ function App(){
         }catch{/* An offline cashier can use the last cloud cache while the edge menu is repaired. */}
       }
 
-      const cloudContext=readCloudMenuContext();
       if(!cloudContext||!supabase)return;
       const cacheKey=`common-table.menu-cache.v1:${cloudContext.tenantId}:${cloudContext.outletId}`;
       const {data:sessionData}=await supabase.auth.getSession();
@@ -164,15 +227,48 @@ function App(){
         id:row.item_id,name:row.name,category:names.get(row.category_id)??'Menu',priceMinor:Number(row.price_minor),emoji:row.emoji,color:row.color,
         ...(row.tag?{tag:row.tag}:{}),vegetarian:row.vegetarian,available:row.available,kitchenStation:row.kitchen_station,modifiers:Array.isArray(row.modifiers)?row.modifiers:[],
       } satisfies MenuItem));
-      if(!rows.length)return;
-      setMenu(rows);setMenuSource('cloud');
-      try{localStorage.setItem(cacheKey,JSON.stringify({userId:currentUserId,items:rows}));}catch{/* Current session continues even when storage is full. */}
+      if(rows.length){
+        setMenu(rows);setMenuSource('cloud');
+        try{localStorage.setItem(cacheKey,JSON.stringify({userId:currentUserId,items:rows}));}catch{/* Current session continues even when storage is full. */}
+      }
+      const [areaResult,tableResult,stationResult]=await Promise.all([
+        supabase.from('dining_areas').select('area_id,name,sort_order').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('active',true).order('sort_order'),
+        supabase.from('dining_tables').select('table_id,area_id,name,capacity,sort_order').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('active',true).order('sort_order'),
+        supabase.from('kitchen_stations').select('station_id,name,sort_order').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('active',true).order('sort_order'),
+      ]);
+      if(!areaResult.error&&!tableResult.error&&!stationResult.error){
+        const tableRows=(tableResult.data??[]) as CloudTableRow[];
+        const layout:FloorPlan={
+          areas:((areaResult.data??[]) as CloudAreaRow[]).map(area=>({id:area.area_id,name:area.name,sortOrder:Number(area.sort_order),tables:tableRows.filter(table=>table.area_id===area.area_id).map(table=>({id:table.table_id,name:table.name,capacity:Number(table.capacity),sortOrder:Number(table.sort_order)}))})),
+          stations:((stationResult.data??[]) as CloudStationRow[]).map(station=>({id:station.station_id,name:station.name,sortOrder:Number(station.sort_order)})),
+        };
+        applyFloorPlan(layout);
+        try{localStorage.setItem(floorCacheKey(cloudContext.tenantId,cloudContext.outletId),JSON.stringify({layout}));}catch{/* A full cache does not interrupt this session. */}
+      }
     })().catch(()=>undefined);
     const onOnline=()=>{setOnline(true);void flushQueue();};const onOffline=()=>setOnline(false);
     window.addEventListener('online',onOnline);window.addEventListener('offline',onOffline);
     const retry=window.setInterval(()=>{void flushQueue();void refreshOrders();void refreshKitchen();void refreshShift();void refreshSyncStatus();},5000);
     return()=>{window.removeEventListener('online',onOnline);window.removeEventListener('offline',onOffline);window.clearInterval(retry);};
-  },[flushQueue,refreshKitchen,refreshOrders,refreshQueue,refreshShift,refreshSyncStatus]);
+  },[applyFloorPlan,flushQueue,refreshKitchen,refreshOrders,refreshQueue,refreshShift,refreshSyncStatus]);
+
+  useEffect(()=>{
+    if(!isOutletEdge||!staffSessionReady||!outletContext)return;
+    let active=true;
+    const refreshFloorPlan=async()=>{
+      try{
+        const response=await fetch('/api/floor-plan',{cache:'no-store'});
+        if(!response.ok)return;
+        const layout=parseFloorPlan(await response.json());
+        if(!layout||!active)return;
+        applyFloorPlan(layout);
+        try{localStorage.setItem(floorCacheKey(outletContext.tenantId,outletContext.outletId),JSON.stringify({layout}));}catch{/* A full cache does not interrupt service. */}
+      }catch{/* The browser retains its last accepted outlet layout. */}
+    };
+    void refreshFloorPlan();
+    const interval=window.setInterval(()=>void refreshFloorPlan(),30_000);
+    return()=>{active=false;window.clearInterval(interval);};
+  },[applyFloorPlan,isOutletEdge,outletContext,staffSessionReady]);
 
   useEffect(()=>{
     if(!isOutletEdge)return;
@@ -248,7 +344,7 @@ function App(){
   }
 
   async function sendToKitchen(){
-    if(!cart.length||busy)return;if(!outletContext){notify('Connect to the outlet edge server before sending or queueing an order.');return;}setBusy(true);const command=editingOrder?null:buildCommand();
+    if(!cart.length||busy)return;if(!editingOrder&&orderType==='dine_in'&&!selectedTable){notify('Choose an available table before sending this dine-in order.');return;}if(!outletContext){notify('Connect to the outlet edge server before sending or queueing an order.');return;}setBusy(true);const command=editingOrder?null:buildCommand();
     try{
       const response=editingOrder
         ?await fetch(`/api/orders/${editingOrder.id}/lines`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({commandId:editCommandId||makeId(),lines:cart.map(line=>({menuItemId:line.item.id,quantity:line.quantity,modifierIds:line.modifiers.map(option=>option.id)}))})})
@@ -275,7 +371,7 @@ function App(){
   }
 
   async function recordPayment(){
-    if((!cart.length&&!editingOrder)||busy)return;if(!outletContext||!connected){notify('Connect this browser to the outlet edge server before taking payment.');return;}if(!shiftSummary||shiftSummary.shift.status!=='open'){setCheckoutOpen(false);setShiftOpen(true);notify('Open a shift before recording a tender.');return;}
+    if((!cart.length&&!editingOrder)||busy)return;if(!editingOrder&&orderType==='dine_in'&&!selectedTable){notify('Choose an available table before charging this dine-in order.');return;}if(!outletContext||!connected){notify('Connect this browser to the outlet edge server before taking payment.');return;}if(!shiftSummary||shiftSummary.shift.status!=='open'){setCheckoutOpen(false);setShiftOpen(true);notify('Open a shift before recording a tender.');return;}
     const splitMinor=Math.round(Number(splitAmount)*100);
     if(splitPayment&&(!Number.isSafeInteger(splitMinor)||splitMinor<=0||splitMinor>=total||splitMethod===paymentMethod)){
       notify(splitMethod===paymentMethod?'Choose two different tender methods.':'Enter a split amount smaller than the order total.');return;
@@ -369,8 +465,8 @@ function App(){
         <div className="grid items-start gap-3 xl:grid-cols-[minmax(500px,1.55fr)_minmax(330px,.85fr)]">
           <section className="overflow-hidden rounded-[14px] border border-[#e8ede9] bg-white shadow-[0_10px_24px_rgba(25,37,34,.045)]">
             <div className="flex flex-wrap items-center gap-2 border-b border-[#edf0ed] p-3">
-              <div className="flex rounded-lg bg-[#f2f5f2] p-[3px]"><button disabled={!!editingOrder} onClick={()=>setOrderType('dine_in')} className={`rounded-md px-2.5 py-1.5 text-[9px] disabled:opacity-40 ${orderType==='dine_in'?'bg-white font-bold text-[#28694f] shadow-sm':'text-[#829089]'}`}>▤ Dine in</button><button disabled={!!editingOrder} onClick={()=>setOrderType('takeaway')} className={`rounded-md px-2.5 py-1.5 text-[9px] disabled:opacity-40 ${orderType==='takeaway'?'bg-white font-bold text-[#28694f] shadow-sm':'text-[#829089]'}`}>↗ Takeaway</button></div>
-              {orderType==='dine_in'&&<><label className="flex h-[31px] items-center gap-2 rounded-lg border border-[#e8ede9] px-2 text-[9px] text-[#89948e]">Table<select disabled={!!editingOrder} value={table} onChange={event=>setTable(event.target.value)} className="appearance-none bg-transparent pr-1 text-[10px] font-semibold text-[#38483f]"><option>Table 04</option><option>Table 01</option><option>Table 02</option><option>Table 03</option><option>Table 05</option><option>Patio 01</option><option>Bar 01</option><option>Bar 02</option></select><ChevronDown size={12}/></label><button disabled={!!editingOrder} onClick={()=>setFloorOpen(true)} className="flex h-[31px] items-center gap-1 rounded-lg border border-[#e8ede9] px-2 text-[9px] font-semibold text-[#4b6657] disabled:opacity-40"><MapPin size={12}/>Floor plan</button></>}
+              <div className="flex rounded-lg bg-[#f2f5f2] p-[3px]"><button disabled={!!editingOrder||configuredTables.length===0} onClick={()=>setOrderType('dine_in')} className={`rounded-md px-2.5 py-1.5 text-[9px] disabled:opacity-40 ${orderType==='dine_in'?'bg-white font-bold text-[#28694f] shadow-sm':'text-[#829089]'}`}>▤ Dine in</button><button disabled={!!editingOrder} onClick={()=>setOrderType('takeaway')} className={`rounded-md px-2.5 py-1.5 text-[9px] disabled:opacity-40 ${orderType==='takeaway'?'bg-white font-bold text-[#28694f] shadow-sm':'text-[#829089]'}`}>↗ Takeaway</button></div>
+              {orderType==='dine_in'&&<><label className="flex h-[31px] items-center gap-2 rounded-lg border border-[#e8ede9] px-2 text-[9px] text-[#89948e]">Table<select aria-label="Dining table" disabled={!!editingOrder||configuredTables.length===0} value={table} onChange={event=>setTable(event.target.value)} className="appearance-none bg-transparent pr-1 text-[10px] font-semibold text-[#38483f]">{floorPlan.areas.map(area=><optgroup key={area.id} label={area.name}>{area.tables.map(candidate=><option key={candidate.id} value={candidate.name} disabled={candidate.occupied||orders.some(order=>order.tableLabel===candidate.name&&['sent','preparing','ready'].includes(order.status))}>{candidate.name}{candidate.occupied||orders.some(order=>order.tableLabel===candidate.name&&['sent','preparing','ready'].includes(order.status))?' · In service':''}</option>)}</optgroup>)}</select><ChevronDown size={12}/></label><button disabled={!!editingOrder||configuredTables.length===0} onClick={()=>setFloorOpen(true)} className="flex h-[31px] items-center gap-1 rounded-lg border border-[#e8ede9] px-2 text-[9px] font-semibold text-[#4b6657] disabled:opacity-40"><MapPin size={12}/>Floor plan</button>{configuredTables.length===0&&<span className="w-full text-[8px] text-[#a8783e]">No active tables are configured; choose takeaway or ask a manager to add tables.</span>}</>}
               {orderType==='dine_in'&&<span className="ml-auto flex items-center gap-1.5 rounded-md bg-[#f7f9f7] px-2 py-2 text-[9px] text-[#78847e]">♙ 2 guests <ChevronDown size={12}/></span>}
             </div>
             <div className="flex items-center gap-2 border-b border-[#edf0ed] px-3 py-2"><span className="shrink-0 text-[8px] font-semibold text-[#829089]">Order</span><select aria-label="Add items to an open order" value={editingOrderId} onChange={event=>{const selected=activeOrders.find(order=>order.id===event.target.value);setEditingOrderId(event.target.value);setEditCommandId(selected?makeId():'');setCart([]);setNote(selected?.note??'');if(selected){setOrderType(selected.orderType);if(selected.tableLabel)setTable(selected.tableLabel);}}} className="h-8 min-w-0 flex-1 rounded-md border border-[#e8ede9] bg-white px-2 text-[9px] text-[#415148]"><option value="">New order</option>{activeOrders.map(order=><option key={order.id} value={order.id}>{order.orderNumber} · {order.orderType==='dine_in'?order.tableLabel:'Takeaway'} · {order.status}</option>)}</select>{editingOrder&&<button onClick={()=>{setEditingOrderId('');setEditCommandId('');setCart([]);setNote('');}} className="text-[8px] font-semibold text-[#6e8b79]">Clear</button>}</div>
@@ -391,7 +487,7 @@ function App(){
             {editingOrder?.note&&<p className="mb-2 rounded bg-[#fff8ed] p-2 text-[8px] text-[#a17a48]">Kitchen note: {editingOrder.note}</p>}
             <label className="mb-2 flex h-8 items-center gap-1.5 rounded-md border border-dashed border-[#dce5de] px-2 text-[#7d9385]"><Plus size={13}/><input disabled={!!editingOrder} value={editingOrder?editingOrder.note??'':note} onChange={event=>setNote(event.target.value)} maxLength={140} placeholder={editingOrder?'Kitchen note is saved with the order':'Add a note for the kitchen'} className="w-full bg-transparent text-[9px] text-[#324239] outline-none placeholder:text-[#9ca8a1] disabled:cursor-not-allowed"/></label>
             <div className="border-t border-[#edf0ed] pt-2.5"><div className="mb-2 flex justify-between text-[9px] text-[#87938c]"><span>Subtotal</span><span>{money(subtotal)}</span></div><div className="mb-2 flex justify-between text-[9px] text-[#87938c]"><span>Tax <span className="text-[8px] text-[#a4aea8]">(demo {taxRateBps/100}%)</span></span><span>{money(tax)}</span></div><div className="flex items-center justify-between border-t border-dashed border-[#e6ebe7] pt-2.5"><strong className="text-[11px]">Total</strong><strong className="text-[17px] tracking-[-.4px]">{money(total)}</strong></div><p className="mt-1.5 text-[8px] text-[#a2aaa5]">Sample tax only. Set local rules before live use.</p></div>
-            <div className="mt-3 grid grid-cols-2 gap-2"><button disabled={!cart.length||busy} onClick={()=>void sendToKitchen()} className="flex h-10 items-center justify-center gap-1.5 rounded-lg border border-[#dfe8e1] bg-white text-[9px] font-bold text-[#43624f] disabled:cursor-not-allowed disabled:opacity-40"><Send size={13}/>{busy?<LoaderCircle size={12} className="animate-spin"/>:editingOrder?'Send additions':'Send to kitchen'}</button><button disabled={(!cart.length&&(!editingOrder||editingOrder.totalMinor<=0))||busy} onClick={()=>{setCheckoutCommandId(makeId());setCheckoutOpen(true);}} className="flex h-10 items-center gap-1.5 rounded-lg bg-[#27694f] px-2 text-[9px] font-bold text-white hover:bg-[#1d503c] disabled:cursor-not-allowed disabled:opacity-40"><span>Charge</span><strong className="ml-auto text-[10px]">{money(total)}</strong><span>→</span></button></div>
+            <div className="mt-3 grid grid-cols-2 gap-2"><button disabled={!cart.length||busy||(!editingOrder&&orderType==='dine_in'&&!selectedTable)} onClick={()=>void sendToKitchen()} className="flex h-10 items-center justify-center gap-1.5 rounded-lg border border-[#dfe8e1] bg-white text-[9px] font-bold text-[#43624f] disabled:cursor-not-allowed disabled:opacity-40"><Send size={13}/>{busy?<LoaderCircle size={12} className="animate-spin"/>:editingOrder?'Send additions':'Send to kitchen'}</button><button disabled={(!cart.length&&(!editingOrder||editingOrder.totalMinor<=0))||busy||(!editingOrder&&orderType==='dine_in'&&!selectedTable)} onClick={()=>{setCheckoutCommandId(makeId());setCheckoutOpen(true);}} className="flex h-10 items-center gap-1.5 rounded-lg bg-[#27694f] px-2 text-[9px] font-bold text-white hover:bg-[#1d503c] disabled:cursor-not-allowed disabled:opacity-40"><span>Charge</span><strong className="ml-auto text-[10px]">{money(total)}</strong><span>→</span></button></div>
             <div className="mt-2.5 text-center text-[8px] text-[#a0aaa4]">{isOutletEdge?'⌁ Orders save to this outlet edge before syncing to cloud':'⌁ Preview menu only · connect an outlet edge to save orders'}</div>
           </aside>
         </div>
@@ -405,7 +501,7 @@ function App(){
     </main>
 
     {connectionHelpOpen&&<div className="fixed inset-0 z-30 grid place-items-center bg-[#14221c]/55 p-4 backdrop-blur-[2px]"><section role="dialog" aria-modal="true" aria-labelledby="edge-help-title" className="w-full max-w-[460px] rounded-2xl border border-[#e3e9e4] bg-white p-5 shadow-2xl"><div className="flex items-center justify-between"><span className="text-[8px] font-bold tracking-[1.2px] text-[#84918a]">OUTLET CONNECTION</span><button onClick={()=>setConnectionHelpOpen(false)} aria-label="Close" className="grid size-8 place-items-center rounded-lg bg-[#f4f6f4] text-[#68776f]"><X size={16}/></button></div><h2 id="edge-help-title" className="mt-2 text-lg font-bold">Use the POS on your outlet network</h2><p className="mt-2 text-sm leading-6 text-[#718077]">{connected?`This browser is connected to ${outletContext?.outletName??'the local edge'}. Orders and kitchen updates are handled by that outlet server.`:'This page is hosted on Vercel. It cannot reach the restaurant SQLite database or printer by itself.'}</p><div className="mt-4 rounded-xl bg-[#f2f7f3] p-3 text-xs leading-5 text-[#52675a]"><p>For cashier and kitchen tablets, open the local edge address on the same outlet Wi-Fi, for example:</p><code className="mt-2 block break-all rounded-lg bg-white px-3 py-2 text-[#28694f]">http://&lt;edge-device&gt;:3001</code><p className="mt-2">The edge server must be running. Its readiness check is available at <code>/api/ready</code>. The Vercel site is for the cloud manager and setup portal.</p></div><button onClick={()=>setConnectionHelpOpen(false)} className="mt-4 flex h-10 w-full items-center justify-center rounded-lg bg-[#27694f] text-sm font-semibold text-white">Got it</button></section></div>}
-    {floorOpen&&<div className="fixed inset-0 z-20 grid place-items-center bg-[#14221c]/55 p-4 backdrop-blur-[2px]"><div className="w-full max-w-[510px] rounded-2xl border border-[#e3e9e4] bg-white p-5 shadow-2xl"><div className="flex items-center justify-between"><div><span className="text-[8px] font-bold tracking-[1.2px] text-[#84918a]">DINING ROOM</span><h2 className="mt-1 text-lg font-bold">Choose a table</h2></div><button onClick={()=>setFloorOpen(false)} className="grid size-7 place-items-center rounded-lg bg-[#f4f6f4] text-[#68776f]"><X size={16}/></button></div><div className="mb-3 mt-2 flex gap-3 text-[8px] text-[#84918a]"><span><i className="mr-1 inline-block size-2 rounded-full bg-[#74a984]"/>Available</span><span><i className="mr-1 inline-block size-2 rounded-full bg-[#e6b66f]"/>In service</span></div><div className="grid grid-cols-3 gap-2 sm:grid-cols-4">{['Table 01','Table 02','Table 03','Table 04','Table 05','Patio 01','Bar 01','Bar 02'].map((name,index)=>{const occupied=orders.some(order=>order.tableLabel===name&&['sent','preparing','ready'].includes(order.status));return <button key={name} disabled={occupied} onClick={()=>{setTable(name);setFloorOpen(false);}} className={`flex h-[83px] flex-col items-center justify-center rounded-xl border text-center ${name===table?'border-[#4b8a65] bg-[#edf6ef] text-[#28694f]':occupied?'cursor-not-allowed border-[#efe4d4] bg-[#fff9f0] text-[#aa875a]':'border-[#e7ece8] bg-[#fbfcfb] text-[#64736b] hover:border-[#a9c9b1]'}`}><LayoutGrid size={19}/><strong className="mt-2 text-[9px]">{name}</strong><small className="mt-0.5 text-[7px]">{occupied?'In service':`${index<5?2:4} seats`}</small></button>;})}</div><p className="mt-3 text-[8px] text-[#98a29d]">Occupied tables are locked in this prototype; order transfer and merge come later.</p></div></div>}
+    {floorOpen&&<div className="fixed inset-0 z-20 grid place-items-center bg-[#14221c]/55 p-4 backdrop-blur-[2px]"><div role="dialog" aria-modal="true" aria-labelledby="floor-title" className="w-full max-w-[510px] rounded-2xl border border-[#e3e9e4] bg-white p-5 shadow-2xl"><div className="flex items-center justify-between"><div><span className="text-[8px] font-bold tracking-[1.2px] text-[#84918a]">DINING ROOM</span><h2 id="floor-title" className="mt-1 text-lg font-bold">Choose a table</h2></div><button onClick={()=>setFloorOpen(false)} aria-label="Close floor plan" className="grid size-7 place-items-center rounded-lg bg-[#f4f6f4] text-[#68776f]"><X size={16}/></button></div><div className="mb-3 mt-2 flex gap-3 text-[8px] text-[#84918a]"><span><i className="mr-1 inline-block size-2 rounded-full bg-[#74a984]"/>Available</span><span><i className="mr-1 inline-block size-2 rounded-full bg-[#e6b66f]"/>In service</span></div><div className="mb-3 flex gap-1.5 overflow-x-auto">{floorPlan.areas.map(area=><button key={area.id} onClick={()=>setFloorAreaId(area.id)} className={`whitespace-nowrap rounded-full border px-3 py-1.5 text-[9px] ${floorAreaId===area.id?'border-[#294f3f] bg-[#294f3f] text-white':'border-[#e8ede9] text-[#718077]'}`}>{area.name}</button>)}</div>{floorPlan.areas.find(area=>area.id===floorAreaId)?.tables.length?<div className="grid grid-cols-3 gap-2 sm:grid-cols-4">{floorPlan.areas.find(area=>area.id===floorAreaId)?.tables.map(candidate=>{const occupied=Boolean(candidate.occupied)||orders.some(order=>order.tableLabel===candidate.name&&['sent','preparing','ready'].includes(order.status));return <button key={candidate.id} disabled={occupied} onClick={()=>{setTable(candidate.name);setFloorOpen(false);}} className={`flex h-[83px] flex-col items-center justify-center rounded-xl border text-center ${candidate.name===table?'border-[#4b8a65] bg-[#edf6ef] text-[#28694f]':occupied?'cursor-not-allowed border-[#efe4d4] bg-[#fff9f0] text-[#aa875a]':'border-[#e7ece8] bg-[#fbfcfb] text-[#64736b] hover:border-[#a9c9b1]'}`}><LayoutGrid size={19}/><strong className="mt-2 text-[9px]">{candidate.name}</strong><small className="mt-0.5 text-[7px]">{occupied?'In service':`${candidate.capacity} seats`}</small></button>;})}</div>:<p className="rounded-xl bg-[#f6f8f6] p-5 text-center text-sm text-[#78857e]">No tables in this area. Ask a manager to add tables in outlet setup.</p>}<p className="mt-3 text-[8px] text-[#98a29d]">Occupied tables are locked while their order is active.</p></div></div>}
     {modifierItem&&<div className="fixed inset-0 z-20 grid place-items-center bg-[#14221c]/55 p-4 backdrop-blur-[2px]"><div className="w-full max-w-[430px] rounded-2xl border border-[#e3e9e4] bg-white p-5 shadow-2xl"><div className="flex items-center justify-between"><span className="text-[8px] font-bold tracking-[1.2px] text-[#84918a]">CUSTOMIZE ITEM</span><button onClick={()=>setModifierItem(null)} className="grid size-7 place-items-center rounded-lg bg-[#f4f6f4] text-[#68776f]"><X size={16}/></button></div><h2 className="mt-2 text-lg font-bold">{modifierItem.name}</h2><p className="mt-1 text-[9px] text-[#89958e]">Choose the options for this item.</p><div className="mt-4 space-y-4">{[...new Set(modifierItem.modifiers.map(option=>option.group))].map(group=><fieldset key={group}><legend className="mb-2 text-[9px] font-bold text-[#526259]">{group}<span className="ml-1 font-normal text-[#9da7a1]">{group==='Add-on'?'· optional':'· choose one'}</span></legend><div className="space-y-1">{modifierItem.modifiers.filter(option=>option.group===group).map(option=>{const selected=modifierSelection.includes(option.id);return <button type="button" key={option.id} onClick={()=>toggleModifier(option)} className={`flex w-full items-center rounded-lg border px-3 py-2 text-left text-[9px] ${selected?'border-[#a7c8b0] bg-[#f1f7f2] text-[#35684a]':'border-[#edf0ed] text-[#56665d]'}`}><span className={`mr-2 grid size-3.5 place-items-center rounded-full border ${selected?'border-[#3f865b] bg-[#3f865b] text-white':'border-[#cbd5ce]'}`}>{selected&&<Check size={9}/>}</span>{option.name}<span className="ml-auto">{option.priceDeltaMinor?`+${money(option.priceDeltaMinor)}`:'Included'}</span></button>;})}</div></fieldset>)}</div><div className="mt-4 flex items-center justify-between border-t border-[#edf0ed] pt-3"><span className="text-[9px] text-[#87938c]">Item total</span><strong className="text-[14px]">{money(modifierItem.priceMinor+modifierItem.modifiers.filter(option=>modifierSelection.includes(option.id)).reduce((sum,option)=>sum+option.priceDeltaMinor,0))}</strong></div><button onClick={()=>{addConfiguredItem(modifierItem,modifierSelection);setModifierItem(null);}} className="mt-3 flex h-10 w-full items-center rounded-lg bg-[#27694f] px-3 text-[9px] font-bold text-white">Add to order <span className="ml-auto">→</span></button></div></div>}
     {shiftOpen&&<div className="fixed inset-0 z-30 grid place-items-center bg-[#14221c]/55 p-4 backdrop-blur-[2px]"><section role="dialog" aria-modal="true" aria-labelledby="shift-title" className="max-h-[90vh] w-full max-w-[500px] overflow-y-auto rounded-2xl border border-[#e3e9e4] bg-white p-5 shadow-2xl"><div className="flex items-center justify-between"><span className="text-[8px] font-bold tracking-[1.2px] text-[#84918a]">CASH CONTROL</span><button onClick={()=>setShiftOpen(false)} aria-label="Close" className="grid size-8 place-items-center rounded-lg bg-[#f4f6f4] text-[#68776f]"><X size={16}/></button></div><h2 id="shift-title" className="mt-2 text-lg font-bold">{shiftSummary?.shift.status==='open'?`Shift ${shiftSummary.shift.shiftNumber}`:'Open a shift'}</h2>{!connected&&<p className="mt-2 rounded-lg bg-[#fcf6eb] p-2 text-xs text-[#936e3e]">Shift controls need an active connection to the outlet edge server. Open this POS on the outlet Wi-Fi.</p>}{shiftSummary?.shift.status!=='open'?<><p className="mt-1 text-xs text-[#718077]">Count the starting cash float before taking demo tenders.</p><label className="mt-4 block text-xs font-medium text-[#526259]">Opening float ({outletContext?.currency??'INR'})<input aria-label="Opening float" type="number" min="0" step="0.01" value={openingFloat} onChange={event=>setOpeningFloat(event.target.value)} className="mt-1 h-10 w-full rounded-lg border border-[#e5ebe6] px-3 text-sm"/></label><button onClick={()=>void openShift()} disabled={shiftBusy||!connected} className="mt-4 h-10 w-full rounded-lg bg-[#27694f] text-sm font-semibold text-white disabled:opacity-60">{shiftBusy?'Opening…':'Open shift'}</button></>:<><div className="mt-3 grid grid-cols-2 gap-2 text-xs">{[['Opening float',shiftSummary.shift.openingFloatMinor],['Cash sales',shiftSummary.salesByMethod.cash],['UPI sales',shiftSummary.salesByMethod.upi],['Card sales',shiftSummary.salesByMethod.card],['Cash in',shiftSummary.cashInMinor],['Cash out',shiftSummary.cashOutMinor],['Expected drawer',shiftSummary.expectedCashMinor]].map(([label,amount])=><div key={label} className="rounded-lg bg-[#f4f7f4] p-2.5 text-[#758179]"><span>{label}</span><strong className="mt-1 block text-sm text-[#294437]">{money(Number(amount))}</strong></div>)}</div><div className="mt-4 rounded-xl border border-[#e8ede9] p-3"><h3 className="text-xs font-bold text-[#405149]">Cash movement</h3><div className="mt-2 grid grid-cols-2 gap-2"><select aria-label="Movement type" value={movementType} onChange={event=>setMovementType(event.target.value as 'cash_in'|'cash_out')} className="h-9 rounded-lg border border-[#e5ebe6] px-2 text-xs"><option value="cash_in">Cash in</option><option value="cash_out">Cash out</option></select><input aria-label="Movement amount" type="number" min="0.01" step="0.01" placeholder={`Amount ${outletContext?.currency??'INR'}`} value={movementAmount} onChange={event=>setMovementAmount(event.target.value)} className="h-9 rounded-lg border border-[#e5ebe6] px-2 text-xs"/></div><input aria-label="Movement reason" value={movementReason} onChange={event=>setMovementReason(event.target.value)} placeholder="Reason (e.g. petty cash)" className="mt-2 h-9 w-full rounded-lg border border-[#e5ebe6] px-2 text-xs"/><button onClick={()=>void recordCashMovement()} disabled={shiftBusy||!connected} className="mt-2 h-9 w-full rounded-lg border border-[#dfe8e1] text-xs font-semibold text-[#43624f] disabled:opacity-60">Record movement</button></div>{shiftSummary.shift.status==='open'&&<div className="mt-4 border-t border-[#edf0ed] pt-3"><label className="block text-xs font-medium text-[#526259]">Counted drawer cash ({outletContext?.currency??'INR'})<input aria-label="Counted drawer cash" type="number" min="0" step="0.01" value={countedCash} onChange={event=>setCountedCash(event.target.value)} className="mt-1 h-10 w-full rounded-lg border border-[#e5ebe6] px-3 text-sm"/></label><p className="mt-2 text-xs text-[#718077]">Expected {money(shiftSummary.expectedCashMinor)} · Variance {money(Math.round(Number(countedCash||0)*100)-shiftSummary.expectedCashMinor)}</p><button onClick={()=>void closeShift()} disabled={shiftBusy||!connected} className="mt-3 h-10 w-full rounded-lg bg-[#27694f] text-sm font-semibold text-white disabled:opacity-60">{shiftBusy?'Closing…':'Close shift'}</button></div>}</>}</section></div>}
     {checkoutOpen&&<div className="fixed inset-0 z-20 grid place-items-center bg-[#14221c]/55 p-4 backdrop-blur-[2px]"><div className="w-full max-w-[400px] rounded-2xl border border-[#e3e9e4] bg-white p-5 shadow-2xl"><div className="flex items-center justify-between"><span className="text-[8px] font-bold tracking-[1.2px] text-[#84918a]">COMPLETE ORDER</span><button onClick={()=>setCheckoutOpen(false)} className="grid size-7 place-items-center rounded-lg bg-[#f4f6f4] text-[#68776f]"><X size={16}/></button></div><h2 className="mt-3 text-xl font-bold tracking-[-.5px]">Take payment</h2><p className="mt-1 text-[10px] text-[#8b9790]">{editingOrder?(editingOrder.orderType==='dine_in'?editingOrder.tableLabel:'Takeaway'):(orderType==='dine_in'?table:'Takeaway')} · {displayItemCount} items</p><div className="mt-4 flex items-center justify-between rounded-xl bg-[#f4f7f4] p-3 text-[10px] text-[#748078]"><span>Amount due</span><strong className="text-xl text-[#294437]">{money(total)}</strong></div><p className="mb-2 mt-4 text-[9px] text-[#748078]">Choose a payment method</p><div className="grid grid-cols-3 gap-2">{([{id:'cash',name:'Cash',Icon:Banknote},{id:'upi',name:'UPI',Icon:QrCode},{id:'card',name:'Card',Icon:CreditCard}] as const).map(method=><button key={method.id} onClick={()=>setPaymentMethod(method.id)} className={`flex h-14 flex-col items-center justify-center gap-1 rounded-lg border text-[9px] ${paymentMethod===method.id?'border-[#93bba0] bg-[#edf6ef] text-[#34704c]':'border-[#e5ebe6] text-[#78857e]'}`}><method.Icon size={15}/><strong>{method.name}</strong></button>)}</div><button type="button" onClick={()=>{const next=!splitPayment;setSplitPayment(next);setSplitAmount(next?(total/200).toFixed(2):'');}} className="mt-3 w-full rounded-lg border border-[#dfe8e1] py-2 text-[9px] font-semibold text-[#43624f]">{splitPayment?'Remove split tender':'Split between two methods'}</button>{splitPayment&&<div className="mt-3 rounded-xl border border-[#e5ebe6] bg-[#fafcf9] p-3"><label className="block text-[9px] font-semibold text-[#65736b]">Second tender<select aria-label="Second tender method" value={splitMethod} onChange={event=>setSplitMethod(event.target.value as PaymentMethod)} className="mt-1 h-9 w-full rounded-lg border border-[#e5ebe6] bg-white px-2 text-xs">{(['cash','upi','card'] as PaymentMethod[]).filter(method=>method!==paymentMethod).map(method=><option key={method} value={method}>{method.toUpperCase()}</option>)}</select></label><label className="mt-2 block text-[9px] font-semibold text-[#65736b]">Second tender amount ({outletContext?.currency??'INR'})<input aria-label="Second tender amount" type="number" min="0.01" step="0.01" max={(total-1)/100} value={splitAmount} onChange={event=>setSplitAmount(event.target.value)} className="mt-1 h-9 w-full rounded-lg border border-[#e5ebe6] bg-white px-2 text-xs"/></label><p className="mt-2 text-[9px] text-[#7f8a83]">{paymentMethod.toUpperCase()} remainder: {money(Math.max(0,total-Math.round(Number(splitAmount||0)*100)))}</p></div>}<div className="my-3 rounded-md bg-[#fcf6eb] p-2 text-[8px] leading-relaxed text-[#9b805d]">Prototype only. Records a demo tender on the edge server; no real payment is processed.</div><button onClick={()=>void recordPayment()} disabled={busy} className="flex h-10 w-full items-center gap-2 rounded-lg bg-[#27694f] px-3 text-[9px] font-bold text-white hover:bg-[#1d503c] disabled:opacity-60">{busy?<LoaderCircle size={14} className="animate-spin"/>:'Record demo payment'}<span className="ml-auto">→</span></button></div></div>}

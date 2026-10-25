@@ -1,4 +1,4 @@
-import { acknowledgeSyncEvents, applyManagedMenuSnapshot, failSyncEvents, managedMenuSyncState, markManagedMenuChecked, pendingSyncEvents, recordManagedMenuSyncError, syncOutboxStatus, type ManagedMenuSnapshotItem } from './database.js';
+import { acknowledgeSyncEvents, applyManagedMenuSnapshot, failSyncEvents, managedMenuSyncState, markManagedMenuChecked, pendingSyncEvents, recordManagedMenuSyncError, syncOutboxStatus, type ManagedMenuSnapshotItem, type ManagedOutletLayout } from './database.js';
 import { EDGE_CONFIG, parseOutletRuntimeSettings, SYNC_CONFIG } from './config.js';
 
 let sending = false;
@@ -28,6 +28,43 @@ function validMenuItem(value:unknown):value is ManagedMenuSnapshotItem{
     });
 }
 
+function validOutletLayout(value:unknown):value is ManagedOutletLayout{
+  if(!value||typeof value!=='object'||Array.isArray(value))return false;
+  const layout=value as Record<string,unknown>;
+  if(!Array.isArray(layout.areas)||layout.areas.length>100||!Array.isArray(layout.stations)||layout.stations.length>100)return false;
+  const areaIds=new Set<string>();const areaNames=new Set<string>();const tableIds=new Set<string>();const tableNames=new Set<string>();
+  let tableCount=0;
+  const validLabel=(label:string,max:number)=>label.trim().length>0&&label.length<=max&&!/[\u0000-\u001f\u007f]/.test(label);
+  for(const candidate of layout.areas){
+    if(!candidate||typeof candidate!=='object'||Array.isArray(candidate))return false;
+    const area=candidate as Record<string,unknown>;
+    if(typeof area.id!=='string'||!area.id.trim()||area.id.length>120||areaIds.has(area.id)
+      ||typeof area.name!=='string'||!validLabel(area.name,80)||areaNames.has(area.name)
+      ||!Number.isSafeInteger(area.sortOrder)||Number(area.sortOrder)<0||!Array.isArray(area.tables))return false;
+    areaIds.add(area.id);areaNames.add(area.name);tableCount+=area.tables.length;
+    if(tableCount>500)return false;
+    for(const row of area.tables){
+      if(!row||typeof row!=='object'||Array.isArray(row))return false;
+      const table=row as Record<string,unknown>;
+      if(typeof table.id!=='string'||!table.id.trim()||table.id.length>120||tableIds.has(table.id)
+        ||typeof table.name!=='string'||!validLabel(table.name,40)||tableNames.has(table.name)
+        ||!Number.isSafeInteger(table.capacity)||Number(table.capacity)<1||Number(table.capacity)>50
+        ||!Number.isSafeInteger(table.sortOrder)||Number(table.sortOrder)<0)return false;
+      tableIds.add(table.id);tableNames.add(table.name);
+    }
+  }
+  const stationIds=new Set<string>();const stationNames=new Set<string>();
+  for(const row of layout.stations){
+    if(!row||typeof row!=='object'||Array.isArray(row))return false;
+    const station=row as Record<string,unknown>;
+    if(typeof station.id!=='string'||!station.id.trim()||station.id.length>120||stationIds.has(station.id)
+      ||typeof station.name!=='string'||!validLabel(station.name,80)||stationNames.has(station.name)
+      ||!Number.isSafeInteger(station.sortOrder)||Number(station.sortOrder)<0)return false;
+    stationIds.add(station.id);stationNames.add(station.name);
+  }
+  return true;
+}
+
 export function getSyncStatus(){
   const stats=syncOutboxStatus();
   return {configured:Boolean(SYNC_CONFIG.url&&SYNC_CONFIG.terminalKey),pending:stats.pending,failed:stats.failed,
@@ -47,16 +84,16 @@ export async function syncMenuOnce():Promise<void>{
       menuError=null;
       return;
     }
-    const result=await response.json().catch(()=>({})) as {tenantId?:unknown;outletId?:unknown;version?:unknown;outletConfig?:unknown;items?:unknown;error?:unknown};
+    const result=await response.json().catch(()=>({})) as {tenantId?:unknown;outletId?:unknown;version?:unknown;outletConfig?:unknown;items?:unknown;layout?:unknown;error?:unknown};
     if(!response.ok)throw new Error(typeof result.error==='string'?result.error:`Menu sync returned HTTP ${response.status}.`);
     if(result.tenantId!==EDGE_CONFIG.tenantId||result.outletId!==EDGE_CONFIG.outletId)
       throw new Error('The cloud menu belongs to a different outlet.');
     const outletConfig=parseOutletRuntimeSettings(result.outletConfig);
-    if(typeof result.version!=='string'||!/^[0-9a-f]{64}$/.test(result.version)||!Array.isArray(result.items)
+    if(typeof result.version!=='string'||!/^[0-9a-f]{64}$/.test(result.version)||!Array.isArray(result.items)||!validOutletLayout(result.layout)
       ||result.items.length>5000||!result.items.every(validMenuItem))throw new Error('The cloud returned an invalid menu snapshot.');
     const ids=new Set((result.items as ManagedMenuSnapshotItem[]).map(item=>item.id));
     if(ids.size!==(result.items as ManagedMenuSnapshotItem[]).length)throw new Error('The cloud menu contains duplicate item IDs.');
-    applyManagedMenuSnapshot(result.version,result.items as ManagedMenuSnapshotItem[],outletConfig);
+    applyManagedMenuSnapshot(result.version,result.items as ManagedMenuSnapshotItem[],outletConfig,result.layout);
     menuError=null;
     console.log(JSON.stringify({level:'info',event:'menu.sync_succeeded',count:result.items.length,version:result.version}));
   }catch(error){

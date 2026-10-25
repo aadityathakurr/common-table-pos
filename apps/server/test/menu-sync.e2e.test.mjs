@@ -24,8 +24,15 @@ const items = [
 ];
 let outletConfig = { name: 'Managed Test Outlet', timezone: 'UTC', currency: 'USD', taxRateBps: 1000,
   receiptName: 'Test Cafe', receiptAddress: '10 Test Street', receiptPhone: '+91 98765 43210', gstin: '22AAAAA0000A1Z5', receiptFooter: 'Thanks for visiting' };
+let layout = { areas: [{ id: 'area-main', name: 'Main floor', sortOrder: 0, tables: [
+  { id: 'table-1', name: 'Table 01', capacity: 2, sortOrder: 0 },
+  { id: 'table-2', name: 'Table 02', capacity: 4, sortOrder: 1 },
+] }], stations: [{ id: 'station-hot', name: 'Hot kitchen', sortOrder: 0 }, { id: 'station-sweets', name: 'Sweets', sortOrder: 1 }] };
+function localFloorPlan(occupiedTables = []) {
+  return { ...layout, areas: layout.areas.map(area => ({ ...area, tables: area.tables.map(table => ({ ...table, occupied: occupiedTables.includes(table.name) })) })) };
+}
 function snapshotVersion() {
-  return createHash('sha256').update(JSON.stringify({ outletConfig, items })).digest('hex');
+  return createHash('sha256').update(JSON.stringify({ outletConfig, items, layout })).digest('hex');
 }
 let version = snapshotVersion();
 let upstreamAvailable = true;
@@ -72,7 +79,7 @@ const upstream = createServer(async (request, response) => {
       return;
     }
     response.writeHead(200, { 'content-type': 'application/json', etag, 'cache-control': 'no-store' })
-      .end(JSON.stringify({ tenantId, outletId, version: currentVersion, outletConfig, items }));
+      .end(JSON.stringify({ tenantId, outletId, version: currentVersion, outletConfig, items, layout }));
     return;
   }
   if (request.method === 'POST') {
@@ -211,6 +218,8 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
     receipt: { name: outletConfig.receiptName, address: outletConfig.receiptAddress, phone: outletConfig.receiptPhone,
       gstin: outletConfig.gstin, footer: outletConfig.receiptFooter },
   }, 'the paired edge applies cloud outlet settings');
+  assert.deepEqual((await jsonRequest(baseUrl, '/api/floor-plan')).body, localFloorPlan(),
+    'the paired edge applies the active cloud floor plan and kitchen stations');
 
   const firstMenu = await jsonRequest(baseUrl, '/api/menu');
   assert.equal(firstMenu.body.length, 2);
@@ -222,7 +231,7 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   const commandId = randomUUID();
   const created = await jsonRequest(baseUrl, '/api/orders', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ commandId, tenantId, outletId, terminalId, orderType: 'takeaway', guestCount: 1,
+    body: JSON.stringify({ commandId, tenantId, outletId, terminalId, orderType: 'dine_in', tableLabel: 'Table 01', guestCount: 1,
       lines: [{ menuItemId: 'cloud-poha', quantity: 1, modifierIds: ['cloud-modifier'] }] }),
   });
   assert.equal(created.response.status, 201);
@@ -231,6 +240,8 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.equal(created.body.totalMinor, 605, 'cloud-configured tax is applied to the accepted order');
   assert.equal(created.body.currency, 'USD');
   assert.equal(created.body.taxRateBps, 1000);
+  assert.deepEqual((await jsonRequest(baseUrl, '/api/floor-plan')).body, localFloorPlan(['Table 01']),
+    'active dine-in orders mark their configured table as occupied');
   assert.equal((await jsonRequest(baseUrl, '/api/menu')).body.length, 2);
 
   const addCommandId = randomUUID();
@@ -446,6 +457,10 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   outletConfig = { name: 'Updated Test Outlet', timezone: 'Asia/Kolkata', currency: 'INR', taxRateBps: 500,
     receiptName: 'Updated Test Cafe', receiptAddress: '22 Sample Road', receiptPhone: '+91 12345 67890',
     gstin: '22AAAAA0000A1Z5', receiptFooter: 'Visit again soon' };
+  layout = { areas: [
+    { id: 'area-main', name: 'Main floor', sortOrder: 0, tables: [{ id: 'table-1', name: 'Table 01', capacity: 2, sortOrder: 0 }] },
+    { id: 'area-patio', name: 'Patio', sortOrder: 1, tables: [{ id: 'patio-1', name: 'Patio 01', capacity: 4, sortOrder: 0 }] },
+  ], stations: [{ id: 'station-hot', name: 'Hot kitchen', sortOrder: 0 }, { id: 'station-tea', name: 'Tea station', sortOrder: 1 }] };
   version = snapshotVersion();
   await waitFor(async () => {
     const [{ body: context }, { body: syncStatus }] = await Promise.all([
@@ -455,6 +470,7 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
       && context.currency === outletConfig.currency && context.taxRateBps === outletConfig.taxRateBps
       && JSON.stringify(context.receipt) === JSON.stringify({ name: outletConfig.receiptName, address: outletConfig.receiptAddress,
         phone: outletConfig.receiptPhone, gstin: outletConfig.gstin, footer: outletConfig.receiptFooter })
+      && JSON.stringify((await jsonRequest(baseUrl, '/api/floor-plan')).body) === JSON.stringify(localFloorPlan())
       && syncStatus.menu?.version === version;
   }, 'a cloud-only outlet setting change did not reach the running edge', 40_000);
   const updatedOrder = await jsonRequest(baseUrl, '/api/orders', {
