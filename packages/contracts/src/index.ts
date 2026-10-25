@@ -83,8 +83,36 @@ export interface OrderRecord extends KitchenOrder {
 export interface PaymentCommand {
   commandId: string;
   orderId: string;
+  shiftId: string;
   method: PaymentMethod;
   amountMinor: number;
+}
+
+export interface ShiftRecord {
+  id: string;
+  shiftNumber: string;
+  status: 'open' | 'closed';
+  openedAt: string;
+  openingFloatMinor: number;
+  closedAt?: string;
+  countedCashMinor?: number;
+  expectedCashMinor?: number;
+  varianceMinor?: number;
+}
+
+export interface ShiftSummary {
+  shift: ShiftRecord;
+  salesByMethod: Record<PaymentMethod, number>;
+  cashInMinor: number;
+  cashOutMinor: number;
+  expectedCashMinor: number;
+}
+
+export interface CashMovementCommand {
+  commandId: string;
+  type: 'cash_in' | 'cash_out';
+  amountMinor: number;
+  reason: string;
 }
 
 export interface ServerMessage {

@@ -46,7 +46,7 @@ Vercel is a good home for the hosted web/control plane. The local edge process r
 
 **Done when:** cashier and KDS can run on separate devices on the outlet LAN, survive a WAN outage/restart, and reconcile to cloud without duplicate orders or tickets.
 
-**Progress:** outlet-scoped menu categories and items are stored in Supabase; the manager can publish 12 categories and 43 fictional training items and edit prices/availability. The POS can read that cloud menu for a signed-in browser and cache it for offline display. The local SQLite edge accepts orders with stable command IDs, assigns numbers, records audit events, updates KDS clients over WebSockets, and formats kitchen tickets. A two-tab cashier-to-KDS flow, item modifier, cash demo tender, invoice, receipt, SQLite integrity, and duplicate order/payment retries were exercised against an isolated temporary database. Local edge sync to cloud, order edits/void reasons, and WAN-down KDS reconnection still remain open.
+**Progress:** outlet-scoped menu categories and items are stored in Supabase; the manager can publish 12 categories and 43 fictional training items and edit prices/availability. The POS can read that cloud menu for a signed-in browser and cache it for offline display. The local SQLite edge accepts orders with stable command IDs, assigns numbers, records audit events, updates KDS clients over WebSockets, and formats kitchen tickets. A two-tab cashier-to-KDS flow, item modifier, cash demo tender, invoice, receipt, SQLite integrity, and duplicate order/payment retries were exercised against an isolated temporary database. The edge service now also supports shift open/close, opening float, cash-in/out reasons, tender totals, expected-versus-counted cash, and audit events. UI and API closeout tests balanced cash to zero variance; SQLite integrity and foreign keys passed after restarting the edge process. Local edge sync to cloud, order edits/void reasons, and WAN-down KDS reconnection still remain open.
 
 ### 3. Payments, receipts, and shift close
 
@@ -56,6 +56,8 @@ Vercel is a good home for the hosted web/control plane. The local edge process r
 - Add shift open/close, opening float, cash movement, expected-vs-counted reconciliation, and close report.
 
 **Done when:** a pilot cashier can close a shift and reconcile sales by tender; payment outcomes are verifiable and idempotent.
+
+**Progress:** local SQLite shifts now have deterministic numbers, idempotent open/close commands, an opening float, reasoned cash-in/out events, cash/UPI/card demo tender totals, expected drawer cash, counted cash, variance, and audit records. Payments require an open shift and are associated with it. The local POS dialog shows the shift totals and supports cash reconciliation. This only records manual/demo tenders; no payment provider or live card/UPI flow is connected. Production tax/invoice rules and a physical printer driver remain open.
 
 ### 4. Pilot reporting and operational hardening
 
@@ -82,7 +84,7 @@ Vercel is a good home for the hosted web/control plane. The local edge process r
 
 ## Current baseline and known gaps
 
-The repo has a touch POS, a 43-item fictional Indore vegetarian training menu, dine-in/takeaway order creation, a basic KDS state update, demo tender recording, IndexedDB outbox, local SQLite edge storage, WebSocket updates, mock ESC/POS TCP printing, and outlet-scoped cloud menu administration. The Vercel POS preview can display the cloud menu but cannot process orders without an outlet edge; cashier and KDS clients must use the edge-hosted web app on the outlet network. Local-to-cloud order synchronization, terminal pairing and staff authorization at the edge, order edits/void reasons, real payment processing, split/refund flows, shift management, production printer drivers, and operational monitoring are not implemented.
+The repo has a touch POS, a 43-item fictional Indore vegetarian training menu, dine-in/takeaway order creation, a basic KDS state update, demo tender recording, IndexedDB outbox, local SQLite edge storage, WebSocket updates, mock ESC/POS TCP printing, outlet-scoped cloud menu administration, and local shift reconciliation. The Vercel POS preview can display the cloud menu but cannot process orders without an outlet edge; cashier and KDS clients must use the edge-hosted web app on the outlet network. Local-to-cloud order synchronization, terminal pairing and staff authorization at the edge, order edits/void reasons, real payment processing, split/refund flows, production printer drivers, and operational monitoring are not implemented.
 
 ## Pilot acceptance checklist
 

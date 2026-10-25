@@ -16,6 +16,9 @@ db.pragma('synchronous = FULL');
 db.pragma('foreign_keys = ON');
 db.pragma('busy_timeout = 5000');
 db.exec(readFileSync(resolve(here, 'schema.sql'), 'utf8'));
+const paymentColumns = db.pragma('table_info(payment_events)') as Array<{ name: string }>;
+if (!paymentColumns.some(column => column.name === 'shift_id')) db.exec('ALTER TABLE payment_events ADD COLUMN shift_id TEXT REFERENCES shifts(id)');
+db.exec('CREATE INDEX IF NOT EXISTS payments_by_shift ON payment_events(tenant_id,outlet_id,shift_id,method,status)');
 
 export const DEMO_TENANT = EDGE_CONFIG.tenantId;
 export const DEMO_OUTLET = EDGE_CONFIG.outletId;
@@ -44,14 +47,14 @@ const seed = db.transaction(() => {
     id:modifier.id,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,menuItemId:item.id,group:modifier.group,
     name:modifier.name,priceDeltaMinor:modifier.priceDeltaMinor,sortOrder:index,
   }));
-  for (const [counterName,nextValue] of [['order',1],['invoice',1]] as const) {
+  for (const [counterName,nextValue] of [['order',1],['invoice',1],['shift',1]] as const) {
     db.prepare(`INSERT OR IGNORE INTO outlet_counters(tenant_id,outlet_id,counter_name,next_value) VALUES(?,?,?,?)`)
       .run(DEMO_TENANT,DEMO_OUTLET,counterName,nextValue);
   }
 });
 seed();
 
-export function allocateNumber(counterName: 'order'|'invoice', prefix: 'ORD'|'INV'): string {
+export function allocateNumber(counterName: 'order'|'invoice'|'shift', prefix: 'ORD'|'INV'|'SHIFT'): string {
   const row = db.prepare(`SELECT next_value FROM outlet_counters WHERE tenant_id=? AND outlet_id=? AND counter_name=?`)
     .get(DEMO_TENANT,DEMO_OUTLET,counterName) as {next_value:number};
   db.prepare(`UPDATE outlet_counters SET next_value=? WHERE tenant_id=? AND outlet_id=? AND counter_name=?`)

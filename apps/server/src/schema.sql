@@ -68,12 +68,35 @@ CREATE TABLE IF NOT EXISTS kitchen_tickets (
   FOREIGN KEY(tenant_id,outlet_id,order_id) REFERENCES orders(tenant_id,outlet_id,id)
 );
 CREATE INDEX IF NOT EXISTS tickets_by_station ON kitchen_tickets(tenant_id,outlet_id,station,status,created_at);
+CREATE TABLE IF NOT EXISTS shifts (
+  id TEXT PRIMARY KEY, command_id TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL,
+  terminal_id TEXT NOT NULL, actor_id TEXT NOT NULL, shift_number TEXT NOT NULL,
+  opening_float_minor INTEGER NOT NULL CHECK(opening_float_minor >= 0),
+  status TEXT NOT NULL CHECK(status IN ('open','closed')), opened_at TEXT NOT NULL, closed_at TEXT,
+  close_command_id TEXT UNIQUE, counted_cash_minor INTEGER, expected_cash_minor INTEGER, variance_minor INTEGER,
+  FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id),
+  FOREIGN KEY(tenant_id,outlet_id,terminal_id) REFERENCES terminals(tenant_id,outlet_id,id),
+  UNIQUE(tenant_id,outlet_id,id), UNIQUE(tenant_id,outlet_id,shift_number)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_shift_per_outlet ON shifts(tenant_id,outlet_id) WHERE status='open';
+CREATE TABLE IF NOT EXISTS cash_movements (
+  id TEXT PRIMARY KEY, command_id TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL,
+  shift_id TEXT NOT NULL, terminal_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+  movement_type TEXT NOT NULL CHECK(movement_type IN ('cash_in','cash_out')),
+  amount_minor INTEGER NOT NULL CHECK(amount_minor > 0), reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 3 AND 120),
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(tenant_id,outlet_id,shift_id) REFERENCES shifts(tenant_id,outlet_id,id),
+  FOREIGN KEY(tenant_id,outlet_id,terminal_id) REFERENCES terminals(tenant_id,outlet_id,id)
+);
+CREATE INDEX IF NOT EXISTS cash_movements_by_shift ON cash_movements(tenant_id,outlet_id,shift_id,created_at);
 CREATE TABLE IF NOT EXISTS payment_events (
   id TEXT PRIMARY KEY, command_id TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL,
   order_id TEXT NOT NULL, terminal_id TEXT NOT NULL, method TEXT NOT NULL CHECK(method IN ('cash','upi','card')),
   amount_minor INTEGER NOT NULL CHECK(amount_minor >= 0), status TEXT NOT NULL CHECK(status IN ('succeeded','failed')),
+  shift_id TEXT,
   provider_reference TEXT, created_at TEXT NOT NULL,
-  FOREIGN KEY(tenant_id,outlet_id,order_id) REFERENCES orders(tenant_id,outlet_id,id)
+  FOREIGN KEY(tenant_id,outlet_id,order_id) REFERENCES orders(tenant_id,outlet_id,id),
+  FOREIGN KEY(tenant_id,outlet_id,shift_id) REFERENCES shifts(tenant_id,outlet_id,id)
 );
 CREATE TABLE IF NOT EXISTS audit_events (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, actor_id TEXT NOT NULL,

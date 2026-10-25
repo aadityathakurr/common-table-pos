@@ -5,7 +5,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { CreateOrderCommand, KitchenOrder, OrderLine, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage } from '@common-table/contracts';
+import type { CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
 import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TAX_RATE_BPS, DEMO_TENANT, DEMO_TERMINAL } from './database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
 import { formatKitchenTicket, formatReceipt, sendToMockPrinter, startMockPrinter } from './printer.js';
@@ -54,6 +54,26 @@ function mapOrder(row:Record<string,unknown>):OrderRecord{
 function orderById(id:string):OrderRecord|undefined{
   const row=db.prepare('SELECT * FROM orders WHERE id=? AND tenant_id=? AND outlet_id=?').get(id,DEMO_TENANT,DEMO_OUTLET) as Record<string,unknown>|undefined;
   return row?mapOrder(row):undefined;
+}
+function mapShift(row:Record<string,unknown>):ShiftRecord{
+  return {id:String(row.id),shiftNumber:String(row.shift_number),status:row.status as ShiftRecord['status'],openedAt:String(row.opened_at),openingFloatMinor:Number(row.opening_float_minor),
+    ...(row.closed_at?{closedAt:String(row.closed_at)}:{}),...(row.counted_cash_minor!=null?{countedCashMinor:Number(row.counted_cash_minor)}:{}),
+    ...(row.expected_cash_minor!=null?{expectedCashMinor:Number(row.expected_cash_minor)}:{}),...(row.variance_minor!=null?{varianceMinor:Number(row.variance_minor)}:{})};
+}
+function shiftSummary(shiftId:string):ShiftSummary|undefined{
+  const row=db.prepare('SELECT * FROM shifts WHERE id=? AND tenant_id=? AND outlet_id=?').get(shiftId,DEMO_TENANT,DEMO_OUTLET) as Record<string,unknown>|undefined;
+  if(!row)return undefined;
+  const shift=mapShift(row);
+  const salesRows=db.prepare(`SELECT method,SUM(amount_minor) AS amount_minor FROM payment_events
+    WHERE tenant_id=? AND outlet_id=? AND shift_id=? AND status='succeeded' GROUP BY method`).all(DEMO_TENANT,DEMO_OUTLET,shiftId) as Array<{method:PaymentMethod;amount_minor:number|null}>;
+  const salesByMethod:Record<PaymentMethod,number>={cash:0,upi:0,card:0};
+  for(const sale of salesRows)salesByMethod[sale.method]=Number(sale.amount_minor??0);
+  const movements=db.prepare(`SELECT movement_type,SUM(amount_minor) AS amount_minor FROM cash_movements
+    WHERE tenant_id=? AND outlet_id=? AND shift_id=? GROUP BY movement_type`).all(DEMO_TENANT,DEMO_OUTLET,shiftId) as Array<{movement_type:'cash_in'|'cash_out';amount_minor:number|null}>;
+  const cashInMinor=Number(movements.find(row=>row.movement_type==='cash_in')?.amount_minor??0);
+  const cashOutMinor=Number(movements.find(row=>row.movement_type==='cash_out')?.amount_minor??0);
+  const expectedCashMinor=shift.openingFloatMinor+salesByMethod.cash+cashInMinor-cashOutMinor;
+  return {shift,salesByMethod,cashInMinor,cashOutMinor,expectedCashMinor};
 }
 function kitchenOrders():KitchenOrder[]{
   const rows=db.prepare(`SELECT * FROM orders WHERE tenant_id=? AND outlet_id=? AND status IN ('sent','preparing','ready') ORDER BY created_at`)
@@ -143,6 +163,63 @@ app.get('/api/orders',(_req,res)=>{
   const rows=db.prepare('SELECT * FROM orders WHERE tenant_id=? AND outlet_id=? ORDER BY created_at DESC LIMIT 100').all(DEMO_TENANT,DEMO_OUTLET) as Array<Record<string,unknown>>;
   return res.json(rows.map(mapOrder));
 });
+app.get('/api/shifts/current',(_req,res)=>{
+  const row=db.prepare("SELECT id FROM shifts WHERE tenant_id=? AND outlet_id=? AND status='open'").get(DEMO_TENANT,DEMO_OUTLET) as {id:string}|undefined;
+  return res.json({shift:row?shiftSummary(row.id):null});
+});
+app.post('/api/shifts/open',(req,res)=>{
+  const body=req.body as {commandId?:unknown;openingFloatMinor?:unknown};
+  if(typeof body.commandId!=='string'||body.commandId.length<8)return fail(res,400,'A stable commandId is required to open a shift.');
+  const openingFloatMinor=Number(body.openingFloatMinor);
+  if(!Number.isSafeInteger(openingFloatMinor)||openingFloatMinor<0)return fail(res,400,'Opening float must be a non-negative amount in minor currency units.');
+  const replay=db.prepare('SELECT id FROM shifts WHERE command_id=?').get(body.commandId) as {id:string}|undefined;
+  if(replay)return res.json(shiftSummary(replay.id));
+  const current=db.prepare("SELECT id FROM shifts WHERE tenant_id=? AND outlet_id=? AND status='open'").get(DEMO_TENANT,DEMO_OUTLET);
+  if(current)return fail(res,409,'A shift is already open for this outlet.');
+  const id=createId();const openedAt=new Date().toISOString();
+  try{db.transaction(()=>{
+    const shiftNumber=allocateNumber('shift','SHIFT');
+    db.prepare(`INSERT INTO shifts(id,command_id,tenant_id,outlet_id,terminal_id,actor_id,shift_number,opening_float_minor,status,opened_at)
+      VALUES(?,?,?,?,?,?,?,?,'open',?)`).run(id,body.commandId,DEMO_TENANT,DEMO_OUTLET,DEMO_TERMINAL,DEMO_ACTOR,shiftNumber,openingFloatMinor,openedAt);
+    audit('shift',id,'shift.opened',null,{shiftNumber,openingFloatMinor});
+  })();}catch(error){return fail(res,409,error instanceof Error?error.message:'Unable to open shift.');}
+  return res.status(201).json(shiftSummary(id));
+});
+app.post('/api/shifts/:shiftId/cash-movements',(req,res)=>{
+  const body=req.body as Partial<CashMovementCommand>;
+  if(typeof body.commandId!=='string'||body.commandId.length<8)return fail(res,400,'A stable commandId is required for cash movement.');
+  if(body.type!=='cash_in'&&body.type!=='cash_out')return fail(res,400,'Choose cash in or cash out.');
+  const amountMinor=Number(body.amountMinor);if(!Number.isSafeInteger(amountMinor)||amountMinor<=0)return fail(res,400,'Cash movement must be greater than zero.');
+  const reason=typeof body.reason==='string'?body.reason.trim():'';if(reason.length<3||reason.length>120)return fail(res,400,'Enter a reason between 3 and 120 characters.');
+  const replay=db.prepare('SELECT shift_id FROM cash_movements WHERE command_id=?').get(body.commandId) as {shift_id:string}|undefined;
+  if(replay)return res.json(shiftSummary(replay.shift_id));
+  const shift=db.prepare("SELECT id FROM shifts WHERE id=? AND tenant_id=? AND outlet_id=? AND status='open'").get(req.params.shiftId,DEMO_TENANT,DEMO_OUTLET);
+  if(!shift)return fail(res,409,'Open a shift before recording cash movement.');
+  db.transaction(()=>{
+    db.prepare(`INSERT INTO cash_movements(id,command_id,tenant_id,outlet_id,shift_id,terminal_id,actor_id,movement_type,amount_minor,reason,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(createId(),body.commandId,DEMO_TENANT,DEMO_OUTLET,req.params.shiftId,DEMO_TERMINAL,DEMO_ACTOR,body.type,amountMinor,reason,new Date().toISOString());
+    audit('shift',req.params.shiftId,`shift.${body.type}`,reason,{amountMinor,commandId:body.commandId});
+  })();
+  return res.status(201).json(shiftSummary(req.params.shiftId));
+});
+app.post('/api/shifts/:shiftId/close',(req,res)=>{
+  const body=req.body as {commandId?:unknown;countedCashMinor?:unknown};
+  if(typeof body.commandId!=='string'||body.commandId.length<8)return fail(res,400,'A stable commandId is required to close a shift.');
+  const countedCashMinor=Number(body.countedCashMinor);if(!Number.isSafeInteger(countedCashMinor)||countedCashMinor<0)return fail(res,400,'Counted cash must be a non-negative amount in minor currency units.');
+  const replay=db.prepare('SELECT id FROM shifts WHERE close_command_id=?').get(body.commandId) as {id:string}|undefined;
+  if(replay)return res.json(shiftSummary(replay.id));
+  const summary=shiftSummary(req.params.shiftId);if(!summary||summary.shift.status!=='open')return fail(res,409,'This shift is not open.');
+  const unsettled=db.prepare(`SELECT COUNT(*) AS count FROM orders WHERE tenant_id=? AND outlet_id=? AND created_at>=? AND status IN ('sent','preparing','ready')`)
+    .get(DEMO_TENANT,DEMO_OUTLET,summary.shift.openedAt) as {count:number};
+  if(unsettled.count>0)return fail(res,409,`Close or cancel ${unsettled.count} open order${unsettled.count===1?'':'s'} before closing the shift.`);
+  const closedAt=new Date().toISOString();const varianceMinor=countedCashMinor-summary.expectedCashMinor;
+  db.transaction(()=>{
+    db.prepare(`UPDATE shifts SET status='closed',closed_at=?,close_command_id=?,counted_cash_minor=?,expected_cash_minor=?,variance_minor=? WHERE id=? AND status='open'`)
+      .run(closedAt,body.commandId,countedCashMinor,summary.expectedCashMinor,varianceMinor,req.params.shiftId);
+    audit('shift',req.params.shiftId,'shift.closed',null,{countedCashMinor,expectedCashMinor:summary.expectedCashMinor,varianceMinor});
+  })();
+  return res.json(shiftSummary(req.params.shiftId));
+});
 app.post('/api/orders',(req:Request,res:Response)=>{
   const body=req.body as Partial<CreateOrderCommand>;
   if(typeof body.commandId!=='string'||body.commandId.length<8)return fail(res,400,'A stable commandId is required for idempotent retries.');
@@ -171,18 +248,21 @@ app.post('/api/orders/:orderId/payment',(req,res)=>{
   if(typeof body.commandId!=='string'||body.commandId.length<8)return fail(res,400,'A stable payment commandId is required.');
   const method=body.method;if(!method||!(['cash','upi','card'] as const).includes(method))return fail(res,400,'Choose cash, UPI, or card.');
   const before=orderById(req.params.orderId);if(!before)return fail(res,404,'Order not found.');
-  if(before.status==='paid')return res.json(before);
-  if(before.status==='cancelled')return fail(res,409,'Cancelled orders cannot be paid.');
-  if(Number(body.amountMinor)!==before.totalMinor)return fail(res,409,'Payment amount does not match the order total.');
   const duplicate=db.prepare('SELECT id FROM payment_events WHERE command_id=?').get(body.commandId);
   if(duplicate)return res.json(before);
+  if(before.status==='paid')return fail(res,409,'This order already has a recorded payment.');
+  if(before.status==='cancelled')return fail(res,409,'Cancelled orders cannot be paid.');
+  if(Number(body.amountMinor)!==before.totalMinor)return fail(res,409,'Payment amount does not match the order total.');
+  if(typeof body.shiftId!=='string')return fail(res,409,'Open a shift before recording payment.');
+  const shift=db.prepare("SELECT id FROM shifts WHERE id=? AND tenant_id=? AND outlet_id=? AND status='open'").get(body.shiftId,DEMO_TENANT,DEMO_OUTLET);
+  if(!shift)return fail(res,409,'This payment must be assigned to an open shift.');
   const timestamp=new Date().toISOString();
   const pay=db.transaction(()=>{
     const invoiceNumber=allocateNumber('invoice','INV');
-    db.prepare('INSERT INTO payment_events(id,command_id,tenant_id,outlet_id,order_id,terminal_id,method,amount_minor,status,created_at) VALUES(?,?,?,?,?,?,?,? ,\'succeeded\',?)')
-      .run(createId(),body.commandId,DEMO_TENANT,DEMO_OUTLET,before.id,DEMO_TERMINAL,method,before.totalMinor,timestamp);
+    db.prepare('INSERT INTO payment_events(id,command_id,tenant_id,outlet_id,order_id,terminal_id,method,amount_minor,status,shift_id,created_at) VALUES(?,?,?,?,?,?,?,? ,\'succeeded\',?,?)')
+      .run(createId(),body.commandId,DEMO_TENANT,DEMO_OUTLET,before.id,DEMO_TERMINAL,method,before.totalMinor,body.shiftId,timestamp);
     db.prepare('UPDATE orders SET status=\'paid\',payment_method=?,invoice_number=?,updated_at=? WHERE id=?').run(method,invoiceNumber,timestamp,before.id);
-    audit('order',before.id,'order.payment_recorded',null,{method,invoiceNumber,amountMinor:before.totalMinor});
+    audit('order',before.id,'order.payment_recorded',null,{method,invoiceNumber,amountMinor:before.totalMinor,shiftId:body.shiftId});
   });pay();
   const order=orderById(before.id)!;publish('order.updated',order);
   void sendToMockPrinter(formatReceipt(order)).catch(error=>console.error('Receipt printer is not reachable:',error));
