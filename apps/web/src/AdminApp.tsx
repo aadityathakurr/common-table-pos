@@ -17,7 +17,18 @@ const buttonClass = 'inline-flex min-h-11 items-center justify-center gap-2 roun
 function authRedirectUrl() {
   const configuredOrigin = import.meta.env.VITE_AUTH_REDIRECT_URL?.trim();
   const localHost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
-  const origin = configuredOrigin || (localHost ? 'https://common-table-pos.vercel.app' : window.location.origin);
+  let configuredUrl: URL | undefined;
+  try {
+    if (configuredOrigin) configuredUrl = new URL(configuredOrigin);
+  } catch {
+    // Ignore malformed build-time configuration and use the current app origin.
+  }
+  const configuredHost = configuredUrl?.hostname;
+  const configuredIsLocal = configuredHost !== undefined
+    && ['localhost', '127.0.0.1', '::1'].includes(configuredHost);
+  const origin = configuredUrl && !configuredIsLocal
+    ? configuredUrl.origin
+    : localHost ? 'https://common-table-pos.vercel.app' : window.location.origin;
   return new URL('/admin', origin).toString();
 }
 
