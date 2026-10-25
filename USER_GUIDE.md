@@ -25,6 +25,8 @@ UPI is a manual tender entry. The cashier confirms receipt of payment and record
 ## Internet outage and reconnection
 
 - Keep using the same installed cashier laptop and browser profile. Orders are stored in its local SQLite database; unsent browser commands use that browser profile's IndexedDB queue and retry with stable command IDs.
+- On the Linux cashier service installation, the database is `~/.local/share/common-table-pos/outlet.sqlite` (or `$XDG_DATA_HOME/common-table-pos/outlet.sqlite` when `XDG_DATA_HOME` is set). The database is created on the cashier laptop. Its `-wal` and `-shm` files beside it are SQLite working files; leave them in place while the service is running. For a manual `npm start`, the default is `.data/common-table.db` relative to the server's working directory. `POS_DATABASE_PATH` overrides either location.
+- Automatic backups are stored in a `backups/` folder beside the database. Set `POS_BACKUP_DIR` to use another location. Copy a verified backup off the cashier laptop to protect against device loss.
 - The local session, cached menu, floor plan, current orders, kitchen display, and reports continue to work while the WAN is unavailable, as long as the laptop and its local service are running.
 - Internet is required again for new Supabase sign-in or access changes, menu/configuration refresh, and cloud synchronization. Queued business events retry after reconnection.
 - A single laptop does not require Wi-Fi or a second edge server. If the service process restarts, it reopens the same persistent local database. A second device can share live orders only when it can reach the cashier laptop over a LAN; it is not required for the one-cashier setup.
