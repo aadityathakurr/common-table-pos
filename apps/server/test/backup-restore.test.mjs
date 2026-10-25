@@ -46,6 +46,10 @@ test('SQLite backup restores verified outlet data and keeps a pre-restore safety
   const backupResult = runCli('apps/server/dist/backup.js', { POS_DATABASE_PATH: databasePath, POS_BACKUP_PATH: backupPath });
   assert.equal(backupResult.at(-1).event, 'database.backup.completed');
   assert.equal(backupResult.at(-1).integrity, 'ok');
+  const verifiedBackup = new Database(backupPath, { readonly: true, fileMustExist: true });
+  assert.equal(verifiedBackup.prepare('SELECT value FROM restore_test_marker').get().value, 'backup-value');
+  assert.equal(verifiedBackup.pragma('quick_check')[0].quick_check, 'ok');
+  verifiedBackup.close();
 
   seedDatabase(destinationPath, 'before-restore');
   const restoreResult = runCli('apps/server/dist/restore.js', {
