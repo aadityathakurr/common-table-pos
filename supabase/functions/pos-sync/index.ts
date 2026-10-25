@@ -79,7 +79,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
 
   if (request.method === "GET") {
     const [outletResult, categoryResult, itemResult] = await Promise.all([
-      client.from("outlets").select("name,timezone,currency,tax_rate_bps")
+      client.from("outlets").select("name,timezone,currency,tax_rate_bps,receipt_name,receipt_address,receipt_phone,gstin,receipt_footer")
         .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id).maybeSingle(),
       client.from("menu_categories").select("category_id,name,sort_order,active")
         .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id)
@@ -97,11 +97,21 @@ Deno.serve(async (request: Request): Promise<Response> => {
       timezone: outletResult.data.timezone.trim(),
       currency: outletResult.data.currency.trim().toUpperCase(),
       taxRateBps: Number(outletResult.data.tax_rate_bps),
+      receiptName: (outletResult.data.receipt_name ?? "").trim(),
+      receiptAddress: (outletResult.data.receipt_address ?? "").trim(),
+      receiptPhone: (outletResult.data.receipt_phone ?? "").trim(),
+      gstin: (outletResult.data.gstin ?? "").trim().toUpperCase(),
+      receiptFooter: (outletResult.data.receipt_footer ?? "").trim(),
     };
     try {
       if (!outletConfig.name.trim() || outletConfig.name.length > 120 || !outletConfig.timezone.trim()
         || outletConfig.timezone.length > 80 || !/^[A-Z]{3}$/.test(outletConfig.currency)
-        || !Number.isSafeInteger(outletConfig.taxRateBps) || outletConfig.taxRateBps < 0 || outletConfig.taxRateBps > 10_000) {
+        || !Number.isSafeInteger(outletConfig.taxRateBps) || outletConfig.taxRateBps < 0 || outletConfig.taxRateBps > 10_000
+        || outletConfig.receiptName.length > 120 || outletConfig.receiptAddress.length > 240
+        || outletConfig.receiptPhone.length > 40 || (outletConfig.gstin && !/^[0-9A-Z]{15}$/.test(outletConfig.gstin))
+        || outletConfig.receiptFooter.length > 240
+        || [outletConfig.receiptName, outletConfig.receiptAddress, outletConfig.receiptPhone, outletConfig.gstin, outletConfig.receiptFooter]
+          .some(value => /[\u0000-\u001f\u007f]/.test(value))) {
         throw new Error("invalid settings");
       }
       new Intl.DateTimeFormat("en-US", { timeZone: outletConfig.timezone });

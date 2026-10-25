@@ -10,9 +10,20 @@ type Outlet = {
   timezone: string;
   currency: string;
   tax_rate_bps: number;
+  receipt_name: string | null;
+  receipt_address: string | null;
+  receipt_phone: string | null;
+  gstin: string | null;
+  receipt_footer: string | null;
 };
 
-type OutletUpdate = Pick<Outlet, 'name' | 'timezone' | 'currency' | 'tax_rate_bps'>;
+type OutletDraft = Pick<Outlet, 'name' | 'timezone' | 'currency' | 'tax_rate_bps'> & {
+  receipt_name: string;
+  receipt_address: string;
+  receipt_phone: string;
+  gstin: string;
+  receipt_footer: string;
+};
 
 type Props = {
   outlet: Outlet;
@@ -22,26 +33,33 @@ type Props = {
 
 const fieldClass = 'h-11 w-full rounded-xl border border-[#dfe6df] bg-white px-3 text-sm text-[#263b30] outline-none transition focus:border-[#4a8a61] focus:ring-4 focus:ring-[#4a8a61]/10 disabled:bg-[#f6f8f6] disabled:text-[#7e8c82]';
 
-function initialDraft(outlet: Outlet): OutletUpdate {
+function initialDraft(outlet: Outlet): OutletDraft {
   return {
     name: outlet.name,
     timezone: outlet.timezone,
     currency: outlet.currency.trim().toUpperCase(),
     tax_rate_bps: outlet.tax_rate_bps,
+    receipt_name: outlet.receipt_name ?? '',
+    receipt_address: outlet.receipt_address ?? '',
+    receipt_phone: outlet.receipt_phone ?? '',
+    gstin: (outlet.gstin ?? '').toUpperCase(),
+    receipt_footer: outlet.receipt_footer ?? '',
   };
 }
 
-function validate(draft: OutletUpdate): string | null {
+function validate(draft: OutletDraft): string | null {
   if (!draft.name.trim() || draft.name.trim().length > 120) return 'Enter an outlet name from 1 to 120 characters.';
   if (!/^[A-Z]{3}$/.test(draft.currency.trim().toUpperCase())) return 'Currency must be a three-letter ISO code, such as INR.';
   if (!Number.isInteger(draft.tax_rate_bps) || draft.tax_rate_bps < 0 || draft.tax_rate_bps > 10_000) return 'Tax rate must be from 0% to 100%.';
+  if (draft.receipt_name.length > 120 || draft.receipt_address.length > 240 || draft.receipt_phone.length > 40 || draft.receipt_footer.length > 240) return 'Receipt name, address, phone, or footer is too long.';
+  if (draft.gstin && !/^[0-9A-Z]{15}$/.test(draft.gstin.trim().toUpperCase())) return 'GSTIN must contain 15 letters or digits.';
   try { new Intl.DateTimeFormat('en-US', { timeZone: draft.timezone.trim() }); }
   catch { return 'Enter a valid IANA timezone, such as Asia/Kolkata.'; }
   return null;
 }
 
 export default function OutletSettings({ outlet, canEdit, onSaved }: Props) {
-  const [draft, setDraft] = useState<OutletUpdate>(() => initialDraft(outlet));
+  const [draft, setDraft] = useState<OutletDraft>(() => initialDraft(outlet));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -49,13 +67,18 @@ export default function OutletSettings({ outlet, canEdit, onSaved }: Props) {
   async function save(event: FormEvent) {
     event.preventDefault();
     if (!supabase || !canEdit) return;
-    const normalized: OutletUpdate = {
+    const normalized = {
       name: draft.name.trim(),
       timezone: draft.timezone.trim(),
       currency: draft.currency.trim().toUpperCase(),
       tax_rate_bps: draft.tax_rate_bps,
+      receipt_name: draft.receipt_name.trim() || null,
+      receipt_address: draft.receipt_address.trim() || null,
+      receipt_phone: draft.receipt_phone.trim() || null,
+      gstin: draft.gstin.trim().toUpperCase() || null,
+      receipt_footer: draft.receipt_footer.trim() || null,
     };
-    const validationError = validate(normalized);
+    const validationError = validate({ ...normalized, receipt_name: normalized.receipt_name ?? '', receipt_address: normalized.receipt_address ?? '', receipt_phone: normalized.receipt_phone ?? '', gstin: normalized.gstin ?? '', receipt_footer: normalized.receipt_footer ?? '' });
     if (validationError) { setError(validationError); setNotice(''); return; }
 
     setSaving(true);
@@ -66,7 +89,7 @@ export default function OutletSettings({ outlet, canEdit, onSaved }: Props) {
         .update(normalized)
         .eq('tenant_id', outlet.tenant_id)
         .eq('outlet_id', outlet.outlet_id)
-        .select('tenant_id,outlet_id,name,timezone,currency,tax_rate_bps')
+        .select('tenant_id,outlet_id,name,timezone,currency,tax_rate_bps,receipt_name,receipt_address,receipt_phone,gstin,receipt_footer')
         .maybeSingle();
       if (updateError) throw updateError;
       if (!data) throw new Error('No outlet was updated. Check your outlet manager access and try again.');
@@ -83,12 +106,15 @@ export default function OutletSettings({ outlet, canEdit, onSaved }: Props) {
 
   const changed = draft.name !== outlet.name || draft.timezone !== outlet.timezone
     || draft.currency.trim().toUpperCase() !== outlet.currency.trim().toUpperCase()
-    || draft.tax_rate_bps !== outlet.tax_rate_bps;
+    || draft.tax_rate_bps !== outlet.tax_rate_bps
+    || draft.receipt_name !== (outlet.receipt_name ?? '') || draft.receipt_address !== (outlet.receipt_address ?? '')
+    || draft.receipt_phone !== (outlet.receipt_phone ?? '') || draft.gstin !== (outlet.gstin ?? '')
+    || draft.receipt_footer !== (outlet.receipt_footer ?? '');
 
   return <section className="rounded-2xl border border-[#e1e8e1] bg-white p-6" aria-labelledby="outlet-settings-title">
     <div className="flex items-center gap-3">
       <span className="grid size-10 place-items-center rounded-xl bg-[#edf3f7] text-[#587c98]"><Settings2 size={18}/></span>
-      <div><h2 id="outlet-settings-title" className="font-bold">Outlet settings</h2><p className="text-xs text-[#839087]">Name, timezone, currency, and configured tax rate.</p></div>
+      <div><h2 id="outlet-settings-title" className="font-bold">Outlet settings</h2><p className="text-xs text-[#839087]">Identity, receipt details, timezone, currency, and configured tax.</p></div>
     </div>
     <form className="mt-5 space-y-3" onSubmit={save}>
       <label className="block text-xs font-semibold text-[#536259]">Outlet name
@@ -106,6 +132,27 @@ export default function OutletSettings({ outlet, canEdit, onSaved }: Props) {
         <input className={`${fieldClass} mt-1.5`} type="number" min={0} max={10000} step={1} value={draft.tax_rate_bps} required disabled={!canEdit || saving} onChange={event => setDraft(current => ({ ...current, tax_rate_bps: Number(event.target.value) }))}/>
         <small className="mt-1 block font-normal text-[#89958d]">{(draft.tax_rate_bps / 100).toFixed(2)}%. Confirm the applicable tax treatment with your accountant.</small>
       </label>
+      <div className="border-t border-[#edf0ed] pt-3"><h3 className="text-xs font-bold uppercase tracking-wide text-[#65746b]">Receipt identity</h3>
+        <div className="mt-3 space-y-3">
+          <label className="block text-xs font-semibold text-[#536259]">Receipt name
+            <input className={`${fieldClass} mt-1.5`} value={draft.receipt_name} maxLength={120} disabled={!canEdit || saving} onChange={event => setDraft(current => ({ ...current, receipt_name: event.target.value }))}/>
+          </label>
+          <label className="block text-xs font-semibold text-[#536259]">Address
+            <input className={`${fieldClass} mt-1.5`} value={draft.receipt_address} maxLength={240} disabled={!canEdit || saving} onChange={event => setDraft(current => ({ ...current, receipt_address: event.target.value }))}/>
+          </label>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="block text-xs font-semibold text-[#536259]">Phone
+              <input className={`${fieldClass} mt-1.5`} type="tel" value={draft.receipt_phone} maxLength={40} disabled={!canEdit || saving} onChange={event => setDraft(current => ({ ...current, receipt_phone: event.target.value }))}/>
+            </label>
+            <label className="block text-xs font-semibold text-[#536259]">GSTIN
+              <input className={`${fieldClass} mt-1.5 uppercase`} value={draft.gstin} maxLength={15} disabled={!canEdit || saving} onChange={event => setDraft(current => ({ ...current, gstin: event.target.value.toUpperCase() }))}/>
+            </label>
+          </div>
+          <label className="block text-xs font-semibold text-[#536259]">Receipt footer
+            <input className={`${fieldClass} mt-1.5`} value={draft.receipt_footer} maxLength={240} disabled={!canEdit || saving} onChange={event => setDraft(current => ({ ...current, receipt_footer: event.target.value }))}/>
+          </label>
+        </div>
+      </div>
       {error&&<p role="alert" className="rounded-lg bg-[#fff2ef] px-3 py-2 text-xs text-[#a34d3d]">{error}</p>}
       {notice&&<p role="status" className="rounded-lg bg-[#f0f7f0] px-3 py-2 text-xs text-[#39704d]">{notice}</p>}
       {canEdit&&<button className="inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-[#286a4f] px-4 text-sm font-semibold text-white transition hover:bg-[#1f563f] disabled:cursor-not-allowed disabled:opacity-55" disabled={saving || !changed}>

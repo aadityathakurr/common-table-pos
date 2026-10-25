@@ -9,7 +9,7 @@ import OutletSettings from './OutletSettings';
 
 type Tenant = { tenant_id: string; name: string; created_by: string };
 type Membership = { tenant_id: string; role: string; status: string };
-type Outlet = { tenant_id: string; outlet_id: string; name: string; timezone: string; currency: string; tax_rate_bps: number };
+type Outlet = { tenant_id: string; outlet_id: string; name: string; timezone: string; currency: string; tax_rate_bps: number; receipt_name: string | null; receipt_address: string | null; receipt_phone: string | null; gstin: string | null; receipt_footer: string | null };
 type Terminal = { terminal_id: string; name: string; status: 'active'|'revoked'; enrolled_at: string; last_seen_at: string|null };
 type OutletMembership = { tenant_id: string; outlet_id: string; role: string; status: string };
 type Role = 'manager' | 'cashier' | 'kitchen' | 'viewer';
@@ -96,7 +96,7 @@ export default function AdminApp() {
       const firstTenantId = preferredTenantId || membershipsForUser[0]?.tenant_id || '';
       setTenantId(firstTenantId);
       if (firstTenantId) {
-        const outletResult = await supabase.from('outlets').select('tenant_id,outlet_id,name,timezone,currency,tax_rate_bps').eq('tenant_id', firstTenantId).order('name');
+        const outletResult = await supabase.from('outlets').select('tenant_id,outlet_id,name,timezone,currency,tax_rate_bps,receipt_name,receipt_address,receipt_phone,gstin,receipt_footer').eq('tenant_id', firstTenantId).order('name');
         if (outletResult.error) throw outletResult.error;
         const rows = (outletResult.data ?? []) as Outlet[];
         setOutlets(rows);
@@ -333,7 +333,7 @@ export default function AdminApp() {
   async function changeTenant(nextId: string) {
     setTenantId(nextId); setOutletId('');
     if (!supabase) return;
-    const { data, error: queryError } = await supabase.from('outlets').select('tenant_id,outlet_id,name,timezone,currency,tax_rate_bps').eq('tenant_id', nextId).order('name');
+    const { data, error: queryError } = await supabase.from('outlets').select('tenant_id,outlet_id,name,timezone,currency,tax_rate_bps,receipt_name,receipt_address,receipt_phone,gstin,receipt_footer').eq('tenant_id', nextId).order('name');
     if (queryError) setError(queryError.message);
     else { const rows = (data ?? []) as Outlet[]; setOutlets(rows); setOutletId(rows[0]?.outlet_id ?? ''); }
   }

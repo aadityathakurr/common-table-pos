@@ -224,6 +224,7 @@ app.get('/api/context',(_req,res)=>res.json({
   tenantId:DEMO_TENANT,tenantName:EDGE_CONFIG.tenantName,outletId:DEMO_OUTLET,outletName:EDGE_CONFIG.outletName,
   terminalId:DEMO_TERMINAL,terminalName:EDGE_CONFIG.terminalName,locationLabel:EDGE_CONFIG.locationLabel,
   currency:EDGE_CONFIG.currency,timeZone:EDGE_CONFIG.timezone,taxRateBps:EDGE_CONFIG.taxRateBps,
+  receipt:{name:EDGE_CONFIG.receiptName,address:EDGE_CONFIG.receiptAddress,phone:EDGE_CONFIG.receiptPhone,gstin:EDGE_CONFIG.gstin,footer:EDGE_CONFIG.receiptFooter},
 }));
 app.get('/api/ready',(_req,res)=>{
   try{

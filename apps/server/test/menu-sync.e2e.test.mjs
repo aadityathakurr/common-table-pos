@@ -22,7 +22,8 @@ const items = [
   { id: 'cloud-chai', name: 'Masala Chai', category: 'Beverages', priceMinor: 200, emoji: '☕', color: '#f4e8d5',
     tag: null, vegetarian: true, available: true, kitchenStation: 'Beverage station', modifiers: [] },
 ];
-let outletConfig = { name: 'Managed Test Outlet', timezone: 'UTC', currency: 'USD', taxRateBps: 1000 };
+let outletConfig = { name: 'Managed Test Outlet', timezone: 'UTC', currency: 'USD', taxRateBps: 1000,
+  receiptName: 'Test Cafe', receiptAddress: '10 Test Street', receiptPhone: '+91 98765 43210', gstin: '22AAAAA0000A1Z5', receiptFooter: 'Thanks for visiting' };
 function snapshotVersion() {
   return createHash('sha256').update(JSON.stringify({ outletConfig, items })).digest('hex');
 }
@@ -207,6 +208,8 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
     tenantId, tenantName: 'Test Cafe', outletId, outletName: outletConfig.name,
     terminalId, terminalName: 'Counter 1', locationLabel: 'Test Location',
     currency: 'USD', timeZone: 'UTC', taxRateBps: 1000,
+    receipt: { name: outletConfig.receiptName, address: outletConfig.receiptAddress, phone: outletConfig.receiptPhone,
+      gstin: outletConfig.gstin, footer: outletConfig.receiptFooter },
   }, 'the paired edge applies cloud outlet settings');
 
   const firstMenu = await jsonRequest(baseUrl, '/api/menu');
@@ -440,7 +443,9 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.match(csvText, /Indori Poha/);
   assert.match(csvText, /closed_shifts/);
 
-  outletConfig = { name: 'Updated Test Outlet', timezone: 'Asia/Kolkata', currency: 'INR', taxRateBps: 500 };
+  outletConfig = { name: 'Updated Test Outlet', timezone: 'Asia/Kolkata', currency: 'INR', taxRateBps: 500,
+    receiptName: 'Updated Test Cafe', receiptAddress: '22 Sample Road', receiptPhone: '+91 12345 67890',
+    gstin: '22AAAAA0000A1Z5', receiptFooter: 'Visit again soon' };
   version = snapshotVersion();
   await waitFor(async () => {
     const [{ body: context }, { body: syncStatus }] = await Promise.all([
@@ -448,6 +453,8 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
     ]);
     return context.outletName === outletConfig.name && context.timeZone === outletConfig.timezone
       && context.currency === outletConfig.currency && context.taxRateBps === outletConfig.taxRateBps
+      && JSON.stringify(context.receipt) === JSON.stringify({ name: outletConfig.receiptName, address: outletConfig.receiptAddress,
+        phone: outletConfig.receiptPhone, gstin: outletConfig.gstin, footer: outletConfig.receiptFooter })
       && syncStatus.menu?.version === version;
   }, 'a cloud-only outlet setting change did not reach the running edge', 40_000);
   const updatedOrder = await jsonRequest(baseUrl, '/api/orders', {

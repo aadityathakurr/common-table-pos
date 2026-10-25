@@ -20,6 +20,11 @@ export const EDGE_CONFIG = {
   terminalId: setting('POS_TERMINAL_ID', 'terminal-counter-01'),
   terminalName: setting('POS_TERMINAL_NAME', 'Counter 01'),
   locationLabel: setting('POS_LOCATION_LABEL', 'Vijay Nagar, Indore · Demo'),
+  receiptName: process.env.POS_RECEIPT_NAME?.trim() ?? '',
+  receiptAddress: process.env.POS_RECEIPT_ADDRESS?.trim() ?? '',
+  receiptPhone: process.env.POS_RECEIPT_PHONE?.trim() ?? '',
+  gstin: process.env.POS_GSTIN?.trim().toUpperCase() ?? '',
+  receiptFooter: process.env.POS_RECEIPT_FOOTER?.trim() ?? '',
   actorId: setting('POS_ACTOR_ID', 'demo-owner'),
   timezone: setting('POS_TIMEZONE', 'Asia/Kolkata'),
   currency: setting('POS_CURRENCY', 'INR'),
@@ -35,6 +40,21 @@ export interface OutletRuntimeSettings {
   timezone: string;
   currency: string;
   taxRateBps: number;
+  receiptName: string;
+  receiptAddress: string;
+  receiptPhone: string;
+  gstin: string;
+  receiptFooter: string;
+}
+
+function receiptText(row: Record<string, unknown>, field: string, maxLength: number, fallback: string): string {
+  if (!(field in row)) return fallback;
+  const raw = row[field];
+  if (raw === null) return '';
+  if (typeof raw !== 'string') throw new Error(`The cloud outlet ${field} is invalid.`);
+  const value = raw.trim().replace(/[\u0000-\u001f\u007f]/g, '');
+  if (value.length > maxLength) throw new Error(`The cloud outlet ${field} is invalid.`);
+  return value;
 }
 
 export function parseOutletRuntimeSettings(value: unknown): OutletRuntimeSettings {
@@ -44,13 +64,19 @@ export function parseOutletRuntimeSettings(value: unknown): OutletRuntimeSetting
   const timezone = typeof row.timezone === 'string' ? row.timezone.trim() : '';
   const currency = typeof row.currency === 'string' ? row.currency.trim().toUpperCase() : '';
   const taxRateBps = Number(row.taxRateBps);
+  const receiptName = receiptText(row, 'receiptName', 120, EDGE_CONFIG.receiptName);
+  const receiptAddress = receiptText(row, 'receiptAddress', 240, EDGE_CONFIG.receiptAddress);
+  const receiptPhone = receiptText(row, 'receiptPhone', 40, EDGE_CONFIG.receiptPhone);
+  const gstin = receiptText(row, 'gstin', 15, EDGE_CONFIG.gstin).toUpperCase();
+  const receiptFooter = receiptText(row, 'receiptFooter', 240, EDGE_CONFIG.receiptFooter);
   if (!name || name.length > 120) throw new Error('The cloud outlet name is invalid.');
   if (!timezone || timezone.length > 80) throw new Error('The cloud outlet timezone is invalid.');
   try { new Intl.DateTimeFormat('en-US', { timeZone: timezone }); }
   catch { throw new Error('The cloud outlet timezone is invalid.'); }
   if (!/^[A-Z]{3}$/.test(currency)) throw new Error('The cloud outlet currency is invalid.');
   if (!Number.isSafeInteger(taxRateBps) || taxRateBps < 0 || taxRateBps > 10_000) throw new Error('The cloud outlet tax rate is invalid.');
-  return { name, timezone, currency, taxRateBps };
+  if (gstin && !/^[0-9A-Z]{15}$/.test(gstin)) throw new Error('The cloud outlet GSTIN is invalid.');
+  return { name, timezone, currency, taxRateBps, receiptName, receiptAddress, receiptPhone, gstin, receiptFooter };
 }
 
 export function applyOutletRuntimeSettings(value: unknown): OutletRuntimeSettings {
@@ -59,6 +85,11 @@ export function applyOutletRuntimeSettings(value: unknown): OutletRuntimeSetting
   EDGE_CONFIG.timezone = settings.timezone;
   EDGE_CONFIG.currency = settings.currency;
   EDGE_CONFIG.taxRateBps = settings.taxRateBps;
+  EDGE_CONFIG.receiptName = settings.receiptName;
+  EDGE_CONFIG.receiptAddress = settings.receiptAddress;
+  EDGE_CONFIG.receiptPhone = settings.receiptPhone;
+  EDGE_CONFIG.gstin = settings.gstin;
+  EDGE_CONFIG.receiptFooter = settings.receiptFooter;
   return settings;
 }
 

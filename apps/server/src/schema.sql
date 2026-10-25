@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS outlets (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id), name TEXT NOT NULL,
   timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata', currency TEXT NOT NULL DEFAULT 'INR',
   tax_rate_bps INTEGER NOT NULL DEFAULT 0 CHECK(tax_rate_bps BETWEEN 0 AND 10000),
+  receipt_name TEXT, receipt_address TEXT, receipt_phone TEXT, gstin TEXT, receipt_footer TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(tenant_id,id)
 );
 CREATE TABLE IF NOT EXISTS terminals (

@@ -21,6 +21,17 @@ if (!outletColumns.some(column => column.name === 'tax_rate_bps')) {
   db.exec('ALTER TABLE outlets ADD COLUMN tax_rate_bps INTEGER NOT NULL DEFAULT 0 CHECK(tax_rate_bps BETWEEN 0 AND 10000)');
   db.prepare('UPDATE outlets SET tax_rate_bps=? WHERE id=? AND tenant_id=?').run(EDGE_CONFIG.taxRateBps, EDGE_CONFIG.outletId, EDGE_CONFIG.tenantId);
 }
+const receiptColumns = [
+  ['receipt_name', EDGE_CONFIG.receiptName], ['receipt_address', EDGE_CONFIG.receiptAddress],
+  ['receipt_phone', EDGE_CONFIG.receiptPhone], ['gstin', EDGE_CONFIG.gstin], ['receipt_footer', EDGE_CONFIG.receiptFooter],
+] as const;
+for (const [column, initialValue] of receiptColumns) {
+  if (!outletColumns.some(existing => existing.name === column)) {
+    db.exec(`ALTER TABLE outlets ADD COLUMN ${column} TEXT`);
+    db.prepare(`UPDATE outlets SET ${column}=? WHERE id=? AND tenant_id=?`)
+      .run(initialValue || null, EDGE_CONFIG.outletId, EDGE_CONFIG.tenantId);
+  }
+}
 const paymentColumns = db.pragma('table_info(payment_events)') as Array<{ name: string }>;
 if (!paymentColumns.some(column => column.name === 'shift_id')) db.exec('ALTER TABLE payment_events ADD COLUMN shift_id TEXT REFERENCES shifts(id)');
 if (!paymentColumns.some(column => column.name === 'entry_type')) db.exec("ALTER TABLE payment_events ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'tender'");
@@ -36,8 +47,12 @@ export const DEMO_ACTOR = EDGE_CONFIG.actorId;
 
 const seed = db.transaction(() => {
   db.prepare('INSERT OR IGNORE INTO tenants(id,name) VALUES(?,?)').run(DEMO_TENANT, EDGE_CONFIG.tenantName);
-  db.prepare('INSERT OR IGNORE INTO outlets(id,tenant_id,name,timezone,currency,tax_rate_bps) VALUES(?,?,?,?,?,?)')
-    .run(DEMO_OUTLET, DEMO_TENANT, EDGE_CONFIG.outletName, EDGE_CONFIG.timezone, EDGE_CONFIG.currency, EDGE_CONFIG.taxRateBps);
+  db.prepare(`INSERT OR IGNORE INTO outlets
+    (id,tenant_id,name,timezone,currency,tax_rate_bps,receipt_name,receipt_address,receipt_phone,gstin,receipt_footer)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(DEMO_OUTLET, DEMO_TENANT, EDGE_CONFIG.outletName, EDGE_CONFIG.timezone, EDGE_CONFIG.currency, EDGE_CONFIG.taxRateBps,
+      EDGE_CONFIG.receiptName || null, EDGE_CONFIG.receiptAddress || null, EDGE_CONFIG.receiptPhone || null,
+      EDGE_CONFIG.gstin || null, EDGE_CONFIG.receiptFooter || null);
   db.prepare('INSERT OR IGNORE INTO terminals(id,tenant_id,outlet_id,name) VALUES(?,?,?,?)')
     .run(DEMO_TERMINAL, DEMO_TENANT, DEMO_OUTLET, EDGE_CONFIG.terminalName);
   const insert = db.prepare(`INSERT OR IGNORE INTO menu_items
@@ -61,7 +76,9 @@ const seed = db.transaction(() => {
   }
 });
 seed();
-const cachedOutletSettings = db.prepare('SELECT name,timezone,currency,tax_rate_bps AS taxRateBps FROM outlets WHERE id=? AND tenant_id=?')
+const cachedOutletSettings = db.prepare(`SELECT name,timezone,currency,tax_rate_bps AS taxRateBps,
+  receipt_name AS receiptName,receipt_address AS receiptAddress,receipt_phone AS receiptPhone,gstin,receipt_footer AS receiptFooter
+  FROM outlets WHERE id=? AND tenant_id=?`)
   .get(DEMO_OUTLET, DEMO_TENANT) as OutletRuntimeSettings | undefined;
 if (cachedOutletSettings) applyOutletRuntimeSettings(cachedOutletSettings);
 
@@ -154,8 +171,11 @@ export function markManagedMenuChecked(version:string, syncedAt=new Date().toISO
 export function applyManagedMenuSnapshot(version:string,items:ManagedMenuSnapshotItem[],settings:OutletRuntimeSettings,syncedAt=new Date().toISOString()):void{
   if(items.length>5000)throw new Error('The outlet menu exceeds the item limit.');
   const apply=db.transaction(()=>{
-    db.prepare('UPDATE outlets SET name=?,timezone=?,currency=?,tax_rate_bps=? WHERE id=? AND tenant_id=?')
-      .run(settings.name,settings.timezone,settings.currency,settings.taxRateBps,DEMO_OUTLET,DEMO_TENANT);
+    db.prepare(`UPDATE outlets SET name=?,timezone=?,currency=?,tax_rate_bps=?,receipt_name=?,receipt_address=?,receipt_phone=?,gstin=?,receipt_footer=?
+      WHERE id=? AND tenant_id=?`)
+      .run(settings.name,settings.timezone,settings.currency,settings.taxRateBps,
+        settings.receiptName || null,settings.receiptAddress || null,settings.receiptPhone || null,
+        settings.gstin || null,settings.receiptFooter || null,DEMO_OUTLET,DEMO_TENANT);
     db.prepare('UPDATE menu_items SET available=0,updated_at=? WHERE tenant_id=? AND outlet_id=?')
       .run(syncedAt,DEMO_TENANT,DEMO_OUTLET);
     db.prepare('UPDATE menu_modifiers SET active=0 WHERE tenant_id=? AND outlet_id=?').run(DEMO_TENANT,DEMO_OUTLET);
