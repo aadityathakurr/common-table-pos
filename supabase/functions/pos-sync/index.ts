@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.118.0";
+import { ifNoneMatchMatches } from "./etag.mjs";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
 const secretKey = Deno.env.get("SUPABASE_SECRET_KEY") ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -45,6 +46,21 @@ async function hashTerminalKey(key: string): Promise<string> {
   return base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key))));
 }
 
+async function recordTerminalSeen(
+  client: ReturnType<typeof createClient>,
+  terminal: { tenant_id: string; outlet_id: string; terminal_id: string },
+): Promise<void> {
+  const { error } = await client.from("terminals")
+    .update({ last_seen_at: new Date().toISOString() })
+    .eq("tenant_id", terminal.tenant_id)
+    .eq("outlet_id", terminal.outlet_id)
+    .eq("terminal_id", terminal.terminal_id);
+  if (error) {
+    // Connectivity status is advisory; a last-seen write must not block offline-first order sync.
+    console.error(JSON.stringify({ event: "pos_sync.last_seen_failed", code: error.code }));
+  }
+}
+
 Deno.serve(async (request: Request): Promise<Response> => {
   if (request.headers.has("origin")) return json(403, { error: "Browser requests are not accepted by terminal sync." });
   if (request.method !== "POST" && request.method !== "GET") return json(405, { error: "Method not allowed." });
@@ -59,6 +75,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
     .eq("status", "active")
     .maybeSingle();
   if (terminalError || !terminal) return json(401, { error: "Terminal authentication failed." });
+  await recordTerminalSeen(client, terminal);
 
   if (request.method === "GET") {
     const [categoryResult, itemResult] = await Promise.all([
@@ -91,7 +108,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
     const version = [...versionBytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
     const etag = `"${version}"`;
     const headers = { etag, "x-pos-menu-version": version };
-    if (request.headers.get("if-none-match") === etag) return noContent(304, headers);
+    if (ifNoneMatchMatches(request.headers.get("if-none-match"), etag)) return noContent(304, headers);
     return json(200, { tenantId: terminal.tenant_id, outletId: terminal.outlet_id, version, items }, headers);
   }
 
@@ -156,11 +173,5 @@ Deno.serve(async (request: Request): Promise<Response> => {
     return json(503, { error: "The sync batch was not acknowledged. It is safe to retry." });
   }
 
-  const { error: seenError } = await client.from("terminals")
-    .update({ last_seen_at: new Date().toISOString() })
-    .eq("tenant_id", terminal.tenant_id)
-    .eq("outlet_id", terminal.outlet_id)
-    .eq("terminal_id", terminal.terminal_id);
-  if (seenError) console.error(JSON.stringify({ event: "pos_sync.last_seen_failed", code: seenError.code }));
   return json(200, { acceptedEventIds: events.map((event) => event.eventId) });
 });
