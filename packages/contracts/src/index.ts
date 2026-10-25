@@ -21,6 +21,10 @@ export interface MenuItem {
   available: boolean;
   kitchenStation: string;
   modifiers: ModifierOption[];
+  /** Null or omitted means use the outlet's configured demonstration fallback. */
+  taxCode?: string | null;
+  /** Null or omitted means use the outlet's configured demonstration fallback; zero is an explicit 0% rate. */
+  taxRateBps?: number | null;
 }
 
 export interface DiningTableConfig {
@@ -78,6 +82,8 @@ export interface OrderLine {
   note?: string;
   kitchenStation: string;
   modifiers: ModifierOption[];
+  taxCode?: string | null;
+  taxRateBps?: number;
   voidedAt?: string;
   voidReason?: string;
 }
@@ -159,6 +165,7 @@ export interface DailySalesReport {
   endAt: string;
   generatedAt: string;
   totals: { paidOrderCount: number; subtotalMinor: number; taxTotalMinor: number; salesMinor: number };
+  taxBreakdown: Array<{ taxCode: string | null; taxRateBps: number; taxMinor: number }>;
   refunds: { count: number; amountMinor: number };
   tenders: Array<{ method: PaymentMethod; amountMinor: number; paymentCount: number }>;
   items: Array<{ menuItemId: string; name: string; quantity: number; salesMinor: number }>;

@@ -30,10 +30,14 @@ test('network printer adapter sends the exact ESC/POS bytes over TCP', async () 
         assert.deepEqual(await receivedPayload, payload);
         const receipt = printer.formatReceipt({ id: 'order-1', commandId: 'cmd-1', tenantId: 'tenant-1', outletId: 'outlet-1',
           terminalId: 'terminal-1', orderNumber: 'J-ORD-000001', orderType: 'takeaway', tableLabel: null, guestCount: 1,
-          status: 'paid', note: null, createdAt: new Date().toISOString(), lines: [], currency: 'USD', taxRateBps: 0,
-          subtotalMinor: 250, taxTotalMinor: 0, totalMinor: 250 });
+          status: 'paid', note: null, createdAt: new Date().toISOString(), lines: [
+            { id: 'line-1', menuItemId: 'poha', name: 'Indori Poha', category: 'Breakfast', quantity: 1, unitPriceMinor: 550,
+              lineTotalMinor: 550, kitchenStation: 'Hot kitchen', modifiers: [], taxCode: '1101', taxRateBps: 500 },
+          ], currency: 'USD', taxRateBps: 0,
+          subtotalMinor: 550, taxTotalMinor: 28, totalMinor: 578 });
         const receiptText = receipt.toString('ascii');
-        assert.match(receiptText, /USD\s+2\.50/);
+        assert.match(receiptText, /USD\s+5\.78/);
+        assert.match(receiptText, /Tax 5% HSN\/SAC 1101/);
         assert.match(receiptText, /Test Sweets/);
         assert.match(receiptText, /10 Vijay Nagar, Indore/);
         assert.match(receiptText, /Phone: \+91 98765 43210/);

@@ -52,7 +52,7 @@ function publish(type:ServerMessage['type'],payload:ServerMessage['payload']){
 function mapLines(orderId:string):OrderLine[]{
   return (db.prepare(`SELECT l.id,l.menu_item_id AS menuItemId,l.item_name_snapshot AS name,l.category_snapshot AS category,
     l.quantity,l.unit_price_minor AS unitPriceMinor,l.modifiers_json AS modifiersJson,l.line_total_minor AS lineTotalMinor,
-    l.kitchen_station AS kitchenStation,l.note,v.voided_at AS voidedAt,v.reason AS voidReason
+    l.kitchen_station AS kitchenStation,l.note,l.tax_code_snapshot AS taxCode,l.tax_rate_bps AS taxRateBps,v.voided_at AS voidedAt,v.reason AS voidReason
     FROM order_lines l LEFT JOIN order_line_voids v ON v.order_line_id=l.id WHERE l.order_id=? ORDER BY l.rowid`).all(orderId) as Array<OrderLine & {note:string|null;modifiersJson:string;voidedAt:string|null;voidReason:string|null}>)
     .map(line=>({...line,modifiers:JSON.parse(line.modifiersJson) as OrderLine['modifiers'],note:line.note??undefined,
       ...(line.voidedAt?{voidedAt:line.voidedAt,voidReason:line.voidReason??undefined}:{})}));
@@ -130,7 +130,7 @@ function audit(entityType:string,entityId:string,action:string,reason:string|nul
     VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(eventId,DEMO_TENANT,DEMO_OUTLET,actorId,DEMO_TERMINAL,entityType,entityId,action,reason,JSON.stringify(payload),occurredAt);
   enqueueSyncEvent('audit',entityId,action,{entityType,entityId,actorId,terminalId:DEMO_TERMINAL,reason,payload},occurredAt,eventId);
 }
-type PreparedOrderLine={id:string;menuItemId:string;name:string;category:string;kitchenStation:string;quantity:number;basePriceMinor:number;modifiers:OrderLine['modifiers'];lineTotalMinor:number;note:string|null};
+type PreparedOrderLine={id:string;menuItemId:string;name:string;category:string;kitchenStation:string;quantity:number;basePriceMinor:number;modifiers:OrderLine['modifiers'];lineTotalMinor:number;taxCode:string|null;taxRateBps:number;note:string|null};
 function prepareLines(lines:OrderLineDraft[]):PreparedOrderLine[]{
   if(!Array.isArray(lines)||lines.length===0||lines.length>50)throw new Error('An order change needs between 1 and 50 items.');
   return lines.map(line=>{
@@ -147,14 +147,17 @@ function prepareLines(lines:OrderLineDraft[]):PreparedOrderLine[]{
     const groupCounts=new Map<string,number>();for(const modifier of modifiers)groupCounts.set(modifier.group,(groupCounts.get(modifier.group)??0)+1);
     for(const [group,count] of groupCounts)if(group!=='Add-on'&&count>1)throw new Error(`Select only one ${group.toLowerCase()} option.`);
     const basePriceMinor=Number(menu.price_minor);const unitPriceMinor=basePriceMinor+modifiers.reduce((sum,modifier)=>sum+modifier.priceDeltaMinor,0);
-    return {id:createId(),menuItemId:String(menu.id),name:String(menu.name),category:String(menu.category),kitchenStation:String(menu.kitchen_station),quantity,basePriceMinor,modifiers,lineTotalMinor:Math.round(unitPriceMinor*quantity),note:line.note?.slice(0,140)??null};
+    const taxCode=menu.tax_code==null?null:String(menu.tax_code);
+    const taxRateBps=menu.tax_rate_bps==null?EDGE_CONFIG.taxRateBps:Number(menu.tax_rate_bps);
+    if(!Number.isSafeInteger(taxRateBps)||taxRateBps<0||taxRateBps>10_000)throw new Error(`Menu item ${String(menu.name)} has an invalid tax rate.`);
+    return {id:createId(),menuItemId:String(menu.id),name:String(menu.name),category:String(menu.category),kitchenStation:String(menu.kitchen_station),quantity,basePriceMinor,modifiers,lineTotalMinor:Math.round(unitPriceMinor*quantity),taxCode,taxRateBps,note:line.note?.slice(0,140)??null};
   });
 }
 function recalculateOrder(orderId:string,timestamp:string){
-  const subtotal=Number((db.prepare(`SELECT COALESCE(SUM(l.line_total_minor),0) AS subtotal FROM order_lines l
-    LEFT JOIN order_line_voids v ON v.order_line_id=l.id WHERE l.order_id=? AND v.order_line_id IS NULL`).get(orderId) as {subtotal:number}).subtotal);
-  const taxRate=Number((db.prepare('SELECT tax_rate_bps FROM orders WHERE id=?').get(orderId) as {tax_rate_bps:number}).tax_rate_bps);
-  const tax=Math.round(subtotal*taxRate/10000);
+  const totals=db.prepare(`SELECT COALESCE(SUM(l.line_total_minor),0) AS subtotal,
+    COALESCE(SUM(ROUND(l.line_total_minor*l.tax_rate_bps/10000.0)),0) AS tax FROM order_lines l
+    LEFT JOIN order_line_voids v ON v.order_line_id=l.id WHERE l.order_id=? AND v.order_line_id IS NULL`).get(orderId) as {subtotal:number;tax:number};
+  const subtotal=Number(totals.subtotal);const tax=Number(totals.tax);
   db.prepare('UPDATE orders SET subtotal_minor=?,tax_total_minor=?,total_minor=?,updated_at=? WHERE id=?').run(subtotal,tax,subtotal+tax,timestamp,orderId);
 }
 function rememberEdit(commandId:string,orderId:string,action:'lines_added'|'line_voided'|'order_voided',request:unknown,timestamp:string){
@@ -170,9 +173,9 @@ function editReplay(commandId:string,orderId:string,action:'lines_added'|'line_v
   return true;
 }
 function persistAddedLines(orderId:string,lines:PreparedOrderLine[],timestamp:string){
-  const insert=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-  for(const line of lines)insert.run(line.id,DEMO_TENANT,DEMO_OUTLET,orderId,line.menuItemId,line.name,line.category,line.basePriceMinor,JSON.stringify(line.modifiers),line.quantity,line.lineTotalMinor,line.kitchenStation,line.note);
+  const insert=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note,tax_code_snapshot,tax_rate_bps)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  for(const line of lines)insert.run(line.id,DEMO_TENANT,DEMO_OUTLET,orderId,line.menuItemId,line.name,line.category,line.basePriceMinor,JSON.stringify(line.modifiers),line.quantity,line.lineTotalMinor,line.kitchenStation,line.note,line.taxCode,line.taxRateBps);
   const known=new Set((db.prepare('SELECT station FROM kitchen_tickets WHERE order_id=?').all(orderId) as Array<{station:string}>).map(ticket=>ticket.station));
   const insertTicket=db.prepare(`INSERT INTO kitchen_tickets(id,tenant_id,outlet_id,order_id,station,status,created_at) VALUES(?,?,?,?,?,'new',?)`);
   for(const station of new Set(lines.map(line=>line.kitchenStation))){
@@ -190,7 +193,7 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
   if(command.orderType==='dine_in'&&!command.tableLabel?.trim())throw new Error('Choose a table for dine-in orders.');
   const prepared=prepareLines(command.lines);
   const subtotalMinor=prepared.reduce((sum,line)=>sum+line.lineTotalMinor,0);
-  const taxTotalMinor=Math.round(subtotalMinor*EDGE_CONFIG.taxRateBps/10000);
+  const taxTotalMinor=prepared.reduce((sum,line)=>sum+Math.round(line.lineTotalMinor*line.taxRateBps/10000),0);
   const totalMinor=subtotalMinor+taxTotalMinor;
   const orderId=randomUUID();const timestamp=new Date().toISOString();
   const create=db.transaction(()=>{
@@ -201,9 +204,9 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
       orderType:command.orderType,tableLabel:command.orderType==='dine_in'?command.tableLabel:null,guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),
       note:command.note?.slice(0,140)??null,currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,
     });
-    const insertLine=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-    for(const line of prepared)insertLine.run(line.id,DEMO_TENANT,DEMO_OUTLET,orderId,line.menuItemId,line.name,line.category,line.basePriceMinor,JSON.stringify(line.modifiers),line.quantity,line.lineTotalMinor,line.kitchenStation,line.note);
+    const insertLine=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note,tax_code_snapshot,tax_rate_bps)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    for(const line of prepared)insertLine.run(line.id,DEMO_TENANT,DEMO_OUTLET,orderId,line.menuItemId,line.name,line.category,line.basePriceMinor,JSON.stringify(line.modifiers),line.quantity,line.lineTotalMinor,line.kitchenStation,line.note,line.taxCode,line.taxRateBps);
     const stations=new Set(prepared.map(line=>line.kitchenStation));
     const insertTicket=db.prepare(`INSERT INTO kitchen_tickets(id,tenant_id,outlet_id,order_id,station,status,created_at) VALUES(?,?,?,?,?,'new',?)`);
     for(const station of stations)insertTicket.run(createId(),DEMO_TENANT,DEMO_OUTLET,orderId,station,timestamp);
@@ -213,7 +216,8 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
       guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),status:'sent',note:command.note?.slice(0,140)??null,
       currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,
       lines:prepared.map(line=>({id:line.id,menuItemId:line.menuItemId,name:line.name,category:line.category,quantity:line.quantity,
-        unitPriceMinor:line.basePriceMinor,lineTotalMinor:line.lineTotalMinor,kitchenStation:line.kitchenStation,note:line.note,modifiers:line.modifiers}))},timestamp);
+        unitPriceMinor:line.basePriceMinor,lineTotalMinor:line.lineTotalMinor,kitchenStation:line.kitchenStation,note:line.note,
+        taxCode:line.taxCode,taxRateBps:line.taxRateBps,modifiers:line.modifiers}))},timestamp);
   });
   create();
   const order=orderById(orderId)!;

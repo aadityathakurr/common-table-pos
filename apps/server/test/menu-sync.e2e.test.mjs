@@ -18,9 +18,9 @@ const terminalKey = 'test-terminal-key-'.padEnd(48, 'x');
 const modifiers = [{ id: 'cloud-modifier', group: 'Size', name: 'Large', priceDeltaMinor: 50 }];
 const items = [
   { id: 'cloud-poha', name: 'Indori Poha', category: 'Breakfast', priceMinor: 500, emoji: '🍲', color: '#dceee2',
-    tag: null, vegetarian: true, available: true, kitchenStation: 'Hot kitchen', modifiers },
+    tag: null, vegetarian: true, available: true, kitchenStation: 'Hot kitchen', modifiers, taxCode: '1101', taxRateBps: 500 },
   { id: 'cloud-chai', name: 'Masala Chai', category: 'Beverages', priceMinor: 200, emoji: '☕', color: '#f4e8d5',
-    tag: null, vegetarian: true, available: true, kitchenStation: 'Beverage station', modifiers: [] },
+    tag: null, vegetarian: true, available: true, kitchenStation: 'Beverage station', modifiers: [], taxRateBps: 0 },
 ];
 let outletConfig = { name: 'Managed Test Outlet', timezone: 'UTC', currency: 'USD', taxRateBps: 1000,
   receiptName: 'Test Cafe', receiptAddress: '10 Test Street', receiptPhone: '+91 98765 43210', gstin: '22AAAAA0000A1Z5', receiptFooter: 'Thanks for visiting' };
@@ -266,8 +266,10 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   });
   assert.equal(created.response.status, 201);
   assert.equal(created.body.subtotalMinor, 550);
-  assert.equal(created.body.taxTotalMinor, 55);
-  assert.equal(created.body.totalMinor, 605, 'cloud-configured tax is applied to the accepted order');
+  assert.equal(created.body.taxTotalMinor, 28);
+  assert.equal(created.body.totalMinor, 578, 'the item rate overrides the outlet fallback for the accepted order');
+  assert.equal(created.body.lines[0].taxCode, '1101');
+  assert.equal(created.body.lines[0].taxRateBps, 500);
   assert.equal(created.body.currency, 'USD');
   assert.equal(created.body.taxRateBps, 1000);
   assert.deepEqual((await jsonRequest(baseUrl, '/api/floor-plan')).body, localFloorPlan(['Table 01']),
@@ -280,7 +282,8 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(addition),
   });
   assert.equal(added.response.status, 201);
-  assert.equal(added.body.totalMinor, 825);
+  assert.equal(added.body.totalMinor, 778, 'an explicit zero item rate stays zero instead of inheriting outlet tax');
+  assert.equal(added.body.lines[1].taxRateBps, 0);
   const replayedAddition = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/lines`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(addition),
   });
@@ -344,7 +347,7 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(voidBody),
   });
   assert.equal(voided.response.status, 200);
-  assert.equal(voided.body.totalMinor, 605);
+  assert.equal(voided.body.totalMinor, 578);
   assert.equal(voided.body.lines.find((line) => line.id === chaiLine.id).voidReason, 'Guest changed mind');
   stationTickets = (await jsonRequest(baseUrl, '/api/kitchen')).body;
   assert.equal(stationTickets.length, 1, 'voiding the last item removes only its station ticket');
@@ -379,7 +382,7 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   const restoredMenu = await jsonRequest(baseUrl, '/api/menu');
   assert.deepEqual(restoredMenu.body.map((item) => item.id), ['cloud-poha', 'cloud-chai']);
   const restoredOrder = (await jsonRequest(baseUrl, '/api/orders')).body.find((order) => order.commandId === commandId);
-  assert.equal(restoredOrder.totalMinor, 605);
+  assert.equal(restoredOrder.totalMinor, 578);
   assert.equal(restoredOrder.currency, 'USD');
   assert.equal(restoredOrder.taxRateBps, 1000);
   assert.equal(restoredOrder.status, 'ready');
@@ -394,7 +397,7 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   });
   assert.equal(openedShift.response.status, 201);
   const splitPaymentCommand = { commandId: randomUUID(), orderId: created.body.id, shiftId: openedShift.body.shift.id,
-    tenders: [{ method: 'cash', amountMinor: 300 }, { method: 'upi', amountMinor: 305 }] };
+    tenders: [{ method: 'cash', amountMinor: 300 }, { method: 'upi', amountMinor: 278 }] };
   const invalidSplit = await jsonRequest(baseUrl, `/api/orders/${created.body.id}/payment`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ ...splitPaymentCommand, commandId: randomUUID(), tenders: [{ method: 'cash', amountMinor: 300 }, { method: 'upi', amountMinor: 200 }] }),
@@ -424,7 +427,7 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.equal(tenderList.response.status, 200);
   const originalUpi = tenderList.body.tenders.find((tender) => tender.method === 'upi');
   refundCommand.paymentId = originalUpi.id;
-  assert.equal(originalUpi.refundableMinor, 305);
+  assert.equal(originalUpi.refundableMinor, 278);
   const cashierPaymentList = await fetch(`${baseUrl}/api/orders/${created.body.id}/payments`, { headers: { cookie: cashierCookie } });
   assert.equal(cashierPaymentList.status, 403, 'cashiers cannot inspect manager refund controls');
   const cashierRefund = await fetch(`${baseUrl}/api/orders/${created.body.id}/refunds`, {
@@ -463,13 +466,14 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.equal(report.body.totals.paidOrderCount, 1);
   assert.equal(report.body.timeZone, 'UTC');
   assert.equal(report.body.currency, 'USD');
-  assert.equal(report.body.totals.subtotalMinor, 459);
-  assert.equal(report.body.totals.salesMinor, 505);
-  assert.equal(report.body.totals.taxTotalMinor, 46, 'tax refunds are allocated proportionally to the original order tax');
+  assert.equal(report.body.totals.subtotalMinor, 455);
+  assert.equal(report.body.totals.salesMinor, 478);
+  assert.equal(report.body.totals.taxTotalMinor, 23, 'tax refunds are allocated proportionally to the original order tax');
+  assert.deepEqual(report.body.taxBreakdown, [{ taxCode: '1101', taxRateBps: 500, taxMinor: 23 }]);
   assert.deepEqual(report.body.refunds, { count: 1, amountMinor: 100 });
   assert.deepEqual(report.body.tenders, [
     { method: 'cash', amountMinor: 300, paymentCount: 1 },
-    { method: 'upi', amountMinor: 205, paymentCount: 1 },
+    { method: 'upi', amountMinor: 178, paymentCount: 1 },
   ]);
   assert.deepEqual(report.body.items.map((item) => ({ name: item.name, quantity: item.quantity, salesMinor: item.salesMinor })), [
     { name: 'Indori Poha', quantity: 1, salesMinor: 550 },
@@ -488,6 +492,7 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.match(csvText, /net_sales/);
   assert.match(csvText, /refunds/);
   assert.match(csvText, /Indori Poha/);
+  assert.match(csvText, /tax_rate/);
   assert.match(csvText, /closed_shifts/);
   upstreamAvailable = true;
   await waitFor(async () => (await jsonRequest(baseUrl, '/api/sync/status')).body.pending === 0,

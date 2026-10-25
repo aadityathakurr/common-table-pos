@@ -136,7 +136,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
           .select("order_id,subtotal_minor,tax_total_minor,total_minor")
           .eq("tenant_id", tenantId).eq("outlet_id", outletId).in("order_id", batch)),
         fetchAll(client.from("pos_order_items")
-          .select("order_id,line_id,menu_item_id,name,quantity,line_total_minor,voided_at")
+          .select("order_id,line_id,menu_item_id,name,quantity,line_total_minor,voided_at,tax_code,tax_rate_bps")
           .eq("tenant_id", tenantId).eq("outlet_id", outletId).in("order_id", batch)),
       ]);
       orders.push(...orderRows);

@@ -13,7 +13,7 @@ const CONTEXT_CACHE='common-table.edge-context.v1';
 
 interface EdgeContext {tenantId:string;tenantName:string;outletId:string;outletName:string;terminalId:string;terminalName:string;locationLabel:string;currency:string;timeZone?:string;taxRateBps:number;}
 interface CloudMenuContext {tenantId:string;outletId:string;outletName?:string;currency?:string;}
-interface CloudMenuRow {item_id:string;category_id:string;name:string;price_minor:number;emoji:string;color:string;tag:string|null;vegetarian:boolean;available:boolean;kitchen_station:string;modifiers:ModifierOption[]|null;}
+interface CloudMenuRow {item_id:string;category_id:string;name:string;price_minor:number;emoji:string;color:string;tag:string|null;vegetarian:boolean;available:boolean;kitchen_station:string;modifiers:ModifierOption[]|null;tax_code:string|null;tax_rate_bps:number|null;}
 interface CloudAreaRow {area_id:string;name:string;sort_order:number;}
 interface CloudTableRow {table_id:string;area_id:string;name:string;capacity:number;sort_order:number;}
 interface CloudStationRow {station_id:string;name:string;sort_order:number;}
@@ -129,9 +129,10 @@ function App(){
   const activeOrders=orders.filter(order=>['sent','preparing','ready'].includes(order.status));
   const paidOrders=orders.filter(order=>order.status==='paid'&&order.invoiceNumber).slice(0,25);
   const editingOrder=activeOrders.find(order=>order.id===editingOrderId);
-  const cartSubtotal=cart.reduce((sum,line)=>sum+(line.item.priceMinor+line.modifiers.reduce((amount,modifier)=>amount+modifier.priceDeltaMinor,0))*line.quantity,0);
+  const cartSubtotal=cart.reduce((sum,line)=>sum+Math.round((line.item.priceMinor+line.modifiers.reduce((amount,modifier)=>amount+modifier.priceDeltaMinor,0))*line.quantity),0);
   const subtotal=(editingOrder?.subtotalMinor??0)+cartSubtotal;
-  const tax=editingOrder&&!cart.length?editingOrder.taxTotalMinor:Math.round(subtotal*taxRateBps/10000); // Demonstration rate only, must be configured for a real outlet.
+  const addedCartTax=cart.reduce((sum,line)=>{const lineTotal=Math.round((line.item.priceMinor+line.modifiers.reduce((amount,modifier)=>amount+modifier.priceDeltaMinor,0))*line.quantity);return sum+Math.round(lineTotal*(line.item.taxRateBps??taxRateBps)/10000);},0);
+  const tax=editingOrder?(editingOrder.taxTotalMinor+addedCartTax):addedCartTax;
   const total=editingOrder&&!cart.length?editingOrder.totalMinor:subtotal+tax;
   const displayItemCount=(editingOrder?.lines.filter(line=>!line.voidedAt).reduce((sum,line)=>sum+line.quantity,0)??0)+cart.reduce((sum,line)=>sum+line.quantity,0);
   const money=(minor:number)=>formatMoney(minor,outletContext?.currency??'INR');
@@ -224,14 +225,14 @@ function App(){
       if(userError||!userData.user||userData.user.id!==currentUserId)return;
       const [categoryResult,itemResult]=await Promise.all([
         supabase.from('menu_categories').select('category_id,name,active').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('active',true),
-        supabase.from('menu_items').select('item_id,category_id,name,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,modifiers').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('available',true).order('sort_order').order('name'),
+        supabase.from('menu_items').select('item_id,category_id,name,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,modifiers,tax_code,tax_rate_bps').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('available',true).order('sort_order').order('name'),
       ]);
       if(categoryResult.error)throw categoryResult.error;
       if(itemResult.error)throw itemResult.error;
       const names=new Map((categoryResult.data??[]).map(row=>[row.category_id as string,row.name as string]));
       const rows=((itemResult.data??[]) as CloudMenuRow[]).map(row=>({
         id:row.item_id,name:row.name,category:names.get(row.category_id)??'Menu',priceMinor:Number(row.price_minor),emoji:row.emoji,color:row.color,
-        ...(row.tag?{tag:row.tag}:{}),vegetarian:row.vegetarian,available:row.available,kitchenStation:row.kitchen_station,modifiers:Array.isArray(row.modifiers)?row.modifiers:[],
+        ...(row.tag?{tag:row.tag}:{}),vegetarian:row.vegetarian,available:row.available,kitchenStation:row.kitchen_station,modifiers:Array.isArray(row.modifiers)?row.modifiers:[],taxCode:row.tax_code,taxRateBps:row.tax_rate_bps===null?null:Number(row.tax_rate_bps),
       } satisfies MenuItem));
       if(rows.length){
         setMenu(rows);setMenuSource('cloud');
@@ -507,7 +508,7 @@ function App(){
             </div>
             {editingOrder?.note&&<p className="mb-2 rounded bg-[#fff8ed] p-2 text-[8px] text-[#a17a48]">Kitchen note: {editingOrder.note}</p>}
             <label className="mb-2 flex h-8 items-center gap-1.5 rounded-md border border-dashed border-[#dce5de] px-2 text-[#7d9385]"><Plus size={13}/><input disabled={!!editingOrder} value={editingOrder?editingOrder.note??'':note} onChange={event=>setNote(event.target.value)} maxLength={140} placeholder={editingOrder?'Kitchen note is saved with the order':'Add a note for the kitchen'} className="w-full bg-transparent text-[9px] text-[#324239] outline-none placeholder:text-[#9ca8a1] disabled:cursor-not-allowed"/></label>
-            <div className="border-t border-[#edf0ed] pt-2.5"><div className="mb-2 flex justify-between text-[9px] text-[#87938c]"><span>Subtotal</span><span>{money(subtotal)}</span></div><div className="mb-2 flex justify-between text-[9px] text-[#87938c]"><span>Tax <span className="text-[8px] text-[#a4aea8]">(demo {taxRateBps/100}%)</span></span><span>{money(tax)}</span></div><div className="flex items-center justify-between border-t border-dashed border-[#e6ebe7] pt-2.5"><strong className="text-[11px]">Total</strong><strong className="text-[17px] tracking-[-.4px]">{money(total)}</strong></div><p className="mt-1.5 text-[8px] text-[#a2aaa5]">Sample tax only. Set local rules before live use.</p></div>
+            <div className="border-t border-[#edf0ed] pt-2.5"><div className="mb-2 flex justify-between text-[9px] text-[#87938c]"><span>Subtotal</span><span>{money(subtotal)}</span></div><div className="mb-2 flex justify-between text-[9px] text-[#87938c]"><span>Tax <span className="text-[8px] text-[#a4aea8]">(configured rates)</span></span><span>{money(tax)}</span></div><div className="flex items-center justify-between border-t border-dashed border-[#e6ebe7] pt-2.5"><strong className="text-[11px]">Total</strong><strong className="text-[17px] tracking-[-.4px]">{money(total)}</strong></div><p className="mt-1.5 text-[8px] text-[#a2aaa5]">Training menu tax values are examples; confirm rates and classifications before live use.</p></div>
             <div className="mt-3 grid grid-cols-2 gap-2"><button disabled={!cart.length||busy||(!editingOrder&&orderType==='dine_in'&&!selectedTable)} onClick={()=>void sendToKitchen()} className="flex h-10 items-center justify-center gap-1.5 rounded-lg border border-[#dfe8e1] bg-white text-[9px] font-bold text-[#43624f] disabled:cursor-not-allowed disabled:opacity-40"><Send size={13}/>{busy?<LoaderCircle size={12} className="animate-spin"/>:editingOrder?'Send additions':'Send to kitchen'}</button><button disabled={(!cart.length&&(!editingOrder||editingOrder.totalMinor<=0))||busy||(!editingOrder&&orderType==='dine_in'&&!selectedTable)} onClick={()=>{setCheckoutCommandId(makeId());setCheckoutOpen(true);}} className="flex h-10 items-center gap-1.5 rounded-lg bg-[#27694f] px-2 text-[9px] font-bold text-white hover:bg-[#1d503c] disabled:cursor-not-allowed disabled:opacity-40"><span>Charge</span><strong className="ml-auto text-[10px]">{money(total)}</strong><span>→</span></button></div>
             <div className="mt-2.5 text-center text-[8px] text-[#a0aaa4]">{isOutletEdge?'⌁ Orders save to this outlet edge before syncing to cloud':'⌁ Preview menu only · connect an outlet edge to save orders'}</div>
           </aside>

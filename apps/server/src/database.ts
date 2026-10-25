@@ -47,6 +47,15 @@ if (!outboxColumns.some(column => column.name === 'blocked')) db.exec('ALTER TAB
 if (!outboxColumns.some(column => column.name === 'resolved_at')) db.exec('ALTER TABLE sync_outbox ADD COLUMN resolved_at TEXT');
 const manualInventoryColumns = db.pragma('table_info(edge_manual_inventory_movements)') as Array<{ name: string }>;
 if (!manualInventoryColumns.some(column => column.name === 'superseded_at')) db.exec('ALTER TABLE edge_manual_inventory_movements ADD COLUMN superseded_at TEXT');
+const menuTaxColumns = db.pragma('table_info(menu_items)') as Array<{ name: string }>;
+if (!menuTaxColumns.some(column => column.name === 'tax_code')) db.exec('ALTER TABLE menu_items ADD COLUMN tax_code TEXT');
+if (!menuTaxColumns.some(column => column.name === 'tax_rate_bps')) db.exec('ALTER TABLE menu_items ADD COLUMN tax_rate_bps INTEGER CHECK(tax_rate_bps BETWEEN 0 AND 10000)');
+const orderLineTaxColumns = db.pragma('table_info(order_lines)') as Array<{ name: string }>;
+if (!orderLineTaxColumns.some(column => column.name === 'tax_code_snapshot')) db.exec('ALTER TABLE order_lines ADD COLUMN tax_code_snapshot TEXT');
+if (!orderLineTaxColumns.some(column => column.name === 'tax_rate_bps')) {
+  db.exec('ALTER TABLE order_lines ADD COLUMN tax_rate_bps INTEGER NOT NULL DEFAULT 0 CHECK(tax_rate_bps BETWEEN 0 AND 10000)');
+  db.exec('UPDATE order_lines SET tax_rate_bps=COALESCE((SELECT tax_rate_bps FROM orders WHERE orders.id=order_lines.order_id),0)');
+}
 const outletColumns = db.pragma('table_info(outlets)') as Array<{ name: string }>;
 if (!outletColumns.some(column => column.name === 'tax_rate_bps')) {
   db.exec('ALTER TABLE outlets ADD COLUMN tax_rate_bps INTEGER NOT NULL DEFAULT 0 CHECK(tax_rate_bps BETWEEN 0 AND 10000)');
@@ -103,12 +112,13 @@ const seed = db.transaction(() => {
     stationNames.forEach((name, index) => insertStation.run(`demo-station-${index + 1}`, DEMO_TENANT, DEMO_OUTLET, name, index));
   }
   const insert = db.prepare(`INSERT OR IGNORE INTO menu_items
-    (id,tenant_id,outlet_id,name,category,price_minor,emoji,color,tag,vegetarian,available,kitchen_station)
-    VALUES(@id,@tenantId,@outletId,@name,@category,@priceMinor,@emoji,@color,@tag,@vegetarian,@available,@kitchenStation)`);
+      (id,tenant_id,outlet_id,name,category,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,tax_code,tax_rate_bps)
+    VALUES(@id,@tenantId,@outletId,@name,@category,@priceMinor,@emoji,@color,@tag,@vegetarian,@available,@kitchenStation,@taxCode,@taxRateBps)`);
   if (process.env.NODE_ENV !== 'production') for (const item of DEMO_MENU) insert.run({
     id:item.id,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,name:item.name,category:item.category,
     priceMinor:item.priceMinor,emoji:item.emoji,color:item.color,tag:item.tag??null,
     vegetarian:item.vegetarian?1:0,available:item.available?1:0,kitchenStation:item.kitchenStation,
+    taxCode:item.taxCode??null,taxRateBps:item.taxRateBps??null,
   });
   const insertModifier=db.prepare(`INSERT OR IGNORE INTO menu_modifiers
     (id,tenant_id,outlet_id,menu_item_id,group_name,name,price_delta_minor,sort_order)
@@ -379,11 +389,11 @@ export function applyManagedMenuSnapshot(version:string,items:ManagedMenuSnapsho
       .run(syncedAt,DEMO_TENANT,DEMO_OUTLET);
     db.prepare('UPDATE menu_modifiers SET active=0 WHERE tenant_id=? AND outlet_id=?').run(DEMO_TENANT,DEMO_OUTLET);
     const upsertItem=db.prepare(`INSERT INTO menu_items
-      (id,tenant_id,outlet_id,name,category,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,version,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?)
+      (id,tenant_id,outlet_id,name,category,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,tax_code,tax_rate_bps,version,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)
       ON CONFLICT(id) DO UPDATE SET name=excluded.name,category=excluded.category,price_minor=excluded.price_minor,
         emoji=excluded.emoji,color=excluded.color,tag=excluded.tag,vegetarian=excluded.vegetarian,available=excluded.available,
-        kitchen_station=excluded.kitchen_station,version=menu_items.version+1,updated_at=excluded.updated_at
+        kitchen_station=excluded.kitchen_station,tax_code=excluded.tax_code,tax_rate_bps=excluded.tax_rate_bps,version=menu_items.version+1,updated_at=excluded.updated_at
       WHERE menu_items.tenant_id=excluded.tenant_id AND menu_items.outlet_id=excluded.outlet_id`);
     const upsertModifier=db.prepare(`INSERT INTO menu_modifiers
       (id,tenant_id,outlet_id,menu_item_id,group_name,name,price_delta_minor,active,sort_order)
@@ -393,7 +403,7 @@ export function applyManagedMenuSnapshot(version:string,items:ManagedMenuSnapsho
       WHERE menu_modifiers.tenant_id=excluded.tenant_id AND menu_modifiers.outlet_id=excluded.outlet_id`);
     for(const item of items){
       const result=upsertItem.run(item.id,DEMO_TENANT,DEMO_OUTLET,item.name,item.category,item.priceMinor,item.emoji,item.color,
-        item.tag??null,item.vegetarian?1:0,item.available?1:0,item.kitchenStation,syncedAt);
+        item.tag??null,item.vegetarian?1:0,item.available?1:0,item.kitchenStation,item.taxCode??null,item.taxRateBps??null,syncedAt);
       if(result.changes!==1)throw new Error('A menu item ID conflicts with data owned by another outlet.');
       for(const [sortOrder,modifier] of item.modifiers.entries()){
         const modifierResult=upsertModifier.run(modifier.id,DEMO_TENANT,DEMO_OUTLET,item.id,modifier.group,modifier.name,modifier.priceDeltaMinor,sortOrder);

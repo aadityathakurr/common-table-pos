@@ -84,7 +84,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
       client.from("menu_categories").select("category_id,name,sort_order,active")
         .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id)
         .order("sort_order").order("category_id"),
-      client.from("menu_items").select("item_id,category_id,name,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,modifiers,sort_order")
+      client.from("menu_items").select("item_id,category_id,name,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,modifiers,sort_order,tax_code,tax_rate_bps")
         .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id)
         .order("sort_order").order("item_id"),
       client.from("dining_areas").select("area_id,name,sort_order,active")
@@ -144,6 +144,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
         id: item.item_id, name: item.name, category: category.name, priceMinor: Number(item.price_minor),
         emoji: item.emoji, color: item.color, tag: item.tag, vegetarian: item.vegetarian,
         available: item.available && category.active, kitchenStation: item.kitchen_station,
+        taxCode: item.tax_code, taxRateBps: item.tax_rate_bps === null ? null : Number(item.tax_rate_bps),
         modifiers: item.modifiers.map((modifier) => ({ ...modifier, priceDeltaMinor: Number(modifier.priceDeltaMinor) })),
       });
     }

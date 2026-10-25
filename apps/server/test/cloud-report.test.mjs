@@ -100,3 +100,24 @@ test('cloud projections calculate refunds on a later business day from the store
   assert.equal(report.totals.subtotalMinor, -100);
   assert.deepEqual(report.tenders, [{ method: 'upi', amountMinor: -105, paymentCount: 0 }]);
 });
+
+test('cloud tax breakdown keeps item rates separate, including explicit zero, and allocates refund tax', () => {
+  const report = aggregateCloudProjectionReport({
+    ...reportInput,
+    payments: [
+      { order_id: 'mixed-tax', entry_type: 'tender', method: 'upi', amount_minor: '2050', status: 'succeeded' },
+      { order_id: 'mixed-tax', entry_type: 'refund', method: 'upi', amount_minor: '205', status: 'succeeded' },
+    ],
+    orders: [{ order_id: 'mixed-tax', subtotal_minor: '2000', tax_total_minor: '50', total_minor: '2050' }],
+    orderItems: [
+      { order_id: 'mixed-tax', line_id: 'taxed', menu_item_id: 'a', name: 'Taxed item', quantity: 1, line_total_minor: '1000', tax_code: '1101', tax_rate_bps: 500, voided_at: null },
+      { order_id: 'mixed-tax', line_id: 'zero', menu_item_id: 'b', name: 'Zero rate item', quantity: 1, line_total_minor: '1000', tax_code: null, tax_rate_bps: 0, voided_at: null },
+    ],
+    voidedItems: [], shifts: [],
+  });
+  assert.deepEqual(report.taxBreakdown, [
+    { taxCode: null, taxRateBps: 0, taxMinor: 0 },
+    { taxCode: '1101', taxRateBps: 500, taxMinor: 45 },
+  ]);
+  assert.equal(report.taxBreakdown.reduce((sum, row) => sum + row.taxMinor, 0), report.totals.taxTotalMinor);
+});

@@ -59,8 +59,14 @@ export function formatReceipt(order: OrderRecord): Buffer {
     text(`ORDER    ${order.orderNumber}\n`),text(`${new Date(order.createdAt).toLocaleString('en-IN')}\n`),
     text(`${order.orderType==='dine_in'?(order.tableLabel??'Dine in'):'Takeaway'} - ${order.guestCount} guest(s)\n`),text(line()+'\n')];
   for(const item of order.lines.filter(line=>!line.voidedAt)){parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor,order.currency))+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor,order.currency)})`:''}\n`));}
+  const taxes=new Map<string,{code:string|null;rate:number;amount:number}>();
+  for(const item of order.lines.filter(line=>!line.voidedAt)){
+    const rate=item.taxRateBps??order.taxRateBps;const code=item.taxCode??null;const key=`${rate}:${code??''}`;
+    const bucket=taxes.get(key)??{code,rate,amount:0};bucket.amount+=Math.round(item.lineTotalMinor*rate/10000);taxes.set(key,bucket);
+  }
+  const taxRows=[...taxes.values()].sort((a,b)=>a.rate-b.rate||(a.code??'').localeCompare(b.code??''));
   parts.push(text(line()+'\n'),text(columns('Subtotal',money(order.subtotalMinor,order.currency))+'\n'),
-    text(columns(`Tax (demo ${order.taxRateBps/100}%)`,money(order.taxTotalMinor,order.currency))+'\n'),
+    ...taxRows.map(bucket=>text(columns(`Tax ${bucket.rate/100}%${bucket.code?` HSN/SAC ${bucket.code}`:''}`,money(bucket.amount,order.currency))+'\n')),
     command(ESC,0x45,1),text(columns('TOTAL',money(order.totalMinor,order.currency))+'\n'),command(ESC,0x45,0),
     text(columns(`Paid - ${(order.paymentMethod??'cash').toUpperCase()}`,money(order.totalMinor,order.currency))+'\n'),text(line('=')+'\n'),
     command(ESC,0x61,1),text(`${wrap(EDGE_CONFIG.receiptFooter||'Thank you. See you again!').join('\n')}\n\n`),command(GS,0x56,0x41,0x03));

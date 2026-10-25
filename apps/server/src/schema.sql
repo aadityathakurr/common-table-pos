@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS menu_items (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, name TEXT NOT NULL,
   category TEXT NOT NULL, price_minor INTEGER NOT NULL CHECK(price_minor >= 0), emoji TEXT NOT NULL,
   color TEXT NOT NULL, tag TEXT, vegetarian INTEGER NOT NULL DEFAULT 0, available INTEGER NOT NULL DEFAULT 1,
-  kitchen_station TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+  kitchen_station TEXT NOT NULL, tax_code TEXT, tax_rate_bps INTEGER CHECK(tax_rate_bps BETWEEN 0 AND 10000), version INTEGER NOT NULL DEFAULT 1,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id), UNIQUE(tenant_id,outlet_id,id)
 );
@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS order_lines (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, order_id TEXT NOT NULL,
   menu_item_id TEXT NOT NULL, item_name_snapshot TEXT NOT NULL, category_snapshot TEXT NOT NULL,
   unit_price_minor INTEGER NOT NULL, modifiers_json TEXT NOT NULL DEFAULT '[]', quantity REAL NOT NULL CHECK(quantity > 0),
-  line_total_minor INTEGER NOT NULL, kitchen_station TEXT NOT NULL, note TEXT,
+  line_total_minor INTEGER NOT NULL, kitchen_station TEXT NOT NULL, note TEXT, tax_code_snapshot TEXT, tax_rate_bps INTEGER NOT NULL DEFAULT 0 CHECK(tax_rate_bps BETWEEN 0 AND 10000),
   FOREIGN KEY(tenant_id,outlet_id,order_id) REFERENCES orders(tenant_id,outlet_id,id),
   FOREIGN KEY(tenant_id,outlet_id,menu_item_id) REFERENCES menu_items(tenant_id,outlet_id,id)
 );

@@ -18,6 +18,8 @@ function validMenuItem(value:unknown):value is ManagedMenuSnapshotItem{
     &&typeof item.emoji==='string'&&item.emoji.length<=32&&typeof item.color==='string'&&/^#[0-9a-f]{6}$/i.test(item.color)
     &&(item.tag===null||typeof item.tag==='string')&&typeof item.vegetarian==='boolean'&&typeof item.available==='boolean'
     &&typeof item.kitchenStation==='string'&&item.kitchenStation.trim().length>0&&item.kitchenStation.length<=80
+    &&(item.taxCode===undefined||item.taxCode===null||(typeof item.taxCode==='string'&&item.taxCode.trim().length>0&&item.taxCode.length<=30&&!/[\u0000-\u001f\u007f]/.test(item.taxCode)))
+    &&(item.taxRateBps===undefined||item.taxRateBps===null||(Number.isSafeInteger(item.taxRateBps)&&Number(item.taxRateBps)>=0&&Number(item.taxRateBps)<=10_000))
     &&Array.isArray(item.modifiers)&&item.modifiers.length<=32&&item.modifiers.every(modifier=>{
       if(!modifier||typeof modifier!=='object'||Array.isArray(modifier))return false;
       const row=modifier as Record<string,unknown>;
