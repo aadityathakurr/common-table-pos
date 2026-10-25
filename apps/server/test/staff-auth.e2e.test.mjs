@@ -35,10 +35,16 @@ async function waitForReady(baseUrl, child, readLogs) {
 
 test('production edge validates staff identity and enforces cashier, kitchen, viewer and manager permissions', { timeout: 30000 }, async t => {
   const mockPort = await availablePort();
+  let supabaseUnavailable = false;
+  let supabaseAuthRequests = 0;
   const mock = createHttpServer((request, response) => {
     response.setHeader('access-control-allow-origin', '*');
     const token = request.headers.authorization?.replace(/^Bearer /, '') ?? '';
     response.setHeader('content-type', 'application/json');
+    if (request.url?.startsWith('/auth/v1/') || request.url?.startsWith('/rest/v1/tenant_memberships') || request.url?.startsWith('/rest/v1/outlet_memberships')) {
+      supabaseAuthRequests += 1;
+      if (supabaseUnavailable) { response.writeHead(503); response.end(JSON.stringify({ message: 'offline' })); return; }
+    }
     if (request.url === '/auth/v1/user') {
       if (token === 'invalid') { response.writeHead(401); response.end(JSON.stringify({ message: 'invalid token' })); return; }
       const role = token.split(':')[0];
@@ -60,23 +66,28 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
   const port = await availablePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   let output = '';
-  const child = spawn(process.execPath, ['apps/server/dist/index.js'], {
-    cwd: root,
-    env: {
-      ...process.env,
-      NODE_ENV: 'production', PORT: String(port), POS_DATABASE_PATH: join(directory, 'edge.sqlite'),
-      POS_TENANT_ID: 'auth-test-tenant', POS_TENANT_NAME: 'Auth Test Cafe', POS_OUTLET_ID: 'auth-test-outlet',
-      POS_OUTLET_NAME: 'Auth Test Outlet', POS_TERMINAL_ID: 'auth-test-terminal', POS_TERMINAL_NAME: 'Counter 1',
-      POS_LOCATION_LABEL: 'Test outlet', POS_ACTOR_ID: 'test-actor',
-      POS_TAX_RATE_BPS: '500', POS_CURRENCY: 'INR', POS_TIMEZONE: 'Asia/Kolkata', POS_SESSION_SECRET: secret,
-      POS_COOKIE_SECURE: 'false', VITE_SUPABASE_URL: `http://127.0.0.1:${mockPort}`,
-      VITE_SUPABASE_PUBLISHABLE_KEY: 'test-publishable-key', POS_SYNC_URL: '', POS_SYNC_TERMINAL_KEY: '',
-      MOCK_PRINTER_HOST: '127.0.0.1', MOCK_PRINTER_PORT: '0',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  child.stdout.on('data', chunk => { output = (output + chunk.toString()).slice(-5000); });
-  child.stderr.on('data', chunk => { output = (output + chunk.toString()).slice(-5000); });
+  const edgeEnvironment = {
+    ...process.env,
+    NODE_ENV: 'production', PORT: String(port), POS_DATABASE_PATH: join(directory, 'edge.sqlite'),
+    POS_TENANT_ID: 'auth-test-tenant', POS_TENANT_NAME: 'Auth Test Cafe', POS_OUTLET_ID: 'auth-test-outlet',
+    POS_OUTLET_NAME: 'Auth Test Outlet', POS_TERMINAL_ID: 'auth-test-terminal', POS_TERMINAL_NAME: 'Counter 1',
+    POS_LOCATION_LABEL: 'Test outlet', POS_ACTOR_ID: 'test-actor',
+    POS_TAX_RATE_BPS: '500', POS_CURRENCY: 'INR', POS_TIMEZONE: 'Asia/Kolkata', POS_SESSION_SECRET: secret,
+    POS_COOKIE_SECURE: 'false', POS_AUTO_BACKUP: 'false', VITE_SUPABASE_URL: `http://127.0.0.1:${mockPort}`,
+    VITE_SUPABASE_PUBLISHABLE_KEY: 'test-publishable-key', POS_SYNC_URL: '', POS_SYNC_TERMINAL_KEY: '',
+    MOCK_PRINTER_HOST: '127.0.0.1', MOCK_PRINTER_PORT: '0',
+  };
+  function startEdge() {
+    const edge = spawn(process.execPath, ['apps/server/dist/index.js'], {
+      cwd: root,
+      env: edgeEnvironment,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    edge.stdout.on('data', chunk => { output = (output + chunk.toString()).slice(-5000); });
+    edge.stderr.on('data', chunk => { output = (output + chunk.toString()).slice(-5000); });
+    return edge;
+  }
+  let child = startEdge();
   t.after(async () => {
     if (child.exitCode === null) {
       child.kill('SIGTERM');
@@ -192,4 +203,15 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
   const tamperedSignatureChar = manager.cookie[signatureStart] === 'a' ? 'b' : 'a';
   const tamperedCookie = `${manager.cookie.slice(0, signatureStart)}${tamperedSignatureChar}${manager.cookie.slice(signatureStart + 1)}`;
   assert.equal((await fetch(`${baseUrl}/api/orders`, { headers: { cookie: tamperedCookie } })).status, 401);
+
+  const probesBeforeRestart = supabaseAuthRequests;
+  await new Promise(resolve => { child.once('exit', resolve); child.kill('SIGTERM'); });
+  supabaseUnavailable = true;
+  child = startEdge();
+  await waitForReady(baseUrl, child, () => output);
+  const offlineAfterRestart = await fetch(`${baseUrl}/api/orders`, { headers: { cookie: manager.cookie } });
+  assert.equal(offlineAfterRestart.status, 200, 'a verified local session survives edge restart while Supabase is unavailable');
+  assert.equal(supabaseAuthRequests, probesBeforeRestart, 'offline local requests do not contact Supabase Auth or membership APIs');
+  assert.equal((await offlineAfterRestart.json()).length, 0);
+  assert.equal((await fetch(`${baseUrl}/api/orders`)).status, 401, 'restart does not make unauthenticated local access public');
 });
