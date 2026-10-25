@@ -742,5 +742,13 @@ const stopAutomaticBackups=backupSetting==='false'||(backupSetting===undefined&&
   : startAutomaticBackups({database:db,databasePath:DATABASE_PATH,backupDirectory:resolve(process.env.POS_BACKUP_DIR?.trim()||join(dirname(DATABASE_PATH),'backups')),retentionDays:backupRetentionDays,tenantId:EDGE_CONFIG.tenantId,outletId:EDGE_CONFIG.outletId});
 httpServer.listen(port,'0.0.0.0',()=>console.log(`🍽️  Common Table edge server listening on http://0.0.0.0:${port}`));
 let shuttingDown=false;
-function shutdown(){if(shuttingDown)return;shuttingDown=true;httpServer.close();wss.close();printer?.close();stopSyncWorker();void stopAutomaticBackups().finally(()=>db.close());}
+function shutdown(){
+  if(shuttingDown)return;
+  shuttingDown=true;
+  for(const socket of wss.clients)socket.terminate();
+  const httpClosed=new Promise<void>(resolve=>httpServer.close(()=>resolve()));
+  const webSocketsClosed=new Promise<void>(resolve=>wss.close(()=>resolve()));
+  printer?.close();
+  void Promise.allSettled([stopSyncWorker(),stopAutomaticBackups(),httpClosed,webSocketsClosed]).finally(()=>db.close());
+}
 process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);

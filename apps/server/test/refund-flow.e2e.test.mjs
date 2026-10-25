@@ -158,12 +158,35 @@ test('edge order payment refund and shift reports stay idempotent and reconcile 
   assert.equal(remaining.body.tenders[0].refundableMinor, order.totalMinor - 500);
   assert.equal(remaining.body.refunds.length, 1);
 
+  const upiOrderResult = await jsonRequest(baseUrl, '/api/orders', {
+    method: 'POST', body: JSON.stringify({ commandId: randomUUID(), tenantId: context.tenantId, outletId: context.outletId,
+      terminalId: context.terminalId, orderType: 'dine_in', tableLabel: 'Table 04', guestCount: 2,
+      lines: [{ menuItemId: 'indori-poha', quantity: 1 }] }),
+  });
+  assert.equal(upiOrderResult.response.status, 201);
+  const upiOrder = upiOrderResult.body;
+  const upiCommand = { commandId: randomUUID(), shiftId, method: 'upi', amountMinor: upiOrder.totalMinor };
+  const upiPayment = await jsonRequest(baseUrl, `/api/orders/${upiOrder.id}/payment`, {
+    method: 'POST', body: JSON.stringify(upiCommand),
+  });
+  assert.equal(upiPayment.response.status, 200);
+  assert.equal(upiPayment.body.status, 'paid');
+  assert.match(upiPayment.body.invoiceNumber, /^J-INV-/);
+  const upiReplay = await jsonRequest(baseUrl, `/api/orders/${upiOrder.id}/payment`, {
+    method: 'POST', body: JSON.stringify(upiCommand),
+  });
+  assert.equal(upiReplay.response.status, 200, 'retrying the same manual UPI command is idempotent');
+  assert.equal(upiReplay.body.invoiceNumber, upiPayment.body.invoiceNumber);
+  const upiTender = await jsonRequest(baseUrl, `/api/orders/${upiOrder.id}/payments`);
+  assert.deepEqual(upiTender.body.tenders.map(row => [row.method, row.amountMinor]), [['upi', upiOrder.totalMinor]]);
+
   const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
   const report = await jsonRequest(baseUrl, `/api/reports/daily?date=${today}`);
   assert.equal(report.response.status, 200);
-  assert.equal(report.body.totals.salesMinor, order.totalMinor - 500);
+  assert.equal(report.body.totals.salesMinor, order.totalMinor - 500 + upiOrder.totalMinor);
   assert.equal(report.body.refunds.amountMinor, 500);
   assert.equal(report.body.tenders.find(row => row.method === 'cash').amountMinor, order.totalMinor - 500);
+  assert.equal(report.body.tenders.find(row => row.method === 'upi').amountMinor, upiOrder.totalMinor);
 
   const expectedCashMinor = 50000 + order.totalMinor - 500;
   const close = await jsonRequest(baseUrl, `/api/shifts/${shiftId}/close`, {

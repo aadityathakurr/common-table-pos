@@ -171,16 +171,33 @@ async function syncOnce():Promise<void>{
   }finally{sending=false;}
 }
 
-export function startSyncWorker():()=>void{
+export function startSyncWorker():()=>Promise<void>{
   if(!SYNC_CONFIG.url||!SYNC_CONFIG.terminalKey){
     console.log(JSON.stringify({level:'info',event:'sync.disabled',reason:'POS_SYNC_URL or POS_TERMINAL_KEY is not configured.'}));
-    return ()=>undefined;
+    return async()=>undefined;
   }
+  let stopped=false;
+  const inFlight=new Set<Promise<unknown>>();
+  const track=<T>(task:Promise<T>):Promise<T>=>{
+    inFlight.add(task);
+    void task.then(()=>inFlight.delete(task),()=>inFlight.delete(task));
+    return task;
+  };
+  const refreshMenu=()=>stopped?undefined:track(syncMenuOnce());
+  const flushOutbox=()=>stopped?undefined:track(syncOnce());
   // Fetch the current menu baseline first. If pending outbox events exist,
   // starting both workers at once lets syncOnce grab the lock and silently
   // skip the startup menu refresh until the 30 second interval.
-  void syncMenuOnce().finally(()=>void syncOnce());
-  interval=setInterval(()=>void syncOnce(),5_000);
-  menuInterval=setInterval(()=>void syncMenuOnce(),30_000);
-  return ()=>{if(interval)clearInterval(interval);if(menuInterval)clearInterval(menuInterval);};
+  const initialMenuSync=refreshMenu();
+  if(initialMenuSync)void initialMenuSync.then(()=>{if(!stopped)flushOutbox();}).catch(error=>{
+    console.error(JSON.stringify({level:'error',event:'sync.startup_failed',reason:error instanceof Error?error.message:'unknown'}));
+  });
+  interval=setInterval(()=>{void flushOutbox()?.catch(error=>console.error(JSON.stringify({level:'error',event:'sync.worker_failed',reason:error instanceof Error?error.message:'unknown'})));},5_000);
+  menuInterval=setInterval(()=>{void refreshMenu()?.catch(error=>console.error(JSON.stringify({level:'error',event:'menu.sync_worker_failed',reason:error instanceof Error?error.message:'unknown'})));},30_000);
+  return async()=>{
+    stopped=true;
+    if(interval)clearInterval(interval);
+    if(menuInterval)clearInterval(menuInterval);
+    await Promise.allSettled([...inFlight]);
+  };
 }
