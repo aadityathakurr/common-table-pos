@@ -259,6 +259,7 @@ app.post('/api/auth/session',async(req,res)=>{
     return res.json({userId:session.userId,email:session.email,displayName:session.displayName,role:session.role,tenantId:session.tenantId,outletId:session.outletId,expiresAt:session.expiresAt});
   }catch(error){
     const authError=error instanceof StaffAuthError?error:new StaffAuthError('Could not verify this staff session.',503);
+    if(authError.status===403)res.setHeader('Set-Cookie',clearedSessionCookie(EDGE_CONFIG.secureSessionCookie));
     return fail(res,authError.status,authError.message);
   }
 });

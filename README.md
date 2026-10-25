@@ -36,12 +36,13 @@ Use Node.js 22 or newer. In the Common Table manager portal at `/admin`, enroll 
 ```sh
 npm ci
 cp .env.example .env
-# Paste the one-time terminal configuration into .env, then set POS_DATABASE_PATH.
+# Replace the placeholder values with the one-time terminal configuration.
+# Do not append duplicate keys; set POS_DATABASE_PATH to a durable local path.
 npm run build
 npm start
 ```
 
-The copied configuration includes the browser-safe Supabase URL/publishable key, outlet and terminal IDs, a terminal sync key, and a random session-signing secret. Keep `.env` private; do not commit it or put the terminal key or session secret in a `VITE_*` variable. Set `POS_DATABASE_PATH` to a durable local path and configure the selected printer before service. `npm start` forces production mode and fails closed if required outlet configuration is missing. Open `http://localhost:3001/admin`, sign in while online, then open the cashier POS. After that first sign-in, the local session and outlet database work without internet; records sync when the connection returns. The session expires after 30 days without local use or on explicit sign-out. `npm run dev` is for development only and uses a local owner shortcut. The default tax rate is demo data, not a tax configuration for a real outlet.
+The copied configuration includes the browser-safe Supabase URL/publishable key, outlet and terminal IDs, a terminal sync key, and a random session-signing secret. Keep `.env` private; do not commit it or put the terminal key or session secret in a `VITE_*` variable. Set `POS_DATABASE_PATH` to a durable local path and configure the selected printer before service. `npm start` forces production mode and fails closed if required outlet configuration is missing. Open `http://localhost:3001/admin`, sign in while online, then open the cashier POS. After that first sign-in, the local session and outlet database work without internet; records sync when the connection returns. The session expires after 30 days without local use or on explicit sign-out. An explicit online denial of outlet access clears the local session; a network failure does not. `npm run dev` is for development only and uses a local owner shortcut. The default tax rate is demo data, not a tax configuration for a real outlet.
 
 When `apps/web/dist` exists, Express serves the client and API on port 3001. Order, void, payment, and shift audit records use the signed-in staff user's ID.
 

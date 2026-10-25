@@ -108,6 +108,12 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
   assert.equal(cashier.response.status, 200);
   assert.equal(cashier.body.role, 'cashier');
   assert.match(cashier.response.headers.get('set-cookie') ?? '', /HttpOnly/);
+  const revokedMembership = await fetch(`${baseUrl}/api/auth/session`, {
+    method: 'POST', headers: { authorization: 'Bearer no-outlet:token', cookie: cashier.cookie },
+  });
+  assert.equal(revokedMembership.status, 403);
+  assert.match(revokedMembership.headers.get('set-cookie') ?? '', /Max-Age=0/,
+    'an explicit online outlet-access denial clears a previously valid offline cookie');
   const nearExpiry = { ...cashier.body, expiresAt: Math.floor(Date.now() / 1000) + 60 };
   const encodedSession = Buffer.from(JSON.stringify(nearExpiry)).toString('base64url');
   const signedSession = createHmac('sha256', secret).update(encodedSession).digest('base64url');
