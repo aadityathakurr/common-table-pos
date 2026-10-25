@@ -29,14 +29,21 @@ The tracked `supabase/migrations` directory includes the migrations already appl
 
 For hosted sign-up links, configure Supabase **Authentication → URL Configuration** with Site URL `https://common-table-pos.vercel.app` and allow `https://common-table-pos.vercel.app/admin`. The Confirm signup email should link to `{{ .ConfirmationURL }}`, which carries the redirect requested by the manager app. If a custom template constructs a callback URL manually, use `{{ .RedirectTo }}` instead of `{{ .SiteURL }}` for its redirect target. Vercel preview deployments intentionally have no production Supabase credentials.
 
-## Build and run as one edge process
+## Install on a cashier laptop
+
+Use Node.js 22 or newer. In the Common Table manager portal at `/admin`, enroll this laptop as a terminal and copy its one-time edge configuration. On the laptop, install dependencies, keep the outlet database and private configuration on its local disk, then build and start the production server:
 
 ```sh
+npm ci
+cp .env.example .env
+# Paste the one-time terminal configuration into .env, then set POS_DATABASE_PATH.
 npm run build
 npm start
 ```
 
-When `apps/web/dist` exists, Express serves the client and API on port 3001. Copy `.env.example` to `.env` and set the outlet's `POS_*` values before a production run. Production also requires a random `POS_SESSION_SECRET` of at least 32 characters and the Supabase project URL and publishable key. `POS_ACTOR_ID` remains a development fallback; order, void, payment, and shift audit records use the signed-in staff user's ID. The default tax rate is a demo value, not a tax configuration for a real outlet.
+The copied configuration includes the browser-safe Supabase URL/publishable key, outlet and terminal IDs, a terminal sync key, and a random session-signing secret. Keep `.env` private; do not commit it or put the terminal key or session secret in a `VITE_*` variable. Set `POS_DATABASE_PATH` to a durable local path and configure the selected printer before service. `npm start` forces production mode and fails closed if required outlet configuration is missing. Open `http://localhost:3001/admin`, sign in while online, then open the cashier POS. After that first sign-in, the local session and outlet database work without internet; records sync when the connection returns. The session expires after 30 days without local use or on explicit sign-out. `npm run dev` is for development only and uses a local owner shortcut. The default tax rate is demo data, not a tax configuration for a real outlet.
+
+When `apps/web/dist` exists, Express serves the client and API on port 3001. Order, void, payment, and shift audit records use the signed-in staff user's ID.
 
 The server adds an `x-request-id` response header and emits one JSON request log per HTTP request. `GET /api/health` is the liveness endpoint; `GET /api/ready` checks required outlet configuration and SQLite integrity; `GET /api/context` returns the configured outlet identity needed by the POS UI. Protected API routes require a staff session. Sign in through `/admin` on the same outlet edge origin; Supabase verifies the user and outlet membership, then the edge sets a signed `HttpOnly` cookie. Local activity renews this cookie on the laptop, so an active cashier session survives WAN loss and edge/browser restarts without calling Supabase. The cookie expires after 30 days without local use and is cleared on explicit sign-out. If an account is revoked while that laptop is offline, the revocation can only take effect after reconnection. Owner/manager, cashier, kitchen, and viewer roles have separate route permissions. Kitchen API and WebSocket snapshots omit order and item prices. An owner or manager can download `GET /api/support/diagnostics.json` from the outlet edge for a support bundle containing database checks, order-state counts, sync queue health, printer mode, and runtime version. The export omits order/customer records, auth tokens, and database paths.
 
