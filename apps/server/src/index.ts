@@ -60,7 +60,7 @@ function mapOrder(row:Record<string,unknown>):OrderRecord{
   const lines=mapLines(String(row.id));
   return {
     id:String(row.id),commandId:String(row.command_id),tenantId:String(row.tenant_id),outletId:String(row.outlet_id),
-    terminalId:String(row.terminal_id),orderNumber:String(row.order_number),orderType:row.order_type as 'dine_in'|'takeaway',
+    terminalId:String(row.terminal_id),currency:String(row.currency??EDGE_CONFIG.currency),orderNumber:String(row.order_number),orderType:row.order_type as 'dine_in'|'takeaway',
     tableLabel:row.table_label==null?null:String(row.table_label),guestCount:Number(row.guest_count),status:row.status as OrderStatus,
     note:row.note==null?null:String(row.note),createdAt:String(row.created_at),lines,
     taxRateBps:Number(row.tax_rate_bps),subtotalMinor:Number(row.subtotal_minor),taxTotalMinor:Number(row.tax_total_minor),
@@ -195,10 +195,10 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
   const create=db.transaction(()=>{
     const orderNumber=allocateNumber('order','ORD');
     db.prepare(`INSERT INTO orders(id,command_id,tenant_id,outlet_id,terminal_id,order_number,order_type,table_label,guest_count,status,note,currency,subtotal_minor,tax_total_minor,tax_rate_bps,total_minor,created_at,updated_at)
-      VALUES(@id,@commandId,@tenantId,@outletId,@terminalId,@orderNumber,@orderType,@tableLabel,@guestCount,'sent',@note,'INR',@subtotalMinor,@taxTotalMinor,@taxRateBps,@totalMinor,@createdAt,@updatedAt)`).run({
+      VALUES(@id,@commandId,@tenantId,@outletId,@terminalId,@orderNumber,@orderType,@tableLabel,@guestCount,'sent',@note,@currency,@subtotalMinor,@taxTotalMinor,@taxRateBps,@totalMinor,@createdAt,@updatedAt)`).run({
       id:orderId,commandId:command.commandId,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,terminalId:DEMO_TERMINAL,orderNumber,
       orderType:command.orderType,tableLabel:command.orderType==='dine_in'?command.tableLabel:null,guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),
-      note:command.note?.slice(0,140)??null,subtotalMinor,taxTotalMinor,taxRateBps:DEMO_TAX_RATE_BPS,totalMinor,createdAt:timestamp,updatedAt:timestamp,
+      note:command.note?.slice(0,140)??null,currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:DEMO_TAX_RATE_BPS,totalMinor,createdAt:timestamp,updatedAt:timestamp,
     });
     const insertLine=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);

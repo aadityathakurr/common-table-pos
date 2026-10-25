@@ -43,7 +43,7 @@ test('development edge bootstraps the local POS without Supabase credentials', {
       NODE_ENV: 'development', PORT: String(port), POS_DATABASE_PATH: join(directory, 'edge.sqlite'),
       POS_TENANT_ID: 'dev-tenant', POS_TENANT_NAME: 'Development Cafe', POS_OUTLET_ID: 'dev-outlet',
       POS_OUTLET_NAME: 'Development Outlet', POS_TERMINAL_ID: 'dev-terminal', POS_TERMINAL_NAME: 'Counter 1',
-      POS_TAX_RATE_BPS: '0', POS_CURRENCY: 'INR', MOCK_PRINTER_HOST: '127.0.0.1', MOCK_PRINTER_PORT: '0',
+      POS_TAX_RATE_BPS: '0', POS_CURRENCY: 'USD', MOCK_PRINTER_HOST: '127.0.0.1', MOCK_PRINTER_PORT: '0',
       VITE_SUPABASE_URL: '', VITE_SUPABASE_PUBLISHABLE_KEY: '', POS_SESSION_SECRET: '',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -75,5 +75,6 @@ test('development edge bootstraps the local POS without Supabase credentials', {
   assert.equal(orderResponse.status, 201);
   const order = await orderResponse.json();
   assert.equal(order.lines[0].name, 'Indori Poha');
+  assert.equal(order.currency, 'USD');
   assert.equal(order.status, 'sent');
 });

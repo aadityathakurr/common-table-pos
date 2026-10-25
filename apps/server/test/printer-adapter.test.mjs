@@ -17,11 +17,17 @@ test('network printer adapter sends the exact ESC/POS bytes over TCP', async () 
         process.env.POS_PRINTER_MODE = 'network';
         process.env.POS_PRINTER_HOST = '127.0.0.1';
         process.env.POS_PRINTER_PORT = String(port);
+        process.env.POS_CURRENCY = 'INR';
         const printer = await import('../dist/printer.js?network-adapter-test');
         const payload = Buffer.from([0x1b, 0x40, 0x48, 0x69, 0x0a, 0x1d, 0x56, 0x41, 0x03]);
         assert.deepEqual(printer.printerStatus(), { mode: 'network', host: '127.0.0.1', port });
         await printer.sendToPrinter(payload);
         assert.deepEqual(await receivedPayload, payload);
+        const receipt = printer.formatReceipt({ id: 'order-1', commandId: 'cmd-1', tenantId: 'tenant-1', outletId: 'outlet-1',
+          terminalId: 'terminal-1', orderNumber: 'J-ORD-000001', orderType: 'takeaway', tableLabel: null, guestCount: 1,
+          status: 'paid', note: null, createdAt: new Date().toISOString(), lines: [], currency: 'USD', taxRateBps: 0,
+          subtotalMinor: 250, taxTotalMinor: 0, totalMinor: 250 });
+        assert.match(receipt.toString('ascii'), /USD\s+2\.50/);
         server.close();
         resolve();
       } catch (error) {

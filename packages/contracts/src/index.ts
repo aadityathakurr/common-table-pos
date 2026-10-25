@@ -87,6 +87,7 @@ export interface OrderRecord extends KitchenOrder {
   outletId: string;
   terminalId: string;
   guestCount: number;
+  currency: string;
   invoiceNumber?: string;
   taxRateBps: number;
   subtotalMinor: number;

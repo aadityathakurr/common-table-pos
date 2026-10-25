@@ -30,7 +30,7 @@ function wrap(text: string, width=WIDTH): string[] {
 }
 function command(...bytes: number[]): Buffer { return Buffer.from(bytes); }
 function text(value: string): Buffer { return Buffer.from(value.replace(/[^\x20-\x7E\n\r]/g,'?'),'ascii'); }
-function money(minor: number): string { return `Rs ${(minor/100).toFixed(2)}`; }
+function money(minor: number, currency=EDGE_CONFIG.currency): string { return `${currency === 'INR' ? 'Rs' : currency} ${(minor/100).toFixed(2)}`; }
 function readableReceipt(raw:Buffer):string{
   return raw.toString('latin1')
     .replace(/\x1b\x40|\x1b[\x61\x45][\s\S]/g,'')
@@ -53,11 +53,11 @@ export function formatReceipt(order: OrderRecord): Buffer {
     text(`${EDGE_CONFIG.locationLabel}\n`),text(line('=')+'\n'),text(`INVOICE  ${order.invoiceNumber??'PENDING'}\n`),
     text(`ORDER    ${order.orderNumber}\n`),text(`${new Date(order.createdAt).toLocaleString('en-IN')}\n`),
     text(`${order.orderType==='dine_in'?(order.tableLabel??'Dine in'):'Takeaway'} - ${order.guestCount} guest(s)\n`),text(line()+'\n')];
-  for(const item of order.lines.filter(line=>!line.voidedAt)){parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor))+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor)})`:''}\n`));}
-  parts.push(text(line()+'\n'),text(columns('Subtotal',money(order.subtotalMinor))+'\n'),
-    text(columns(`Tax (demo ${order.taxRateBps/100}%)`,money(order.taxTotalMinor))+'\n'),
-    command(ESC,0x45,1),text(columns('TOTAL',money(order.totalMinor))+'\n'),command(ESC,0x45,0),
-    text(columns(`Paid - ${(order.paymentMethod??'cash').toUpperCase()}`,money(order.totalMinor))+'\n'),text(line('=')+'\n'),
+  for(const item of order.lines.filter(line=>!line.voidedAt)){parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor,order.currency))+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor,order.currency)})`:''}\n`));}
+  parts.push(text(line()+'\n'),text(columns('Subtotal',money(order.subtotalMinor,order.currency))+'\n'),
+    text(columns(`Tax (demo ${order.taxRateBps/100}%)`,money(order.taxTotalMinor,order.currency))+'\n'),
+    command(ESC,0x45,1),text(columns('TOTAL',money(order.totalMinor,order.currency))+'\n'),command(ESC,0x45,0),
+    text(columns(`Paid - ${(order.paymentMethod??'cash').toUpperCase()}`,money(order.totalMinor,order.currency))+'\n'),text(line('=')+'\n'),
     command(ESC,0x61,1),text('Thank you. See you again!\n\n'),command(GS,0x56,0x41,0x03));
   return Buffer.concat(parts);
 }
