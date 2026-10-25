@@ -7,10 +7,10 @@ import { DEMO_MENU, type MenuItem, type OutletLayoutConfig } from '@common-table
 import { applyOutletRuntimeSettings, EDGE_CONFIG, type OutletRuntimeSettings } from './config.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const databasePath = resolve(process.env.POS_DATABASE_PATH ?? '.data/common-table.db');
-mkdirSync(dirname(databasePath), { recursive: true });
+export const DATABASE_PATH = resolve(process.env.POS_DATABASE_PATH ?? '.data/common-table.db');
+mkdirSync(dirname(DATABASE_PATH), { recursive: true });
 
-export const db = new Database(databasePath);
+export const db = new Database(DATABASE_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = FULL');
 db.pragma('foreign_keys = ON');

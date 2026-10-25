@@ -3,15 +3,16 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AddOrderLinesCommand, CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderLineDraft, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
-import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, enqueueSyncEvent, localInventoryBalances, recordPaidOrderInventoryConsumption, syncOutboxStatus } from './database.js';
+import { allocateNumber, createId, db, DATABASE_PATH, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, enqueueSyncEvent, localInventoryBalances, recordPaidOrderInventoryConsumption, syncOutboxStatus } from './database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
 import { formatKitchenTicket, formatReceipt, printerStatus, sendToPrinter, startPrinterAdapter } from './printer.js';
 import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from './reports.js';
 import { getSyncStatus, startSyncWorker } from './sync.js';
 import { clearedSessionCookie, createStaffSession, currentStaff, readStaffSession, readStaffSessionCookie, refreshStaffSession, requireRoles, sessionCookie, sessionMiddleware, StaffAuthError } from './auth.js';
+import { startAutomaticBackups } from './automatic-backup.js';
 
 const app=express();
 const httpServer=createServer(app);
@@ -692,6 +693,14 @@ wss.on('connection',(webSocket,request)=>{
 
 const printer=startPrinterAdapter();
 const stopSyncWorker=startSyncWorker();
+const backupSetting=process.env.POS_AUTO_BACKUP?.trim().toLowerCase();
+if(backupSetting!==undefined&&backupSetting!=='true'&&backupSetting!=='false')throw new Error('POS_AUTO_BACKUP must be true or false.');
+const backupRetentionDays=Number(process.env.POS_AUTO_BACKUP_RETENTION_DAYS??7);
+if(!Number.isSafeInteger(backupRetentionDays)||backupRetentionDays<1||backupRetentionDays>365)throw new Error('POS_AUTO_BACKUP_RETENTION_DAYS must be an integer from 1 to 365.');
+const stopAutomaticBackups=backupSetting==='false'||(backupSetting===undefined&&process.env.NODE_ENV!=='production')
+  ? async()=>{}
+  : startAutomaticBackups({database:db,databasePath:DATABASE_PATH,backupDirectory:resolve(process.env.POS_BACKUP_DIR?.trim()||join(dirname(DATABASE_PATH),'backups')),retentionDays:backupRetentionDays,tenantId:EDGE_CONFIG.tenantId,outletId:EDGE_CONFIG.outletId});
 httpServer.listen(port,'0.0.0.0',()=>console.log(`🍽️  Common Table edge server listening on http://0.0.0.0:${port}`));
-function shutdown(){httpServer.close();wss.close();printer?.close();stopSyncWorker();db.close();}
+let shuttingDown=false;
+function shutdown(){if(shuttingDown)return;shuttingDown=true;httpServer.close();wss.close();printer?.close();stopSyncWorker();void stopAutomaticBackups().finally(()=>db.close());}
 process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);
