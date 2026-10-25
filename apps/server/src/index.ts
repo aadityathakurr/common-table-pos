@@ -328,6 +328,27 @@ app.get('/api/orders/:orderId/payments',requireRoles('owner','manager'),(req,res
   return res.json({tenders:tenders.map(row=>({...row,amountMinor:Number(row.amountMinor),refundableMinor:Number(row.refundableMinor)})),refunds});
 });
 app.get('/api/sync/status',requireRoles('owner','manager','cashier','kitchen','viewer'),(_req,res)=>res.json({...getSyncStatus(),outbox:syncOutboxStatus()}));
+app.get('/api/support/diagnostics.json',requireRoles('owner','manager'),(_req,res)=>{
+  const integrity=(db.pragma('quick_check') as Array<{quick_check?:string}>).map(row=>row.quick_check??'unknown');
+  const foreignKeyViolations=(db.pragma('foreign_key_check') as unknown[]).length;
+  const availableMenuItems=Number((db.prepare('SELECT COUNT(*) AS count FROM menu_items WHERE tenant_id=? AND outlet_id=? AND available=1')
+    .get(DEMO_TENANT,DEMO_OUTLET) as {count:number}).count);
+  const orderStates=db.prepare('SELECT status,COUNT(*) AS count FROM orders WHERE tenant_id=? AND outlet_id=? GROUP BY status ORDER BY status')
+    .all(DEMO_TENANT,DEMO_OUTLET) as Array<{status:string;count:number}>;
+  const sync=getSyncStatus();
+  const outbox=syncOutboxStatus();
+  res.setHeader('content-type','application/json; charset=utf-8');
+  res.setHeader('content-disposition','attachment; filename="common-table-edge-diagnostics.json"');
+  return res.json({
+    generatedAt:new Date().toISOString(),service:'common-table-edge',
+    outlet:{tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,name:EDGE_CONFIG.outletName,terminalId:DEMO_TERMINAL},
+    process:{node:process.version,uptimeSeconds:Math.floor(process.uptime())},
+    database:{integrity:integrity.length===1&&integrity[0]==='ok'?'ok':'failed',foreignKeyViolations,availableMenuItems,orderStates},
+    sync:{configured:sync.configured,pending:outbox.pending,failed:outbox.failed,lastSyncedAt:outbox.lastSyncedAt,
+      errorPresent:Boolean(sync.lastError),menu:{version:sync.menu?.version??null,lastSyncedAt:sync.menu?.lastSyncedAt??null,errorPresent:Boolean(sync.menu?.lastError)}},
+    printer:printerStatus(),
+  });
+});
 app.get('/api/shifts/current',requireRoles('owner','manager','cashier'),(_req,res)=>{
   const row=db.prepare("SELECT id FROM shifts WHERE tenant_id=? AND outlet_id=? AND status='open'").get(DEMO_TENANT,DEMO_OUTLET) as {id:string}|undefined;
   return res.json({shift:row?shiftSummary(row.id):null});

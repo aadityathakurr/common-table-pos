@@ -107,6 +107,7 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
   assert.equal(cashier.response.status, 200);
   assert.equal(cashier.body.role, 'cashier');
   assert.match(cashier.response.headers.get('set-cookie') ?? '', /HttpOnly/);
+  assert.equal((await fetch(`${baseUrl}/api/support/diagnostics.json`, { headers: { cookie: cashier.cookie } })).status, 403);
   const cashierKitchen = await fetch(`${baseUrl}/api/kitchen`, { headers: { cookie: cashier.cookie } });
   assert.equal(cashierKitchen.status, 403);
   const cashierVoid = await fetch(`${baseUrl}/api/orders/missing/void`, {
@@ -124,14 +125,26 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
   assert.equal(kitchen.response.status, 200);
   assert.equal((await fetch(`${baseUrl}/api/kitchen`, { headers: { cookie: kitchen.cookie } })).status, 200);
   assert.equal((await fetch(`${baseUrl}/api/orders`, { headers: { cookie: kitchen.cookie } })).status, 403);
+  assert.equal((await fetch(`${baseUrl}/api/support/diagnostics.json`, { headers: { cookie: kitchen.cookie } })).status, 403);
 
   const viewer = await authenticate('viewer');
   assert.equal(viewer.response.status, 200);
   assert.equal((await fetch(`${baseUrl}/api/reports/daily`, { headers: { cookie: viewer.cookie } })).status, 200);
   assert.equal((await fetch(`${baseUrl}/api/orders`, { headers: { cookie: viewer.cookie } })).status, 403);
+  assert.equal((await fetch(`${baseUrl}/api/support/diagnostics.json`, { headers: { cookie: viewer.cookie } })).status, 403);
 
   const manager = await authenticate('manager');
   assert.equal(manager.response.status, 200);
+  const diagnosticsResponse = await fetch(`${baseUrl}/api/support/diagnostics.json`, { headers: { cookie: manager.cookie } });
+  assert.equal(diagnosticsResponse.status, 200);
+  assert.match(diagnosticsResponse.headers.get('content-disposition') ?? '', /common-table-edge-diagnostics\.json/);
+  const diagnostics = await diagnosticsResponse.json();
+  assert.equal(diagnostics.database.integrity, 'ok');
+  assert.equal(diagnostics.database.foreignKeyViolations, 0);
+  assert.equal(diagnostics.database.availableMenuItems, 0, 'the isolated auth test outlet starts with an empty menu');
+  assert.equal(diagnostics.outlet.outletId, 'auth-test-outlet');
+  assert.equal(diagnostics.process.node, process.version);
+  assert.equal(JSON.stringify(diagnostics).includes('test-publishable-key'), false, 'support diagnostics never export auth credentials');
   assert.equal((await fetch(`${baseUrl}/api/orders/missing/void`, {
     method: 'POST', headers: { cookie: manager.cookie, 'content-type': 'application/json' },
     body: JSON.stringify({ commandId: 'manager-void-command', reason: 'test reason' }),
