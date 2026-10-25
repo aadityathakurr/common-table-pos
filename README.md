@@ -21,7 +21,7 @@ cp .env.example .env # optional for the local demo; use POS_* values for a real 
 npm run dev
 ```
 
-Vite serves the web client on port 5173 and proxies API/WebSocket traffic to the edge server on port 3001. From the server workspace, the edge server creates `apps/server/.data/common-table.db` in SQLite WAL mode and starts its mock ESC/POS TCP listener on `127.0.0.1:9100`.
+Vite serves the web client on port 5173 and proxies API/WebSocket traffic to the edge server's `PORT` (3001 by default). Set `POS_API_PROXY` when the edge runs at a different address. From the server workspace, the edge server creates `apps/server/.data/common-table.db` in SQLite WAL mode and starts its mock ESC/POS TCP listener on `127.0.0.1:9100`.
 
 ## Supabase schema and local Auth
 
