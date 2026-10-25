@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AddOrderLinesCommand, CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderLineDraft, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
-import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TAX_RATE_BPS, DEMO_TENANT, DEMO_TERMINAL, enqueueSyncEvent, syncOutboxStatus } from './database.js';
+import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, enqueueSyncEvent, syncOutboxStatus } from './database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
 import { formatKitchenTicket, formatReceipt, printerStatus, sendToPrinter, startPrinterAdapter } from './printer.js';
 import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from './reports.js';
@@ -189,7 +189,7 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
   if(command.orderType==='dine_in'&&!command.tableLabel?.trim())throw new Error('Choose a table for dine-in orders.');
   const prepared=prepareLines(command.lines);
   const subtotalMinor=prepared.reduce((sum,line)=>sum+line.lineTotalMinor,0);
-  const taxTotalMinor=Math.round(subtotalMinor*DEMO_TAX_RATE_BPS/10000);
+  const taxTotalMinor=Math.round(subtotalMinor*EDGE_CONFIG.taxRateBps/10000);
   const totalMinor=subtotalMinor+taxTotalMinor;
   const orderId=randomUUID();const timestamp=new Date().toISOString();
   const create=db.transaction(()=>{
@@ -198,7 +198,7 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
       VALUES(@id,@commandId,@tenantId,@outletId,@terminalId,@orderNumber,@orderType,@tableLabel,@guestCount,'sent',@note,@currency,@subtotalMinor,@taxTotalMinor,@taxRateBps,@totalMinor,@createdAt,@updatedAt)`).run({
       id:orderId,commandId:command.commandId,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,terminalId:DEMO_TERMINAL,orderNumber,
       orderType:command.orderType,tableLabel:command.orderType==='dine_in'?command.tableLabel:null,guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),
-      note:command.note?.slice(0,140)??null,currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:DEMO_TAX_RATE_BPS,totalMinor,createdAt:timestamp,updatedAt:timestamp,
+      note:command.note?.slice(0,140)??null,currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,
     });
     const insertLine=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
@@ -210,7 +210,7 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
     enqueueSyncEvent('order',orderId,'order.created',{id:orderId,commandId:command.commandId,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,
       terminalId:DEMO_TERMINAL,orderNumber,orderType:command.orderType,tableLabel:command.orderType==='dine_in'?command.tableLabel:null,
       guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),status:'sent',note:command.note?.slice(0,140)??null,
-      currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:DEMO_TAX_RATE_BPS,totalMinor,createdAt:timestamp,updatedAt:timestamp,
+      currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,
       lines:prepared.map(line=>({id:line.id,menuItemId:line.menuItemId,name:line.name,category:line.category,quantity:line.quantity,
         unitPriceMinor:line.basePriceMinor,lineTotalMinor:line.lineTotalMinor,kitchenStation:line.kitchenStation,note:line.note,modifiers:line.modifiers}))},timestamp);
   });
@@ -219,11 +219,11 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
   return {order,duplicate:false};
 }
 
-app.get('/api/health',(_req,res)=>res.json({status:'ok',service:'common-table-edge',outletId:DEMO_OUTLET,taxRateBps:DEMO_TAX_RATE_BPS,printer:printerStatus()}));
+app.get('/api/health',(_req,res)=>res.json({status:'ok',service:'common-table-edge',outletId:DEMO_OUTLET,taxRateBps:EDGE_CONFIG.taxRateBps,printer:printerStatus()}));
 app.get('/api/context',(_req,res)=>res.json({
   tenantId:DEMO_TENANT,tenantName:EDGE_CONFIG.tenantName,outletId:DEMO_OUTLET,outletName:EDGE_CONFIG.outletName,
   terminalId:DEMO_TERMINAL,terminalName:EDGE_CONFIG.terminalName,locationLabel:EDGE_CONFIG.locationLabel,
-  currency:EDGE_CONFIG.currency,timeZone:EDGE_CONFIG.timezone,taxRateBps:DEMO_TAX_RATE_BPS,
+  currency:EDGE_CONFIG.currency,timeZone:EDGE_CONFIG.timezone,taxRateBps:EDGE_CONFIG.taxRateBps,
 }));
 app.get('/api/ready',(_req,res)=>{
   try{

@@ -12,7 +12,7 @@ function integerSetting(name: string, developmentFallback: number): number {
   return value;
 }
 
-export const EDGE_CONFIG = Object.freeze({
+export const EDGE_CONFIG = {
   tenantId: setting('POS_TENANT_ID', 'tenant-common-table-demo'),
   tenantName: setting('POS_TENANT_NAME', 'Indore Mithai House Demo'),
   outletId: setting('POS_OUTLET_ID', 'outlet-vijay-nagar-demo'),
@@ -28,7 +28,39 @@ export const EDGE_CONFIG = Object.freeze({
   supabaseUrl: process.env.VITE_SUPABASE_URL?.trim() ?? '',
   supabasePublishableKey: process.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim() ?? '',
   secureSessionCookie: process.env.POS_COOKIE_SECURE?.trim() === 'true' || (process.env.NODE_ENV === 'production' && process.env.POS_COOKIE_SECURE?.trim() !== 'false'),
-});
+};
+
+export interface OutletRuntimeSettings {
+  name: string;
+  timezone: string;
+  currency: string;
+  taxRateBps: number;
+}
+
+export function parseOutletRuntimeSettings(value: unknown): OutletRuntimeSettings {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('The cloud outlet settings are invalid.');
+  const row = value as Record<string, unknown>;
+  const name = typeof row.name === 'string' ? row.name.trim() : '';
+  const timezone = typeof row.timezone === 'string' ? row.timezone.trim() : '';
+  const currency = typeof row.currency === 'string' ? row.currency.trim().toUpperCase() : '';
+  const taxRateBps = Number(row.taxRateBps);
+  if (!name || name.length > 120) throw new Error('The cloud outlet name is invalid.');
+  if (!timezone || timezone.length > 80) throw new Error('The cloud outlet timezone is invalid.');
+  try { new Intl.DateTimeFormat('en-US', { timeZone: timezone }); }
+  catch { throw new Error('The cloud outlet timezone is invalid.'); }
+  if (!/^[A-Z]{3}$/.test(currency)) throw new Error('The cloud outlet currency is invalid.');
+  if (!Number.isSafeInteger(taxRateBps) || taxRateBps < 0 || taxRateBps > 10_000) throw new Error('The cloud outlet tax rate is invalid.');
+  return { name, timezone, currency, taxRateBps };
+}
+
+export function applyOutletRuntimeSettings(value: unknown): OutletRuntimeSettings {
+  const settings = parseOutletRuntimeSettings(value);
+  EDGE_CONFIG.outletName = settings.name;
+  EDGE_CONFIG.timezone = settings.timezone;
+  EDGE_CONFIG.currency = settings.currency;
+  EDGE_CONFIG.taxRateBps = settings.taxRateBps;
+  return settings;
+}
 
 const configuredSupabaseUrl = (process.env.POS_SYNC_URL?.trim()
   ?? `${(process.env.VITE_SUPABASE_URL ?? '').trim().replace(/\/$/, '')}/functions/v1/pos-sync`).trim();

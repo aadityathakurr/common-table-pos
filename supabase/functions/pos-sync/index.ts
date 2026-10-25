@@ -78,7 +78,9 @@ Deno.serve(async (request: Request): Promise<Response> => {
   await recordTerminalSeen(client, terminal);
 
   if (request.method === "GET") {
-    const [categoryResult, itemResult] = await Promise.all([
+    const [outletResult, categoryResult, itemResult] = await Promise.all([
+      client.from("outlets").select("name,timezone,currency,tax_rate_bps")
+        .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id).maybeSingle(),
       client.from("menu_categories").select("category_id,name,sort_order,active")
         .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id)
         .order("sort_order").order("category_id"),
@@ -86,9 +88,25 @@ Deno.serve(async (request: Request): Promise<Response> => {
         .eq("tenant_id", terminal.tenant_id).eq("outlet_id", terminal.outlet_id)
         .order("sort_order").order("item_id"),
     ]);
-    if (categoryResult.error || itemResult.error) {
-      console.error(JSON.stringify({ event: "pos_sync.menu_read_failed", code: categoryResult.error?.code ?? itemResult.error?.code }));
-      return json(503, { error: "The outlet menu could not be read. Retry safely." });
+    if (outletResult.error || !outletResult.data || categoryResult.error || itemResult.error) {
+      console.error(JSON.stringify({ event: "pos_sync.snapshot_read_failed", code: outletResult.error?.code ?? categoryResult.error?.code ?? itemResult.error?.code }));
+      return json(503, { error: "The outlet configuration could not be read. Retry safely." });
+    }
+    const outletConfig = {
+      name: outletResult.data.name.trim(),
+      timezone: outletResult.data.timezone.trim(),
+      currency: outletResult.data.currency.trim().toUpperCase(),
+      taxRateBps: Number(outletResult.data.tax_rate_bps),
+    };
+    try {
+      if (!outletConfig.name.trim() || outletConfig.name.length > 120 || !outletConfig.timezone.trim()
+        || outletConfig.timezone.length > 80 || !/^[A-Z]{3}$/.test(outletConfig.currency)
+        || !Number.isSafeInteger(outletConfig.taxRateBps) || outletConfig.taxRateBps < 0 || outletConfig.taxRateBps > 10_000) {
+        throw new Error("invalid settings");
+      }
+      new Intl.DateTimeFormat("en-US", { timeZone: outletConfig.timezone });
+    } catch {
+      return json(503, { error: "The outlet settings are invalid. Correct them in the manager portal and retry." });
     }
     const categories = new Map((categoryResult.data ?? []).map((category) => [category.category_id, category]));
     const items = [];
@@ -104,12 +122,12 @@ Deno.serve(async (request: Request): Promise<Response> => {
         modifiers: item.modifiers.map((modifier) => ({ ...modifier, priceDeltaMinor: Number(modifier.priceDeltaMinor) })),
       });
     }
-    const versionBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(items))));
+    const versionBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify({ outletConfig, items }))));
     const version = [...versionBytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
     const etag = `"${version}"`;
     const headers = { etag, "x-pos-menu-version": version };
     if (ifNoneMatchMatches(request.headers.get("if-none-match"), etag)) return noContent(304, headers);
-    return json(200, { tenantId: terminal.tenant_id, outletId: terminal.outlet_id, version, items }, headers);
+    return json(200, { tenantId: terminal.tenant_id, outletId: terminal.outlet_id, version, outletConfig, items }, headers);
   }
 
   const contentLength = Number(request.headers.get("content-length") ?? "0");

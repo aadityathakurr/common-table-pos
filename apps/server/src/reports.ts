@@ -2,17 +2,15 @@ import type { DailySalesReport, PaymentMethod } from '@common-table/contracts';
 import { EDGE_CONFIG } from './config.js';
 import { db } from './database.js';
 
-const zonedParts = new Intl.DateTimeFormat('en-CA', {
-  timeZone: EDGE_CONFIG.timezone,
-  year: 'numeric', month: '2-digit', day: '2-digit',
-  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
-});
-
 function localMidnightUtc(year: number, month: number, day: number): Date {
   const target = Date.UTC(year, month - 1, day);
   let candidate = target;
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const parts = Object.fromEntries(zonedParts.formatToParts(new Date(candidate))
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+      timeZone: EDGE_CONFIG.timezone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+    }).formatToParts(new Date(candidate))
       .filter(part => part.type !== 'literal').map(part => [part.type, part.value])) as Record<string, string>;
     const observed = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second));
     const correction = target - observed;

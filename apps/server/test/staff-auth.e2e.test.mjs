@@ -141,6 +141,9 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
     body: JSON.stringify({ commandId: 'manager-refund-command', paymentId: 'p', shiftId: 's', amountMinor: 1, reason: 'test' }),
   })).status, 404);
 
-  const tamperedCookie = `${manager.cookie.slice(0, -1)}x`;
+  const signatureStart = manager.cookie.indexOf('.') + 1;
+  assert.ok(signatureStart > 0, 'the signed session cookie has a payload and signature');
+  const tamperedSignatureChar = manager.cookie[signatureStart] === 'a' ? 'b' : 'a';
+  const tamperedCookie = `${manager.cookie.slice(0, signatureStart)}${tamperedSignatureChar}${manager.cookie.slice(signatureStart + 1)}`;
   assert.equal((await fetch(`${baseUrl}/api/orders`, { headers: { cookie: tamperedCookie } })).status, 401);
 });

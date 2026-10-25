@@ -1,5 +1,5 @@
 import { acknowledgeSyncEvents, applyManagedMenuSnapshot, failSyncEvents, managedMenuSyncState, markManagedMenuChecked, pendingSyncEvents, recordManagedMenuSyncError, syncOutboxStatus, type ManagedMenuSnapshotItem } from './database.js';
-import { EDGE_CONFIG, SYNC_CONFIG } from './config.js';
+import { EDGE_CONFIG, parseOutletRuntimeSettings, SYNC_CONFIG } from './config.js';
 
 let sending = false;
 let interval: NodeJS.Timeout | undefined;
@@ -47,15 +47,16 @@ export async function syncMenuOnce():Promise<void>{
       menuError=null;
       return;
     }
-    const result=await response.json().catch(()=>({})) as {tenantId?:unknown;outletId?:unknown;version?:unknown;items?:unknown;error?:unknown};
+    const result=await response.json().catch(()=>({})) as {tenantId?:unknown;outletId?:unknown;version?:unknown;outletConfig?:unknown;items?:unknown;error?:unknown};
     if(!response.ok)throw new Error(typeof result.error==='string'?result.error:`Menu sync returned HTTP ${response.status}.`);
     if(result.tenantId!==EDGE_CONFIG.tenantId||result.outletId!==EDGE_CONFIG.outletId)
       throw new Error('The cloud menu belongs to a different outlet.');
+    const outletConfig=parseOutletRuntimeSettings(result.outletConfig);
     if(typeof result.version!=='string'||!/^[0-9a-f]{64}$/.test(result.version)||!Array.isArray(result.items)
       ||result.items.length>5000||!result.items.every(validMenuItem))throw new Error('The cloud returned an invalid menu snapshot.');
     const ids=new Set((result.items as ManagedMenuSnapshotItem[]).map(item=>item.id));
     if(ids.size!==(result.items as ManagedMenuSnapshotItem[]).length)throw new Error('The cloud menu contains duplicate item IDs.');
-    applyManagedMenuSnapshot(result.version,result.items as ManagedMenuSnapshotItem[]);
+    applyManagedMenuSnapshot(result.version,result.items as ManagedMenuSnapshotItem[],outletConfig);
     menuError=null;
     console.log(JSON.stringify({level:'info',event:'menu.sync_succeeded',count:result.items.length,version:result.version}));
   }catch(error){
