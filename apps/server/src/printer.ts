@@ -5,8 +5,18 @@ import { EDGE_CONFIG } from './config.js';
 const ESC = 0x1b;
 const GS = 0x1d;
 const WIDTH = 48;
-const printerHost = process.env.MOCK_PRINTER_HOST ?? '127.0.0.1';
-const printerPort = Number(process.env.MOCK_PRINTER_PORT ?? 9100);
+export type PrinterMode = 'mock' | 'network' | 'disabled';
+const configuredMode = process.env.POS_PRINTER_MODE?.trim() as PrinterMode | undefined;
+const printerMode: PrinterMode = configuredMode ?? (process.env.NODE_ENV === 'production' ? 'disabled' : 'mock');
+if (!['mock', 'network', 'disabled'].includes(printerMode)) throw new Error('POS_PRINTER_MODE must be mock, network, or disabled.');
+if (printerMode === 'mock' && process.env.NODE_ENV === 'production') throw new Error('The mock printer is not allowed in production. Configure a network printer or disable printing.');
+const printerHost = printerMode === 'network'
+  ? process.env.POS_PRINTER_HOST?.trim() ?? ''
+  : process.env.MOCK_PRINTER_HOST?.trim() || '127.0.0.1';
+const printerPort = Number(printerMode === 'network' ? process.env.POS_PRINTER_PORT ?? 9100 : process.env.MOCK_PRINTER_PORT ?? 9100);
+if (printerMode === 'network' && (!printerHost || !Number.isInteger(printerPort) || printerPort < 1 || printerPort > 65535)) {
+  throw new Error('Configure POS_PRINTER_HOST and a valid POS_PRINTER_PORT for the network printer.');
+}
 
 function line(char='-'): string { return char.repeat(WIDTH); }
 function columns(left: string, right: string): string {
@@ -53,6 +63,7 @@ export function formatReceipt(order: OrderRecord): Buffer {
 }
 
 export function startMockPrinter(): net.Server {
+  if (printerMode !== 'mock') throw new Error('The mock printer is only available when POS_PRINTER_MODE=mock.');
   const server=net.createServer(socket=>{
     const buffers:Buffer[]=[];socket.on('data',chunk=>buffers.push(chunk));socket.on('end',()=>{
       const raw=Buffer.concat(buffers);const printable=readableReceipt(raw);
@@ -66,13 +77,31 @@ export function startMockPrinter(): net.Server {
 }
 
 export function sendToMockPrinter(payload: Buffer): Promise<void> {
+  return sendToPrinter(payload);
+}
+
+export function printerStatus(): { mode: PrinterMode; host?: string; port?: number } {
+  return printerMode === 'disabled' ? { mode: printerMode } : { mode: printerMode, host: printerHost, port: printerPort };
+}
+
+export function startPrinterAdapter(): net.Server | undefined {
+  return printerMode === 'mock' ? startMockPrinter() : undefined;
+}
+
+export function sendToPrinter(payload: Buffer): Promise<void> {
+  if (printerMode === 'disabled') return Promise.reject(new Error('Printer output is disabled on this edge.'));
   return new Promise((resolve,reject)=>{
     const socket=net.createConnection({host:printerHost,port:printerPort});
-    socket.setTimeout(2500);
-    socket.on('data',()=>undefined);
-    socket.once('connect',()=>{socket.end(payload);});
-    socket.once('end',resolve);
-    socket.once('error',reject);
-    socket.once('timeout',()=>socket.destroy(new Error('Mock printer timed out')));
+    let settled=false;
+    const finish=(error?:Error)=>{
+      if(settled)return;
+      settled=true;
+      socket.destroy();
+      if(error)reject(error);else resolve();
+    };
+    socket.setTimeout(5000);
+    socket.once('connect',()=>socket.end(payload,()=>finish()));
+    socket.once('error',error=>finish(error));
+    socket.once('timeout',()=>finish(new Error('Printer connection timed out.')));
   });
 }

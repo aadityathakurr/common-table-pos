@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import type { AddOrderLinesCommand, CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderLineDraft, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
 import { allocateNumber, createId, db, DEMO_ACTOR, DEMO_OUTLET, DEMO_TAX_RATE_BPS, DEMO_TENANT, DEMO_TERMINAL, enqueueSyncEvent, syncOutboxStatus } from './database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
-import { formatKitchenTicket, formatReceipt, sendToMockPrinter, startMockPrinter } from './printer.js';
+import { formatKitchenTicket, formatReceipt, printerStatus, sendToPrinter, startPrinterAdapter } from './printer.js';
 import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from './reports.js';
 import { getSyncStatus, startSyncWorker } from './sync.js';
 import { clearedSessionCookie, createStaffSession, currentStaff, readStaffSession, readStaffSessionCookie, requireRoles, sessionCookie, sessionMiddleware, StaffAuthError } from './auth.js';
@@ -33,6 +33,10 @@ app.use((req,res,next)=>{
 });
 
 function fail(res:Response,status:number,message:string){return res.status(status).json({error:message});}
+function queuePrint(payload:Buffer,label:string){
+  if(printerStatus().mode==='disabled')return;
+  void sendToPrinter(payload).catch(error=>console.error(`${label} printer is not reachable:`,error));
+}
 function routeParam(req:Request,name:string):string{
   const value=req.params[name];
   return Array.isArray(value)?String(value[0]??''):String(value??'');
@@ -215,7 +219,7 @@ function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{order:Order
   return {order,duplicate:false};
 }
 
-app.get('/api/health',(_req,res)=>res.json({status:'ok',service:'common-table-edge',outletId:DEMO_OUTLET,taxRateBps:DEMO_TAX_RATE_BPS,printer:{host:process.env.MOCK_PRINTER_HOST??'127.0.0.1',port:Number(process.env.MOCK_PRINTER_PORT??9100)}}));
+app.get('/api/health',(_req,res)=>res.json({status:'ok',service:'common-table-edge',outletId:DEMO_OUTLET,taxRateBps:DEMO_TAX_RATE_BPS,printer:printerStatus()}));
 app.get('/api/context',(_req,res)=>res.json({
   tenantId:DEMO_TENANT,tenantName:EDGE_CONFIG.tenantName,outletId:DEMO_OUTLET,outletName:EDGE_CONFIG.outletName,
   terminalId:DEMO_TERMINAL,terminalName:EDGE_CONFIG.terminalName,locationLabel:EDGE_CONFIG.locationLabel,
@@ -394,7 +398,7 @@ app.post('/api/orders',requireRoles('owner','manager','cashier'),(req:Request,re
   try{
     const {order,duplicate}=createOrder(body as CreateOrderCommand,currentStaff(res).userId);
     publish(duplicate?'order.updated':'order.created',order);
-    if(!duplicate)void sendToMockPrinter(formatKitchenTicket(order)).catch(error=>console.error('KOT printer is not reachable:',error));
+    if(!duplicate)queuePrint(formatKitchenTicket(order),'KOT');
     return res.status(duplicate?200:201).json(order);
   }catch(error){return fail(res,400,error instanceof Error?error.message:'Unable to create order.');}
 });
@@ -420,7 +424,7 @@ app.post('/api/orders/:orderId/lines',requireRoles('owner','manager','cashier'),
       return false;
     })();
     const after=orderById(before.id)!;publish('order.updated',after);
-    if(!duplicate){const update={...after,lines:after.lines.filter(line=>prepared.some(added=>added.id===line.id))};void sendToMockPrinter(formatKitchenTicket(update)).catch(error=>console.error('KOT update printer is not reachable:',error));}
+    if(!duplicate){const update={...after,lines:after.lines.filter(line=>prepared.some(added=>added.id===line.id))};queuePrint(formatKitchenTicket(update),'KOT update');}
     return res.status(duplicate?200:201).json(after);
   }catch(error){return fail(res,409,error instanceof Error?error.message:'Could not add items to the order.');}
 });
@@ -455,7 +459,7 @@ app.post('/api/orders/:orderId/lines/:lineId/void',requireRoles('owner','manager
       enqueueSyncEvent('order',before.id,'order.line_voided',{...orderById(before.id)!},timestamp);
     })();
     const after=orderById(before.id)!;publish('order.updated',after);
-    const voidUpdate={...after,lines:[{...line,voidedAt:timestamp,voidReason:reason}]};void sendToMockPrinter(formatKitchenTicket(voidUpdate)).catch(error=>console.error('KOT void printer is not reachable:',error));
+    const voidUpdate={...after,lines:[{...line,voidedAt:timestamp,voidReason:reason}]};queuePrint(formatKitchenTicket(voidUpdate),'KOT void');
     return res.json(after);
   }catch(error){return fail(res,409,error instanceof Error?error.message:'Could not void this item.');}
 });
@@ -480,7 +484,7 @@ app.post('/api/orders/:orderId/void',requireRoles('owner','manager'),(req,res)=>
       enqueueSyncEvent('order',before.id,'order.voided',{...orderById(before.id)!},timestamp);
     })();
     const after=orderById(before.id)!;publish('order.updated',after);
-    void sendToMockPrinter(formatKitchenTicket({...after,lines:remaining.map(line=>({...line,voidedAt:timestamp,voidReason:reason}))})).catch(error=>console.error('KOT void printer is not reachable:',error));
+    queuePrint(formatKitchenTicket({...after,lines:remaining.map(line=>({...line,voidedAt:timestamp,voidReason:reason}))}),'KOT void');
     return res.json(after);
   }catch(error){return fail(res,409,error instanceof Error?error.message:'Could not void this order.');}
 });
@@ -544,7 +548,7 @@ app.post('/api/orders/:orderId/payment',requireRoles('owner','manager','cashier'
     audit('order',before.id,'order.payment_recorded',null,{payments:payments.map(({method,amountMinor})=>({method,amountMinor})),invoiceNumber,amountMinor:before.totalMinor,shiftId:body.shiftId},currentStaff(res).userId);
   });pay();
   const order=orderById(before.id)!;publish('order.updated',order);
-  void sendToMockPrinter(formatReceipt(order)).catch(error=>console.error('Receipt printer is not reachable:',error));
+  queuePrint(formatReceipt(order),'Receipt');
   return res.json(order);
 });
 app.post('/api/orders/:orderId/refunds',requireRoles('owner','manager'),(req,res)=>{
@@ -594,9 +598,11 @@ app.post('/api/orders/:orderId/refunds',requireRoles('owner','manager'),(req,res
   return res.status(201).json({order:before,refund});
 });
 app.post('/api/printer/test',requireRoles('owner','manager'),(_req,res)=>{
+  const printer=printerStatus();
+  if(printer.mode==='disabled')return fail(res,503,'Printer output is disabled on this edge.');
   const sample:KitchenOrder={id:'sample',orderNumber:'J-ORD-000001',orderType:'takeaway',tableLabel:null,status:'sent',note:'Printer connection check',createdAt:new Date().toISOString(),lines:[]};
-  void sendToMockPrinter(formatKitchenTicket(sample)).catch(()=>undefined);
-  return res.json({status:'queued',host:process.env.MOCK_PRINTER_HOST??'127.0.0.1',port:Number(process.env.MOCK_PRINTER_PORT??9100)});
+  void sendToPrinter(formatKitchenTicket(sample)).catch(error=>console.error('Printer test failed:',error));
+  return res.json({status:'queued',...printer});
 });
 const webDist=resolve(dirname(fileURLToPath(import.meta.url)),'../../web/dist');
 if(existsSync(webDist)){
@@ -622,8 +628,8 @@ wss.on('connection',(webSocket,request)=>{
   webSocket.send(JSON.stringify({type:'kitchen.snapshot',payload:kitchenSnapshot()} satisfies ServerMessage));
 });
 
-const printer=startMockPrinter();
+const printer=startPrinterAdapter();
 const stopSyncWorker=startSyncWorker();
 httpServer.listen(port,'0.0.0.0',()=>console.log(`🍽️  Common Table edge server listening on http://0.0.0.0:${port}`));
-function shutdown(){httpServer.close();wss.close();printer.close();stopSyncWorker();db.close();}
+function shutdown(){httpServer.close();wss.close();printer?.close();stopSyncWorker();db.close();}
 process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);
