@@ -36,7 +36,7 @@ function downloadReport(report:DailySalesReport) {
   document.body.append(link);link.click();link.remove();URL.revokeObjectURL(url);
 }
 
-export default function CloudReportsView({tenantId,outletId,outletName,timeZone}:{tenantId:string;outletId:string;outletName:string;timeZone?:string|undefined}) {
+export default function CloudReportsView({tenantId,outletId,outletName,timeZone,currency='INR'}:{tenantId:string;outletId:string;outletName:string;timeZone?:string|undefined;currency?:string}) {
   const [date,setDate]=useState(()=>businessDate(timeZone));
   const [report,setReport]=useState<DailySalesReport|null>(null);
   const [error,setError]=useState('');
@@ -58,7 +58,7 @@ export default function CloudReportsView({tenantId,outletId,outletName,timeZone}
     return()=>{active=false;};
   },[tenantId,outletId,date,refresh]);
 
-  const money=(minor:number)=>new Intl.NumberFormat('en-IN',{style:'currency',currency:report?.currency??'INR'}).format(minor/100);
+  const money=(minor:number)=>new Intl.NumberFormat('en-IN',{style:'currency',currency:report?.currency??currency}).format(minor/100);
   const card='rounded-2xl border border-[#e1e8e1] bg-white p-5 shadow-[0_8px_20px_rgba(25,37,34,.035)]';
   return <section className="mt-7 rounded-3xl border border-[#dce7dc] bg-[#edf4ee] p-5 sm:p-7">
     <header className="mb-5 flex flex-wrap items-end justify-between gap-3"><div><p className="mb-1.5 text-xs font-bold uppercase tracking-[.14em] text-[#75887a]">Cloud control plane</p><h2 className="text-2xl font-bold tracking-tight text-[#263c30]">Daily sales report</h2><p className="mt-1 text-xs text-[#75847a]">Synced outlet events · {outletName}</p></div><div className="flex items-center gap-2"><label className="text-xs font-semibold text-[#718078]">Business date<input aria-label="Cloud report date" type="date" value={date} onChange={event=>setDate(event.target.value)} className="ml-2 h-10 rounded-lg border border-[#dfe6e1] bg-white px-2 text-xs"/></label><button type="button" aria-label="Refresh cloud report" onClick={()=>setRefresh(value=>value+1)} disabled={loading} className="grid size-10 place-items-center rounded-lg border border-[#dfe6e1] bg-white text-[#587060] disabled:opacity-50"><RefreshCw size={14}/></button>{report&&<button type="button" onClick={()=>downloadReport(report)} className="inline-flex h-10 items-center gap-2 rounded-lg bg-[#286a4f] px-3 text-xs font-bold text-white"><Download size={14}/>Export CSV</button>}</div></header>

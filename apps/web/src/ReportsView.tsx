@@ -109,7 +109,7 @@ export default function ReportsView({ timeZone, currency='INR', canManage=false 
     return () => controller.abort();
   }, [date, refreshSequence]);
 
-  const money = (minor: number) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: report?.currency ?? 'INR' }).format(minor / 100);
+  const money = (minor: number) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: report?.currency ?? currency }).format(minor / 100);
   const card = 'rounded-2xl border border-[#e1e8e1] bg-white p-5 shadow-[0_8px_20px_rgba(25,37,34,.035)]';
 
   return <section className="mx-auto w-full max-w-[1540px] flex-1 px-3 py-5 sm:px-5 lg:px-8">
