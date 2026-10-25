@@ -589,6 +589,30 @@ app.post('/api/orders/:orderId/payment',requireRoles('owner','manager','cashier'
   queuePrint(formatReceipt(order),'Receipt');
   return res.json(order);
 });
+app.post('/api/orders/:orderId/receipt/reprint',requireRoles('owner','manager','cashier'),async(req,res)=>{
+  const body=req.body as {reason?:unknown};
+  if(typeof body.reason!=='string'||body.reason.trim().length<3||body.reason.trim().length>120)
+    return fail(res,400,'Enter a reprint reason between 3 and 120 characters.');
+  const order=orderById(routeParam(req,'orderId'));
+  if(!order)return fail(res,404,'Order not found.');
+  if(order.status!=='paid'||!order.invoiceNumber)return fail(res,409,'Only paid orders with an invoice can be reprinted.');
+  const printer=printerStatus();
+  if(printer.mode==='disabled')return fail(res,503,'Printer output is disabled on this edge.');
+  const actor=currentStaff(res);
+  audit('receipt',order.id,'receipt.reprint_requested',body.reason.trim(),
+    {orderNumber:order.orderNumber,invoiceNumber:order.invoiceNumber,printerMode:printer.mode},actor.userId);
+  try{
+    await sendToPrinter(formatReceipt(order));
+    audit('receipt',order.id,'receipt.reprint_dispatched',body.reason.trim(),
+      {orderNumber:order.orderNumber,invoiceNumber:order.invoiceNumber,printerMode:printer.mode},actor.userId);
+    return res.json({status:'dispatched',invoiceNumber:order.invoiceNumber,printerMode:printer.mode});
+  }catch(error){
+    audit('receipt',order.id,'receipt.reprint_failed',body.reason.trim(),
+      {orderNumber:order.orderNumber,invoiceNumber:order.invoiceNumber,printerMode:printer.mode,
+        error:error instanceof Error?error.message:'Printer connection failed.'},actor.userId);
+    return fail(res,502,'The receipt could not be sent to the printer. Check the printer connection and retry.');
+  }
+});
 app.post('/api/orders/:orderId/refunds',requireRoles('owner','manager'),(req,res)=>{
   const body=req.body as {commandId?:unknown;paymentId?:unknown;shiftId?:unknown;amountMinor?:unknown;reason?:unknown};
   if(typeof body.commandId!=='string'||body.commandId.length<8||body.commandId.length>160)return fail(res,400,'A stable refund commandId is required.');

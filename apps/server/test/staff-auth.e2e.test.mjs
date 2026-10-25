@@ -138,17 +138,32 @@ test('production edge validates staff identity and enforces cashier, kitchen, vi
     body: JSON.stringify({ commandId: 'cashier-refund-command', paymentId: 'p', shiftId: 's', amountMinor: 1, reason: 'test' }),
   });
   assert.equal(cashierRefund.status, 403);
+  const cashierReceiptReprint = await fetch(`${baseUrl}/api/orders/missing/receipt/reprint`, {
+    method: 'POST', headers: { cookie: cashier.cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ reason: 'customer copy' }),
+  });
+  assert.equal(cashierReceiptReprint.status, 404, 'cashiers may request a paid receipt reprint');
 
   const kitchen = await authenticate('kitchen');
   assert.equal(kitchen.response.status, 200);
   assert.equal((await fetch(`${baseUrl}/api/kitchen`, { headers: { cookie: kitchen.cookie } })).status, 200);
   assert.equal((await fetch(`${baseUrl}/api/orders`, { headers: { cookie: kitchen.cookie } })).status, 403);
+  const kitchenReceiptReprint = await fetch(`${baseUrl}/api/orders/missing/receipt/reprint`, {
+    method: 'POST', headers: { cookie: kitchen.cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ reason: 'customer copy' }),
+  });
+  assert.equal(kitchenReceiptReprint.status, 403);
   assert.equal((await fetch(`${baseUrl}/api/support/diagnostics.json`, { headers: { cookie: kitchen.cookie } })).status, 403);
 
   const viewer = await authenticate('viewer');
   assert.equal(viewer.response.status, 200);
   assert.equal((await fetch(`${baseUrl}/api/reports/daily`, { headers: { cookie: viewer.cookie } })).status, 200);
   assert.equal((await fetch(`${baseUrl}/api/orders`, { headers: { cookie: viewer.cookie } })).status, 403);
+  const viewerReceiptReprint = await fetch(`${baseUrl}/api/orders/missing/receipt/reprint`, {
+    method: 'POST', headers: { cookie: viewer.cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ reason: 'customer copy' }),
+  });
+  assert.equal(viewerReceiptReprint.status, 403);
   assert.equal((await fetch(`${baseUrl}/api/support/diagnostics.json`, { headers: { cookie: viewer.cookie } })).status, 403);
 
   const manager = await authenticate('manager');
