@@ -89,19 +89,29 @@ const upstream = createServer(async (request, response) => {
     let body = '';
     for await (const chunk of request) body += chunk;
     const payload = JSON.parse(body);
+    const acceptedEventIds = [];
+    const rejectedEvents = [];
     for (const event of payload.events) {
-      if (event.entityType !== 'inventory' || acceptedInventoryEventIds.has(event.eventId)) continue;
-      acceptedInventoryEventIds.add(event.eventId);
-      const stock = inventoryItems.find((item) => item.id === event.payload.inventoryItemId);
-      if (stock) {
-        if(event.action==='inventory.receipt')stock.onHand+=Number(event.payload.quantity);
-        else if(event.action==='inventory.count_adjustment')stock.onHand=Number(event.payload.quantity);
-        else stock.onHand-=Number(event.payload.quantity);
+      if (event.entityType === 'inventory') {
+        if (acceptedInventoryEventIds.has(event.eventId)) { acceptedEventIds.push(event.eventId); continue; }
+        const stock = inventoryItems.find((item) => item.id === event.payload.inventoryItemId);
+        if (event.action === 'inventory.count_adjustment' && stock
+          && Number(event.payload.expectedBalance) !== stock.onHand) {
+          rejectedEvents.push({ eventId: event.eventId, code: '40001' });
+          continue;
+        }
+        acceptedInventoryEventIds.add(event.eventId);
+        if (stock) {
+          if(event.action==='inventory.receipt')stock.onHand+=Number(event.payload.quantity);
+          else if(event.action==='inventory.count_adjustment')stock.onHand=Number(event.payload.quantity);
+          else stock.onHand-=Number(event.payload.quantity);
+        }
       }
+      acceptedEventIds.push(event.eventId);
     }
     version = snapshotVersion();
     response.writeHead(200, { 'content-type': 'application/json' })
-      .end(JSON.stringify({ acceptedEventIds: payload.events.map((event) => event.eventId) }));
+      .end(JSON.stringify({ acceptedEventIds, rejectedEvents }));
     return;
   }
   response.writeHead(405).end();
@@ -535,9 +545,24 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.equal((await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...count,commandId:randomUUID(),expectedBalance:443})})).response.status,409,
     'a physical count based on a stale local balance is rejected');
   assert.ok((await jsonRequest(baseUrl,'/api/sync/status')).body.pending>=3,'offline stock movements are durable in the sync outbox');
+  inventoryItems[0].onHand += 10;
+  version = snapshotVersion();
   upstreamAvailable=true;
+  const conflicts=await waitFor(async()=>{
+    const result=await jsonRequest(baseUrl,'/api/inventory/conflicts');
+    return result.body.length===1?result.body:null;
+  },'stale cloud count conflict was not surfaced for manager review');
+  assert.equal(conflicts[0].countedQuantity,442);
+  const retired=await jsonRequest(baseUrl,`/api/inventory/conflicts/${conflicts[0].movementId}/discard`,{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({reason:'Discard stale count and recount from refreshed balance.'})});
+  assert.equal(retired.response.status,200,retired.body.error);
+  assert.equal(retired.body.inventory[0].onHand,453,'refresh removes the rejected delta but keeps the current cloud balance');
+  assert.equal(retired.body.conflicts.length,0);
+  assert.equal((await jsonRequest(baseUrl,'/api/inventory/movements',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+    commandId:randomUUID(),inventoryItemId:inventoryItems[0].id,movementType:'count_adjustment',quantity:452,expectedBalance:453,reason:'Recount after sync conflict',
+  })})).response.status,201,'manager can record a fresh count against the refreshed cloud balance');
   await waitFor(async()=>{
     const [{body:status},{body:stock}]=await Promise.all([jsonRequest(baseUrl,'/api/sync/status'),jsonRequest(baseUrl,'/api/inventory')]);
-    return status.pending===0&&stock[0].onHand===442&&inventoryItems[0].onHand===442;
-  },'offline stock movements did not reconcile to cloud without duplication');
+    return status.pending===0&&stock[0].onHand===452&&inventoryItems[0].onHand===452;
+  },'recount did not reconcile after retiring the stale count');
 });

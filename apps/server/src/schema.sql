@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS edge_manual_inventory_movements (
   movement_type TEXT NOT NULL CHECK(movement_type IN ('receipt','waste','count_adjustment')),
   quantity REAL NOT NULL CHECK(quantity >= 0), expected_balance REAL,
   quantity_delta REAL NOT NULL, reason TEXT NOT NULL, actor_id TEXT NOT NULL,
-  occurred_at TEXT NOT NULL, synced INTEGER NOT NULL DEFAULT 0 CHECK(synced IN (0,1)),
+  occurred_at TEXT NOT NULL, synced INTEGER NOT NULL DEFAULT 0 CHECK(synced IN (0,1)), superseded_at TEXT,
   CHECK((movement_type='receipt' AND quantity>0 AND expected_balance IS NULL AND quantity_delta=quantity)
     OR (movement_type='waste' AND quantity>0 AND expected_balance IS NULL AND quantity_delta=-quantity)
     OR (movement_type='count_adjustment' AND expected_balance IS NOT NULL AND quantity_delta=quantity-expected_balance))
@@ -190,8 +190,10 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
   payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
   next_attempt_at TEXT,
+  blocked INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0,1)),
   last_error TEXT,
   synced_at TEXT,
+  resolved_at TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sync_outbox_pending

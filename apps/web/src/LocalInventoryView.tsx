@@ -2,26 +2,43 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react
 import { RefreshCw, Scale } from 'lucide-react';
 
 interface InventoryItem {inventoryItemId:string;name:string;unit:string;active:boolean;reorderLevel:number;onHand:number;lowStock:boolean;}
+interface CountConflict {movementId:string;itemName:string;unit:string;countedQuantity:number;expectedBalance:number;reason:string;occurredAt:string;}
 type MovementType='receipt'|'waste'|'count_adjustment';
 const movementLabels:Record<MovementType,string>={receipt:'Receipt',waste:'Waste',count_adjustment:'Physical count'};
 const input='h-10 w-full rounded-lg border border-[#e3e9e4] bg-white px-3 text-xs outline-none focus:border-[#6b9b79]';
 
 export default function LocalInventoryView(){
   const [items,setItems]=useState<InventoryItem[]>([]);
+  const [conflicts,setConflicts]=useState<CountConflict[]>([]);
   const [itemId,setItemId]=useState('');
   const [type,setType]=useState<MovementType>('receipt');
   const [quantity,setQuantity]=useState('');
   const [reason,setReason]=useState('');
   const [busy,setBusy]=useState(false);
+  const [resolving,setResolving]=useState('');
   const [error,setError]=useState('');
   const [notice,setNotice]=useState('');
   const itemById=useMemo(()=>new Map(items.map(item=>[item.inventoryItemId,item])),[items]);
   const load=useCallback(async()=>{
-    try{const response=await fetch('/api/inventory',{cache:'no-store'});if(!response.ok)throw new Error('Inventory is available only on the signed-in cashier laptop.');
-      const rows=await response.json() as InventoryItem[];setItems(rows);setItemId(current=>rows.some(item=>item.inventoryItemId===current)?current:rows.find(item=>item.active)?.inventoryItemId??'');}
+    try{const [response,conflictResponse]=await Promise.all([fetch('/api/inventory',{cache:'no-store'}),fetch('/api/inventory/conflicts',{cache:'no-store'})]);
+      if(!response.ok)throw new Error('Inventory is available only on the signed-in cashier laptop.');
+      if(!conflictResponse.ok)throw new Error('Could not load inventory count conflicts.');
+      const [rows,pendingConflicts]=await Promise.all([response.json() as Promise<InventoryItem[]>,conflictResponse.json() as Promise<CountConflict[]>]);
+      setItems(rows);setConflicts(pendingConflicts);setItemId(current=>rows.some(item=>item.inventoryItemId===current)?current:rows.find(item=>item.active)?.inventoryItemId??'');}
     catch(cause){setError(cause instanceof Error?cause.message:'Could not load local stock.');}
   },[]);
   useEffect(()=>{void load();},[load]);
+  async function discardStaleCount(movementId:string){
+    if(resolving)return;setResolving(movementId);setError('');setNotice('');
+    try{const response=await fetch(`/api/inventory/conflicts/${encodeURIComponent(movementId)}/discard`,{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({reason:'Stale cloud count discarded; manager will recount against the refreshed balance.'})});
+      const result=await response.json() as {error?:string;inventory?:InventoryItem[];conflicts?:CountConflict[]};
+      if(!response.ok)throw new Error(result.error??'Could not resolve the count conflict.');
+      if(result.inventory)setItems(result.inventory);if(result.conflicts)setConflicts(result.conflicts);
+      setNotice('The stale count was kept in the audit history and excluded from stock. Enter a new physical count against the refreshed balance.');
+    }catch(cause){setError(cause instanceof Error?cause.message:'Could not resolve the count conflict.');}
+    finally{setResolving('');}
+  }
   async function save(event:FormEvent){
     event.preventDefault();if(busy)return;
     const item=itemById.get(itemId);const amount=Number(quantity);const note=reason.trim();
@@ -45,6 +62,7 @@ export default function LocalInventoryView(){
     </div>
     {error&&<p role="alert" className="mb-4 rounded-xl border border-[#f1c8c0] bg-[#fff4f1] px-4 py-3 text-xs text-[#9a493d]">{error}</p>}
     {notice&&<p role="status" className="mb-4 rounded-xl border border-[#cfe3d2] bg-[#f0f8f1] px-4 py-3 text-xs text-[#356d49]">{notice}</p>}
+    {conflicts.length>0&&<div className="mb-5 rounded-xl border border-[#edcfb0] bg-[#fffaf4] p-4"><h2 className="text-sm font-semibold text-[#805323]">A physical count needs review</h2><p className="mt-1 max-w-3xl text-xs leading-5 text-[#826d53]">Cloud stock changed while this laptop was offline, so the count was not accepted. This action refreshes cloud stock, retires the unsent count while preserving its audit entry, and lets you record a new count.</p><div className="mt-3 space-y-2">{conflicts.map(conflict=><div key={conflict.movementId} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#f0e2d2] bg-white p-3"><div className="text-xs"><strong>{conflict.itemName}</strong><span className="ml-2 text-[#768078]">Counted {Number(conflict.countedQuantity).toLocaleString('en-IN')} {conflict.unit}; baseline was {Number(conflict.expectedBalance).toLocaleString('en-IN')} {conflict.unit}</span><p className="mt-1 text-[10px] text-[#879087]">{conflict.reason} · {new Date(conflict.occurredAt).toLocaleString('en-IN')}</p></div><button type="button" disabled={Boolean(resolving)} onClick={()=>void discardStaleCount(conflict.movementId)} className="h-9 rounded-lg border border-[#dcc6ac] bg-[#fffaf4] px-3 text-[11px] font-semibold text-[#805323] disabled:opacity-50">{resolving===conflict.movementId?'Refreshing…':'Refresh and retire count'}</button></div>)}</div></div>}
     <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
       <div className="overflow-hidden rounded-xl border border-[#e5ebe6] bg-white"><div className="border-b border-[#edf0ed] px-4 py-3"><h2 className="text-sm font-semibold">Current stock</h2><p className="mt-1 text-[10px] text-[#8c9891]">A local snapshot of the outlet inventory.</p></div>
         <div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead className="bg-[#f7f9f7] text-[10px] text-[#7d8982]"><tr><th className="px-4 py-2.5">Item</th><th className="px-4 py-2.5 text-right">On hand</th><th className="px-4 py-2.5 text-right">Reorder at</th><th className="px-4 py-2.5">Status</th></tr></thead><tbody>{items.map(item=><tr key={item.inventoryItemId} className="border-t border-[#edf0ed]"><td className="px-4 py-3 font-semibold">{item.name}<small className="ml-1 font-normal text-[#87948d]">{item.unit}</small></td><td className="px-4 py-3 text-right">{Number(item.onHand).toLocaleString('en-IN')}</td><td className="px-4 py-3 text-right">{Number(item.reorderLevel).toLocaleString('en-IN')}</td><td className="px-4 py-3"><span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${item.lowStock?'bg-[#fff3e0] text-[#9b6a1f]':'bg-[#edf6ef] text-[#4e805e]'}`}>{item.lowStock?'Low stock':'In stock'}</span></td></tr>)}{!items.length&&<tr><td colSpan={4} className="px-4 py-12 text-center text-[#8c9891]">No stock items are cached on this laptop. Connect online once and add them in the manager portal.</td></tr>}</tbody></table></div>

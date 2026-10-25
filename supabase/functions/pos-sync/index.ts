@@ -281,16 +281,18 @@ Deno.serve(async (request: Request): Promise<Response> => {
   const serializedSize = new TextEncoder().encode(JSON.stringify(rows)).byteLength;
   if (serializedSize > 256_000) return json(413, { error: "Sync event payloads exceed the batch limit." });
   const acceptedEventIds: string[] = [];
+  const rejectedEvents: Array<{ eventId: string; code: string | null }> = [];
   for (const row of rows) {
     const { error: insertError } = await client.from("pos_sync_events")
       .upsert([row], { onConflict: "tenant_id,outlet_id,terminal_id,event_id", ignoreDuplicates: true });
     if (insertError) {
       // Keep a bad event retryable without letting it roll back unrelated sales in this batch.
       console.error(JSON.stringify({ event: "pos_sync.event_rejected", eventId: row.event_id, code: insertError.code }));
+      rejectedEvents.push({ eventId: row.event_id, code: insertError.code ?? null });
       continue;
     }
     acceptedEventIds.push(row.event_id);
   }
 
-  return json(200, { acceptedEventIds });
+  return json(200, { acceptedEventIds, rejectedEvents });
 });

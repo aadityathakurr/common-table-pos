@@ -29,16 +29,24 @@ if(outboxDefinition&&!outboxDefinition.sql.includes("'inventory'")){
       payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
       attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
       next_attempt_at TEXT,
+      blocked INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0,1)),
       last_error TEXT,
       synced_at TEXT,
+      resolved_at TEXT,
       created_at TEXT NOT NULL
     );
-    INSERT INTO sync_outbox_new SELECT * FROM sync_outbox;
+    INSERT INTO sync_outbox_new (outbox_id,event_id,entity_type,entity_id,action,occurred_at,payload_json,attempt_count,next_attempt_at,last_error,synced_at,created_at)
+      SELECT outbox_id,event_id,entity_type,entity_id,action,occurred_at,payload_json,attempt_count,next_attempt_at,last_error,synced_at,created_at FROM sync_outbox;
     DROP TABLE sync_outbox;
     ALTER TABLE sync_outbox_new RENAME TO sync_outbox;
     CREATE INDEX sync_outbox_pending ON sync_outbox(next_attempt_at,outbox_id) WHERE synced_at IS NULL;
     COMMIT;`);
 }
+const outboxColumns = db.pragma('table_info(sync_outbox)') as Array<{ name: string }>;
+if (!outboxColumns.some(column => column.name === 'blocked')) db.exec('ALTER TABLE sync_outbox ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0,1))');
+if (!outboxColumns.some(column => column.name === 'resolved_at')) db.exec('ALTER TABLE sync_outbox ADD COLUMN resolved_at TEXT');
+const manualInventoryColumns = db.pragma('table_info(edge_manual_inventory_movements)') as Array<{ name: string }>;
+if (!manualInventoryColumns.some(column => column.name === 'superseded_at')) db.exec('ALTER TABLE edge_manual_inventory_movements ADD COLUMN superseded_at TEXT');
 const outletColumns = db.pragma('table_info(outlets)') as Array<{ name: string }>;
 if (!outletColumns.some(column => column.name === 'tax_rate_bps')) {
   db.exec('ALTER TABLE outlets ADD COLUMN tax_rate_bps INTEGER NOT NULL DEFAULT 0 CHECK(tax_rate_bps BETWEEN 0 AND 10000)');
@@ -152,7 +160,7 @@ export function enqueueSyncEvent(entityType: PendingSyncEvent['entityType'], ent
 
 export function pendingSyncEvents(limit = 50): PendingSyncEvent[] {
   const rows = db.prepare(`SELECT event_id,entity_type,entity_id,action,occurred_at,payload_json,attempt_count
-    FROM sync_outbox WHERE synced_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+    FROM sync_outbox WHERE synced_at IS NULL AND resolved_at IS NULL AND blocked=0 AND (next_attempt_at IS NULL OR next_attempt_at<=?)
     ORDER BY outbox_id LIMIT ?`).all(new Date().toISOString(),limit) as Array<{
       event_id:string;entity_type:PendingSyncEvent['entityType'];entity_id:string;action:string;occurred_at:string;payload_json:string;attempt_count:number;
     }>;
@@ -162,7 +170,7 @@ export function pendingSyncEvents(limit = 50): PendingSyncEvent[] {
 
 export function acknowledgeSyncEvents(eventIds: string[]): void {
   if (!eventIds.length) return;
-  const update = db.prepare('UPDATE sync_outbox SET synced_at=?,next_attempt_at=NULL,last_error=NULL WHERE event_id=? AND synced_at IS NULL');
+  const update = db.prepare('UPDATE sync_outbox SET synced_at=?,next_attempt_at=NULL,last_error=NULL WHERE event_id=? AND synced_at IS NULL AND resolved_at IS NULL');
   const markInventory = db.prepare(`UPDATE edge_inventory_movements SET synced=1 WHERE event_id=?
     AND EXISTS (SELECT 1 FROM sync_outbox WHERE event_id=? AND entity_type='inventory')`);
   const markManualInventory = db.prepare(`UPDATE edge_manual_inventory_movements SET synced=1 WHERE event_id=?
@@ -171,23 +179,23 @@ export function acknowledgeSyncEvents(eventIds: string[]): void {
   db.transaction(()=>{for(const eventId of eventIds){markInventory.run(eventId,eventId);markManualInventory.run(eventId,eventId);update.run(syncedAt,eventId);}})();
 }
 
-export function failSyncEvents(eventIds: string[], errorMessage: string): void {
+export function failSyncEvents(eventIds: string[], errorMessage: string, permanent = false): void {
   if (!eventIds.length) return;
   const update = db.prepare(`UPDATE sync_outbox SET attempt_count=attempt_count+1,last_error=?,
-    next_attempt_at=? WHERE event_id=? AND synced_at IS NULL`);
+    next_attempt_at=?,blocked=CASE WHEN ? THEN 1 ELSE blocked END WHERE event_id=? AND synced_at IS NULL AND resolved_at IS NULL`);
   const now=Date.now();
   db.transaction(()=>{for(const eventId of eventIds){
     const row=db.prepare('SELECT attempt_count FROM sync_outbox WHERE event_id=? AND synced_at IS NULL').get(eventId) as {attempt_count:number}|undefined;
     if(!row)continue;
     const delayMs=Math.min(5*60_000,1000*2**Math.min(row.attempt_count,8));
-    update.run(errorMessage.slice(0,240),new Date(now+delayMs).toISOString(),eventId);
+    update.run(errorMessage.slice(0,240),permanent?null:new Date(now+delayMs).toISOString(),permanent?1:0,eventId);
   }})();
 }
 
 export function syncOutboxStatus(){
   return db.prepare(`SELECT
-    COALESCE(SUM(CASE WHEN synced_at IS NULL THEN 1 ELSE 0 END),0) AS pending,
-    COALESCE(SUM(CASE WHEN synced_at IS NULL AND attempt_count>0 THEN 1 ELSE 0 END),0) AS failed,
+    COALESCE(SUM(CASE WHEN synced_at IS NULL AND resolved_at IS NULL THEN 1 ELSE 0 END),0) AS pending,
+    COALESCE(SUM(CASE WHEN synced_at IS NULL AND resolved_at IS NULL AND attempt_count>0 THEN 1 ELSE 0 END),0) AS failed,
     MAX(synced_at) AS lastSyncedAt FROM sync_outbox`).get() as {pending:number;failed:number;lastSyncedAt:string|null};
 }
 
@@ -204,7 +212,7 @@ export function localInventoryBalances(){
     LEFT JOIN (SELECT inventory_item_id,SUM(quantity_delta) AS quantity_delta FROM edge_inventory_movements
       WHERE tenant_id=? AND outlet_id=? GROUP BY inventory_item_id) sale ON sale.inventory_item_id=i.id
     LEFT JOIN (SELECT inventory_item_id,SUM(quantity_delta) AS quantity_delta FROM edge_manual_inventory_movements
-      WHERE tenant_id=? AND outlet_id=? GROUP BY inventory_item_id) manual ON manual.inventory_item_id=i.id
+      WHERE tenant_id=? AND outlet_id=? AND superseded_at IS NULL GROUP BY inventory_item_id) manual ON manual.inventory_item_id=i.id
     WHERE i.tenant_id=? AND i.outlet_id=? ORDER BY i.name`)
     .all(DEMO_TENANT,DEMO_OUTLET,DEMO_TENANT,DEMO_OUTLET,DEMO_TENANT,DEMO_OUTLET) as Array<{inventoryItemId:string;name:string;unit:string;active:number;reorderLevel:number;onHand:number;lowStock:number}>;
 }
@@ -234,7 +242,7 @@ export function recordManualInventoryMovement(input:ManualInventoryMovementInput
       const balance=db.prepare(`SELECT i.cloud_on_hand+COALESCE((SELECT SUM(quantity_delta) FROM edge_inventory_movements
         WHERE tenant_id=i.tenant_id AND outlet_id=i.outlet_id AND inventory_item_id=i.id),0)
         +COALESCE((SELECT SUM(quantity_delta) FROM edge_manual_inventory_movements
-        WHERE tenant_id=i.tenant_id AND outlet_id=i.outlet_id AND inventory_item_id=i.id),0) AS on_hand
+        WHERE tenant_id=i.tenant_id AND outlet_id=i.outlet_id AND inventory_item_id=i.id AND superseded_at IS NULL),0) AS on_hand
         FROM edge_inventory_items i WHERE i.tenant_id=? AND i.outlet_id=? AND i.id=? AND i.active=1`)
         .get(DEMO_TENANT,DEMO_OUTLET,input.inventoryItemId) as {on_hand:number}|undefined;
       if(!balance)throw new Error('Inventory item is not available on this device. Sync and try again.');
@@ -257,6 +265,49 @@ export function recordManualInventoryMovement(input:ManualInventoryMovementInput
     return {movementId,duplicate:false};
   });
   return save();
+}
+
+export interface InventoryCountConflict {
+  movementId:string;inventoryItemId:string;itemName:string;unit:string;countedQuantity:number;
+  expectedBalance:number;reason:string;occurredAt:string;lastError:string;
+}
+
+export function listInventoryCountConflicts():InventoryCountConflict[]{
+  return db.prepare(`SELECT m.id AS movementId,m.inventory_item_id AS inventoryItemId,i.name AS itemName,i.unit,
+    m.quantity AS countedQuantity,m.expected_balance AS expectedBalance,m.reason,m.occurred_at AS occurredAt,o.last_error AS lastError
+    FROM edge_manual_inventory_movements m JOIN sync_outbox o ON o.event_id=m.event_id
+    JOIN edge_inventory_items i ON i.tenant_id=m.tenant_id AND i.outlet_id=m.outlet_id AND i.id=m.inventory_item_id
+    WHERE m.tenant_id=? AND m.outlet_id=? AND m.movement_type='count_adjustment' AND m.superseded_at IS NULL
+      AND o.synced_at IS NULL AND o.resolved_at IS NULL AND o.blocked=1
+      AND o.last_error='Stock changed after this count began. Refresh inventory and count again.'
+    ORDER BY m.occurred_at`).all(DEMO_TENANT,DEMO_OUTLET) as InventoryCountConflict[];
+}
+
+export function discardStaleInventoryCount(movementId:string,actorId:string,reason:string,occurredAt:string):void{
+  const resolve=db.transaction(()=>{
+    const movement=db.prepare(`SELECT m.event_id AS eventId,m.inventory_item_id AS inventoryItemId,m.quantity,m.expected_balance AS expectedBalance,
+      m.reason AS originalReason,m.superseded_at AS supersededAt,o.last_error AS lastError,o.blocked,o.resolved_at AS resolvedAt
+      FROM edge_manual_inventory_movements m JOIN sync_outbox o ON o.event_id=m.event_id
+      WHERE m.id=? AND m.tenant_id=? AND m.outlet_id=? AND m.movement_type='count_adjustment'`).get(movementId,DEMO_TENANT,DEMO_OUTLET) as
+      {eventId:string;inventoryItemId:string;quantity:number;expectedBalance:number;originalReason:string;supersededAt:string|null;lastError:string|null;blocked:number;resolvedAt:string|null}|undefined;
+    if(!movement||movement.supersededAt||movement.resolvedAt||Number(movement.blocked)!==1
+      ||movement.lastError!=='Stock changed after this count began. Refresh inventory and count again.')
+      throw new Error('This count is not an unresolved cloud stock conflict. Refresh the inventory list.');
+    const superseded=db.prepare(`UPDATE edge_manual_inventory_movements SET superseded_at=? WHERE id=? AND superseded_at IS NULL`).run(occurredAt,movementId);
+    const resolved=db.prepare(`UPDATE sync_outbox SET resolved_at=?,blocked=0,next_attempt_at=NULL
+      WHERE event_id=? AND synced_at IS NULL AND resolved_at IS NULL AND blocked=1`).run(occurredAt,movement.eventId);
+    if(superseded.changes!==1||resolved.changes!==1)throw new Error('The count conflict changed while it was being resolved. Refresh inventory.');
+    const auditId=createId();
+    db.prepare(`INSERT INTO audit_events(id,tenant_id,outlet_id,actor_id,terminal_id,entity_type,entity_id,action,reason,payload_json,occurred_at)
+      VALUES(?,?,?,?,?,'inventory_item',?,'inventory.count_conflict_discarded',?,?,?)`).run(auditId,DEMO_TENANT,DEMO_OUTLET,actorId,DEMO_TERMINAL,
+        movement.inventoryItemId,reason,JSON.stringify({movementId,eventId:movement.eventId,countedQuantity:Number(movement.quantity),
+          expectedBalance:Number(movement.expectedBalance),originalReason:movement.originalReason}),occurredAt);
+    enqueueSyncEvent('audit',movement.inventoryItemId,'inventory.count_conflict_discarded',{
+      entityType:'inventory_item',entityId:movement.inventoryItemId,actorId,terminalId:DEMO_TERMINAL,reason,
+      payload:{movementId,eventId:movement.eventId,countedQuantity:Number(movement.quantity),expectedBalance:Number(movement.expectedBalance),originalReason:movement.originalReason},
+    },occurredAt,auditId);
+  });
+  resolve();
 }
 
 export function recordPaidOrderInventoryConsumption(orderId:string,orderNumber:string,actorId:string,occurredAt:string):number{

@@ -97,8 +97,8 @@ export function getSyncStatus(){
     lastSyncedAt:stats.lastSyncedAt,lastError,menu:{...managedMenuSyncState(),lastError:menuError??managedMenuSyncState()?.lastError??null}};
 }
 
-export async function syncMenuOnce():Promise<void>{
-  if(menuSending||sending||!SYNC_CONFIG.url||!SYNC_CONFIG.terminalKey)return;
+export async function syncMenuOnce():Promise<boolean>{
+  if(menuSending||sending||!SYNC_CONFIG.url||!SYNC_CONFIG.terminalKey)return false;
   menuSending=true;
   const previous=managedMenuSyncState();
   try{
@@ -108,7 +108,7 @@ export async function syncMenuOnce():Promise<void>{
       if(!previous)throw new Error('The menu sync server returned an unexpected unchanged response.');
       markManagedMenuChecked(previous.version);
       menuError=null;
-      return;
+      return true;
     }
     const result=await response.json().catch(()=>({})) as {tenantId?:unknown;outletId?:unknown;version?:unknown;outletConfig?:unknown;items?:unknown;inventoryItems?:unknown;recipes?:unknown;layout?:unknown;error?:unknown};
     if(!response.ok)throw new Error(typeof result.error==='string'?result.error:`Menu sync returned HTTP ${response.status}.`);
@@ -124,10 +124,12 @@ export async function syncMenuOnce():Promise<void>{
       result.recipes as ManagedInventoryRecipe[],outletConfig,result.layout);
     menuError=null;
     console.log(JSON.stringify({level:'info',event:'menu.sync_succeeded',count:result.items.length,version:result.version}));
+    return true;
   }catch(error){
     menuError=error instanceof Error?error.message:'Menu sync failed.';
     recordManagedMenuSyncError(menuError);
     console.error(JSON.stringify({level:'warn',event:'menu.sync_failed',reason:menuError}));
+    return false;
   }finally{menuSending=false;}
 }
 
@@ -139,17 +141,27 @@ async function syncOnce():Promise<void>{
   try{
     const response=await fetch(SYNC_CONFIG.url,{method:'POST',headers:{'content-type':'application/json','x-pos-terminal-key':SYNC_CONFIG.terminalKey},
       body:JSON.stringify({events:events.map(({attemptCount:_,...event})=>event)}),signal:AbortSignal.timeout(15_000)});
-    const result=await response.json().catch(()=>({})) as {acceptedEventIds?:unknown;error?:unknown};
+    const result=await response.json().catch(()=>({})) as {acceptedEventIds?:unknown;rejectedEvents?:unknown;error?:unknown};
     if(!response.ok)throw new Error(typeof result.error==='string'?result.error:`Sync endpoint returned HTTP ${response.status}.`);
     if(!Array.isArray(result.acceptedEventIds)||result.acceptedEventIds.some(id=>typeof id!=='string'||!ids.includes(id)))
       throw new Error('Sync acknowledgement did not match the submitted events.');
     const accepted=new Set(result.acceptedEventIds as string[]);
     const acknowledged=ids.filter(id=>accepted.has(id));
     acknowledgeSyncEvents(acknowledged);
+    const reported=Array.isArray(result.rejectedEvents)?result.rejectedEvents.filter(value=>value&&typeof value==='object'&&!Array.isArray(value)) as Array<{eventId?:unknown;code?:unknown}>:[];
+    const rejectionById=new Map(reported.filter(value=>typeof value.eventId==='string'&&ids.includes(value.eventId)&&!accepted.has(value.eventId))
+      .map(value=>[value.eventId as string,value]));
     const rejected=ids.filter(id=>!accepted.has(id));
-    if(rejected.length){failSyncEvents(rejected,'The cloud did not acknowledge this event.');throw new Error(`${rejected.length} event(s) were not acknowledged.`);}
-    lastError=null;
-    console.log(JSON.stringify({level:'info',event:'sync.batch_succeeded',count:acknowledged.length}));
+    for(const eventId of rejected){
+      const event=events.find(candidate=>candidate.eventId===eventId);
+      const rejection=rejectionById.get(eventId);
+      const staleCount=event?.action==='inventory.count_adjustment'&&rejection?.code==='40001';
+      failSyncEvents([eventId],staleCount?'Stock changed after this count began. Refresh inventory and count again.':'The cloud rejected this event. Check the local record and retry after resolving the issue.',Boolean(staleCount));
+    }
+    if(rejected.length)lastError=`${rejected.length} event(s) need review.`;
+    else lastError=null;
+    console.log(JSON.stringify({level:rejected.length?'warn':'info',event:rejected.length?'sync.batch_completed_with_rejections':'sync.batch_succeeded',
+      accepted:acknowledged.length,rejected:rejected.length}));
   }catch(error){
     lastError=error instanceof Error?error.message:'Cloud sync failed.';
     failSyncEvents(ids,lastError);

@@ -6,11 +6,11 @@ import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AddOrderLinesCommand, CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderLineDraft, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
-import { allocateNumber, createId, db, DATABASE_PATH, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, enqueueSyncEvent, localInventoryBalances, recordManualInventoryMovement, recordPaidOrderInventoryConsumption, syncOutboxStatus } from './database.js';
+import { allocateNumber, createId, db, DATABASE_PATH, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, discardStaleInventoryCount, enqueueSyncEvent, listInventoryCountConflicts, localInventoryBalances, recordManualInventoryMovement, recordPaidOrderInventoryConsumption, syncOutboxStatus } from './database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
 import { formatKitchenTicket, formatReceipt, printerStatus, sendToPrinter, startPrinterAdapter } from './printer.js';
 import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from './reports.js';
-import { getSyncStatus, startSyncWorker } from './sync.js';
+import { getSyncStatus, startSyncWorker, syncMenuOnce } from './sync.js';
 import { clearedSessionCookie, createStaffSession, currentStaff, readStaffSession, readStaffSessionCookie, refreshStaffSession, requireRoles, sessionCookie, sessionMiddleware, StaffAuthError } from './auth.js';
 import { startAutomaticBackups } from './automatic-backup.js';
 
@@ -310,6 +310,19 @@ app.post('/api/inventory/movements',requireRoles('owner','manager'),(req,res)=>{
     const inventory=localInventoryBalances().map(item=>({...item,active:Boolean(item.active),lowStock:Boolean(item.lowStock)}));
     return res.status(result.duplicate?200:201).json({movementId:result.movementId,duplicate:result.duplicate,inventory});
   }catch(error){return fail(res,409,error instanceof Error?error.message:'Could not record inventory movement.');}
+});
+app.get('/api/inventory/conflicts',requireRoles('owner','manager'),(_req,res)=>res.json(listInventoryCountConflicts()));
+app.post('/api/inventory/conflicts/:movementId/discard',requireRoles('owner','manager'),async(req,res)=>{
+  const movementId=routeParam(req,'movementId');
+  if(!/^[0-9a-f-]{36}$/i.test(movementId))return fail(res,400,'Choose a valid conflicted count.');
+  const body=req.body as Record<string,unknown>;
+  const reason=typeof body.reason==='string'?body.reason.trim():'';
+  if(reason.length<3||reason.length>120||/[\u0000-\u001f\u007f]/.test(reason))return fail(res,400,'Enter a reason between 3 and 120 characters.');
+  if(!await syncMenuOnce())return fail(res,503,'Could not refresh the cloud stock balance. Reconnect and try again; the count was not changed.');
+  try{
+    discardStaleInventoryCount(movementId,currentStaff(res).userId,reason,new Date().toISOString());
+    return res.json({inventory:localInventoryBalances().map(item=>({...item,active:Boolean(item.active),lowStock:Boolean(item.lowStock)})),conflicts:listInventoryCountConflicts()});
+  }catch(error){return fail(res,409,error instanceof Error?error.message:'Could not resolve the stale count.');}
 });
 app.get('/api/kitchen',requireRoles('owner','manager','kitchen'),(_req,res)=>res.json(kitchenSnapshot()));
 app.get('/api/reports/daily',requireRoles('owner','manager','viewer'),(req,res)=>{
