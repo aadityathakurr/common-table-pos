@@ -9,25 +9,13 @@ import LocalInventoryView from './LocalInventoryView';
 
 const formatMoney=(minor:number,currency='INR')=>new Intl.NumberFormat('en-IN',{style:'currency',currency}).format(minor/100);
 const makeId=()=>crypto.randomUUID();
-const CONTEXT_CACHE='common-table.edge-context.v1';
 
 interface EdgeContext {tenantId:string;tenantName:string;outletId:string;outletName:string;terminalId:string;terminalName:string;locationLabel:string;currency:string;timeZone?:string;taxRateBps:number;}
-interface CloudMenuContext {tenantId:string;outletId:string;outletName?:string;currency?:string;}
-interface CloudMenuRow {item_id:string;category_id:string;name:string;price_minor:number;emoji:string;color:string;tag:string|null;vegetarian:boolean;available:boolean;kitchen_station:string;modifiers:ModifierOption[]|null;tax_code:string|null;tax_rate_bps:number|null;}
-interface CloudAreaRow {area_id:string;name:string;sort_order:number;}
-interface CloudTableRow {table_id:string;area_id:string;name:string;capacity:number;sort_order:number;}
-interface CloudStationRow {station_id:string;name:string;sort_order:number;}
 interface FloorTable extends DiningTableConfig {occupied?:boolean;}
 interface FloorArea extends Omit<DiningAreaConfig,'tables'> {tables:FloorTable[];}
 interface FloorPlan {areas:FloorArea[];stations:KitchenStationConfig[];}
 interface SyncStatus {configured:boolean;pending:number;failed:number;lastSyncedAt:string|null;lastError:string|null;menu?:{version?:string;lastSyncedAt?:string;lastError:string|null};}
 interface EdgeStaffSession {userId:string;email:string;displayName:string;role:'owner'|'manager'|'cashier'|'kitchen'|'viewer';tenantId:string;outletId:string;expiresAt:number;}
-function readCachedContext():EdgeContext|null{
-  try{const value=localStorage.getItem(CONTEXT_CACHE);if(!value)return null;const parsed=JSON.parse(value) as Partial<EdgeContext>;return parsed.tenantId&&parsed.outletId&&parsed.terminalId?parsed as EdgeContext:null;}catch{return null;}
-}
-function readCloudMenuContext():CloudMenuContext|null{
-  try{const value=localStorage.getItem('common-table.menu-context.v1');if(!value)return null;const parsed=JSON.parse(value) as Partial<CloudMenuContext>;return parsed.tenantId&&parsed.outletId?parsed as CloudMenuContext:null;}catch{return null;}
-}
 const DEMO_FLOOR_PLAN:FloorPlan={areas:[
   {id:'demo-area-main',name:'Main floor',sortOrder:0,tables:['Table 01','Table 02','Table 03','Table 04','Table 05'].map((name,index)=>({id:`demo-main-${index}`,name,capacity:2,sortOrder:index}))},
   {id:'demo-area-patio',name:'Patio',sortOrder:1,tables:[{id:'demo-patio-0',name:'Patio 01',capacity:4,sortOrder:0}]},
@@ -61,10 +49,6 @@ function parseFloorPlan(value:unknown):FloorPlan|null{
   }
   return {areas,stations};
 }
-function floorCacheKey(tenantId:string,outletId:string){return `common-table.floor-plan.v1:${tenantId}:${outletId}`;}
-function readSavedFloorPlan(tenantId:string,outletId:string):FloorPlan|null{
-  try{const raw=localStorage.getItem(floorCacheKey(tenantId,outletId));if(!raw)return null;const saved=JSON.parse(raw) as {layout?:unknown};return parseFloorPlan(saved.layout);}catch{return null;}
-}
 
 interface CartLine { id:string; item:MenuItem; quantity:number; modifiers:ModifierOption[]; }
 interface LocalTicket { id:string; ticketId:string; kitchenStation:string; ticketStatus:'new'; orderNumber:string; orderType:'dine_in'|'takeaway'; tableLabel:string|null; status:'sent'; note:string|null; createdAt:string; lines:OrderLine[]; pending:true; }
@@ -77,7 +61,7 @@ function ticketStatus(ticket:TicketView):'new'|'preparing'|'ready'{
 function App(){
   const [page,setPage]=useState<'pos'|'kitchen'|'reports'|'inventory'>('pos');
   const [menu,setMenu]=useState<MenuItem[]>(DEMO_MENU);
-  const [menuSource,setMenuSource]=useState<'demo'|'edge'|'cloud'|'offline cache'>('demo');
+  const [menuSource,setMenuSource]=useState<'demo'|'edge'>('demo');
   const [category,setCategory]=useState('All items');
   const [search,setSearch]=useState('');
   const [orderType,setOrderType]=useState<'dine_in'|'takeaway'>('dine_in');
@@ -91,7 +75,7 @@ function App(){
   const [kitchenStationFilter,setKitchenStationFilter]=useState('All stations');
   const [editingOrderId,setEditingOrderId]=useState('');
   const [editCommandId,setEditCommandId]=useState('');
-  const [outletContext,setOutletContext]=useState<EdgeContext|null>(readCachedContext);
+  const [outletContext,setOutletContext]=useState<EdgeContext|null>(null);
   const [isOutletEdge,setIsOutletEdge]=useState(false);
   const [staffSession,setStaffSession]=useState<EdgeStaffSession|null>(null);
   const [staffSessionReady,setStaffSessionReady]=useState(false);
@@ -191,11 +175,9 @@ function App(){
 
   useEffect(()=>{
     void refreshQueue();void refreshOrders();void refreshKitchen();void refreshShift();void refreshSyncStatus();
+    // The cashier service runs on this laptop, so it is the single source for
+    // outlet setup, menu and floor plan; the browser keeps no copies of them.
     void (async()=>{
-      const cloudContext=readCloudMenuContext();
-      const cachedContext=readCachedContext();
-      const layoutContext=cloudContext??cachedContext;
-      if(layoutContext){const saved=readSavedFloorPlan(layoutContext.tenantId,layoutContext.outletId);if(saved)applyFloorPlan(saved);}
       let edgeContext:EdgeContext|null=null;
       try{
         const response=await fetch('/api/context',{cache:'no-store'});
@@ -204,54 +186,11 @@ function App(){
           if(typeof context.tenantId==='string'&&typeof context.outletId==='string'&&typeof context.terminalId==='string')edgeContext=context as EdgeContext;
         }
       }catch{/* Vercel-hosted manager and the outlet edge expose different APIs. */}
-      if(edgeContext){
-        setIsOutletEdge(true);
-        setOutletContext(edgeContext);setTaxRateBps(edgeContext.taxRateBps);
-        try{localStorage.setItem(CONTEXT_CACHE,JSON.stringify(edgeContext));}catch{/* The current session can still work without caching outlet setup. */}
-        try{
-          const response=await fetch('/api/menu',{cache:'no-store'});
-          if(response.ok){const rows=await response.json() as MenuItem[];if(Array.isArray(rows)){setMenu(rows);setMenuSource('edge');return;}}
-        }catch{/* An offline cashier can use the last cloud cache while the edge menu is repaired. */}
-      }
-
-      if(!cloudContext||!supabase)return;
-      const cacheKey=`common-table.menu-cache.v1:${cloudContext.tenantId}:${cloudContext.outletId}`;
-      const {data:sessionData}=await supabase.auth.getSession();
-      const currentUserId=sessionData.session?.user.id;
-      if(!currentUserId)return;
-      try{const cached=localStorage.getItem(cacheKey);if(cached){const saved=JSON.parse(cached) as {userId?:string;items?:MenuItem[]};if(saved.userId===currentUserId&&Array.isArray(saved.items)&&saved.items.length){setMenu(saved.items);setMenuSource('offline cache');}}}catch{/* A bad or stale cache is ignored; the cloud request can repopulate it. */}
-      if(!navigator.onLine)return;
-      const {data:userData,error:userError}=await supabase.auth.getUser();
-      if(userError||!userData.user||userData.user.id!==currentUserId)return;
-      const [categoryResult,itemResult]=await Promise.all([
-        supabase.from('menu_categories').select('category_id,name,active').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('active',true),
-        supabase.from('menu_items').select('item_id,category_id,name,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,modifiers,tax_code,tax_rate_bps').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('available',true).order('sort_order').order('name'),
-      ]);
-      if(categoryResult.error)throw categoryResult.error;
-      if(itemResult.error)throw itemResult.error;
-      const names=new Map((categoryResult.data??[]).map(row=>[row.category_id as string,row.name as string]));
-      const rows=((itemResult.data??[]) as CloudMenuRow[]).map(row=>({
-        id:row.item_id,name:row.name,category:names.get(row.category_id)??'Menu',priceMinor:Number(row.price_minor),emoji:row.emoji,color:row.color,
-        ...(row.tag?{tag:row.tag}:{}),vegetarian:row.vegetarian,available:row.available,kitchenStation:row.kitchen_station,modifiers:Array.isArray(row.modifiers)?row.modifiers:[],taxCode:row.tax_code,taxRateBps:row.tax_rate_bps===null?null:Number(row.tax_rate_bps),
-      } satisfies MenuItem));
-      if(rows.length){
-        setMenu(rows);setMenuSource('cloud');
-        try{localStorage.setItem(cacheKey,JSON.stringify({userId:currentUserId,items:rows}));}catch{/* Current session continues even when storage is full. */}
-      }
-      const [areaResult,tableResult,stationResult]=await Promise.all([
-        supabase.from('dining_areas').select('area_id,name,sort_order').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('active',true).order('sort_order'),
-        supabase.from('dining_tables').select('table_id,area_id,name,capacity,sort_order').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('active',true).order('sort_order'),
-        supabase.from('kitchen_stations').select('station_id,name,sort_order').eq('tenant_id',cloudContext.tenantId).eq('outlet_id',cloudContext.outletId).eq('active',true).order('sort_order'),
-      ]);
-      if(!areaResult.error&&!tableResult.error&&!stationResult.error){
-        const tableRows=(tableResult.data??[]) as CloudTableRow[];
-        const layout:FloorPlan={
-          areas:((areaResult.data??[]) as CloudAreaRow[]).map(area=>({id:area.area_id,name:area.name,sortOrder:Number(area.sort_order),tables:tableRows.filter(table=>table.area_id===area.area_id).map(table=>({id:table.table_id,name:table.name,capacity:Number(table.capacity),sortOrder:Number(table.sort_order)}))})),
-          stations:((stationResult.data??[]) as CloudStationRow[]).map(station=>({id:station.station_id,name:station.name,sortOrder:Number(station.sort_order)})),
-        };
-        applyFloorPlan(layout);
-        try{localStorage.setItem(floorCacheKey(cloudContext.tenantId,cloudContext.outletId),JSON.stringify({layout}));}catch{/* A full cache does not interrupt this session. */}
-      }
+      if(!edgeContext)return;
+      setIsOutletEdge(true);
+      setOutletContext(edgeContext);setTaxRateBps(edgeContext.taxRateBps);
+      const response=await fetch('/api/menu',{cache:'no-store'});
+      if(response.ok){const rows=await response.json() as MenuItem[];if(Array.isArray(rows)){setMenu(rows);setMenuSource('edge');}}
     })().catch(()=>undefined);
     const onOnline=()=>{setOnline(true);void flushQueue();};const onOffline=()=>setOnline(false);
     window.addEventListener('online',onOnline);window.addEventListener('offline',onOffline);
@@ -269,8 +208,7 @@ function App(){
         const layout=parseFloorPlan(await response.json());
         if(!layout||!active)return;
         applyFloorPlan(layout);
-        try{localStorage.setItem(floorCacheKey(outletContext.tenantId,outletContext.outletId),JSON.stringify({layout}));}catch{/* A full cache does not interrupt service. */}
-      }catch{/* The browser retains its last accepted outlet layout. */}
+      }catch{/* Keep the current layout while the local service restarts. */}
     };
     void refreshFloorPlan();
     const interval=window.setInterval(()=>void refreshFloorPlan(),30_000);
