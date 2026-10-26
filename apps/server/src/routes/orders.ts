@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import type { AddOrderLinesCommand, CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderLineDraft, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
 import { allocateNumber, createId, db, DATABASE_PATH, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, discardStaleInventoryCount, enqueueSyncEvent, listInventoryCountConflicts, localInventoryBalances, recordManualInventoryMovement, recordPaidOrderInventoryConsumption, syncOutboxStatus } from '../database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from '../config.js';
-import { formatKitchenTicket, formatReceipt, printerStatus, sendToPrinter } from '../printer.js';
+import { formatKitchenTicket, formatReceipt, formatShareSlip, printerStatus, sendToPrinter } from '../printer.js';
 import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from '../reports.js';
 import { getSyncStatus, syncMenuOnce } from '../sync.js';
 import { clearedSessionCookie, createStaffSession, currentStaff, readStaffSession, refreshStaffSession, requireRoles, sessionCookie, StaffAuthError } from '../auth.js';
@@ -148,8 +148,18 @@ app.post('/api/orders/:orderId/payment',requireRoles('owner','manager','cashier'
   const body=req.body as Partial<PaymentCommand>;
   if(typeof body.commandId!=='string'||body.commandId.length<8)return fail(res,400,'A stable payment commandId is required.');
   const before=orderById(routeParam(req,'orderId'));if(!before)return fail(res,404,'Order not found.');
-  const tenders=Array.isArray(body.tenders)?body.tenders:[{method:body.method,amountMinor:body.amountMinor}];
-  if(tenders.length<1||tenders.length>3)return fail(res,400,'Choose between one and three tenders.');
+  type TenderInput={method?:PaymentMethod|undefined;amountMinor?:number|undefined;label?:string|undefined;lineIds?:string[]|undefined};
+  const tenders:Array<TenderInput|undefined>=Array.isArray(body.tenders)?body.tenders:[{method:body.method,amountMinor:body.amountMinor}];
+  if(tenders.length<1||tenders.length>10)return fail(res,400,'Choose between one and ten tenders.');
+  // Split-bill shares: an optional guest label per tender, optionally tied to that guest's items.
+  const activeLineIds=new Set(before.lines.filter(line=>!line.voidedAt).map(line=>line.id));const claimed=new Set<string>();
+  for(const tender of tenders){
+    if(tender?.label!==undefined&&(typeof tender.label!=='string'||!tender.label.trim()||tender.label.length>40))return fail(res,400,'Each split share label must be 1-40 characters.');
+    if(tender?.lineIds!==undefined){
+      if(!Array.isArray(tender.lineIds)||tender.lineIds.some(id=>typeof id!=='string'||!activeLineIds.has(id)||claimed.has(id)))return fail(res,400,'Each item can belong to only one split share.');
+      for(const id of tender.lineIds)claimed.add(id);
+    }
+  }
   const payments=tenders.map((tender,index)=>({
     commandId:tenders.length===1?body.commandId:`${body.commandId}:${index+1}`,
     method:tender?.method,amountMinor:tender?.amountMinor,
@@ -193,6 +203,7 @@ app.post('/api/orders/:orderId/payment',requireRoles('owner','manager','cashier'
   });pay();
   const order=orderById(before.id)!;publish('order.updated',order);
   queuePrint(formatReceipt(order,orderTenders(order.id)),'Receipt');
+  for(const tender of tenders)if(tender?.label)queuePrint(formatShareSlip(order,{label:tender.label.trim(),method:String(tender.method),amountMinor:Number(tender.amountMinor),...(tender.lineIds?{lineIds:tender.lineIds}:{})}),'Split share');
   return res.json(order);
 });
 app.post('/api/orders/:orderId/receipt/reprint',requireRoles('owner','manager','cashier'),async(req,res)=>{

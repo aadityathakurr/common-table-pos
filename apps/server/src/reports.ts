@@ -1,4 +1,4 @@
-import type { DailySalesReport, PaymentMethod } from '@common-table/contracts';
+import type { DailySalesReport, PaymentMethod, TableReport, TableReportRow } from '@common-table/contracts';
 import { EDGE_CONFIG } from './config.js';
 import { db } from './database.js';
 
@@ -170,5 +170,57 @@ export function dailySalesCsv(report: DailySalesReport): string {
     ['voids', 'voided_lines', report.voids.lineCount, report.voids.amountMinor, report.currency, `${report.voids.quantity} units`],
     ['shifts', 'closed_shifts', report.shifts.closedCount, report.shifts.varianceMinor, report.currency, `expected ${report.shifts.expectedCashMinor}; counted ${report.shifts.countedCashMinor}`],
   ];
+  return `${rows.map(row => row.map(csvCell).join(',')).join('\r\n')}\r\n`;
+}
+
+/** Dine-in performance per table and per area for orders settled on the business day. */
+export function buildTableReport(date = localBusinessDate()): TableReport | undefined {
+  const range = reportRange(date);
+  if (!range) return undefined;
+  const rows = db.prepare(`SELECT o.table_id AS tableId,o.table_label AS tableLabel,o.guest_count AS guestCount,o.total_minor AS totalMinor,
+      o.created_at AS createdAt,t.name AS tableName,t.active AS tableActive,a.name AS areaName,
+      (SELECT MIN(p.created_at) FROM payment_events p WHERE p.order_id=o.id AND p.status='succeeded' AND p.entry_type='tender') AS paidAt
+    FROM orders o LEFT JOIN dining_tables t ON t.id=o.table_id LEFT JOIN dining_areas a ON a.id=t.area_id
+    WHERE o.tenant_id=? AND o.outlet_id=? AND o.status='paid' AND o.order_type='dine_in'
+      AND EXISTS (SELECT 1 FROM payment_events p WHERE p.tenant_id=o.tenant_id AND p.outlet_id=o.outlet_id
+        AND p.order_id=o.id AND p.status='succeeded' AND p.entry_type='tender' AND p.created_at>=? AND p.created_at<?)`)
+    .all(EDGE_CONFIG.tenantId, EDGE_CONFIG.outletId, range.startAt, range.endAt) as Array<{
+      tableId: string | null; tableLabel: string | null; guestCount: number; totalMinor: number; createdAt: string;
+      tableName: string | null; tableActive: number | null; areaName: string | null; paidAt: string }>;
+  type Bucket = { tableId: string | null; tableName: string; areaName: string; orders: number; guests: number; sales: number; minutes: number };
+  const tables = new Map<string, Bucket>();
+  for (const row of rows) {
+    // Removed tables keep their order history under the name they were served with.
+    const tableName = row.tableActive ? row.tableName! : row.tableLabel ?? 'Unassigned';
+    const key = row.tableId ?? `label:${tableName}`;
+    const bucket = tables.get(key) ?? { tableId: row.tableId, tableName, areaName: row.areaName?.replace(/ \(removed [0-9a-f]{6}\)$/, '') ?? 'Unassigned', orders: 0, guests: 0, sales: 0, minutes: 0 };
+    bucket.orders += 1; bucket.guests += Number(row.guestCount); bucket.sales += Number(row.totalMinor);
+    bucket.minutes += Math.max(0, (Date.parse(row.paidAt) - Date.parse(row.createdAt)) / 60000);
+    tables.set(key, bucket);
+  }
+  const finish = (bucket: Omit<Bucket, 'tableId' | 'tableName'>): Omit<TableReportRow, 'tableId' | 'tableName'> => ({
+    areaName: bucket.areaName, orderCount: bucket.orders, guestCount: bucket.guests, salesMinor: bucket.sales,
+    averageBillMinor: bucket.orders ? Math.round(bucket.sales / bucket.orders) : 0,
+    averageSeatedMinutes: bucket.orders ? Math.round(bucket.minutes / bucket.orders) : 0,
+  });
+  const areas = new Map<string, Omit<Bucket, 'tableId' | 'tableName'>>();
+  for (const bucket of tables.values()) {
+    const area = areas.get(bucket.areaName) ?? { areaName: bucket.areaName, orders: 0, guests: 0, sales: 0, minutes: 0 };
+    area.orders += bucket.orders; area.guests += bucket.guests; area.sales += bucket.sales; area.minutes += bucket.minutes;
+    areas.set(bucket.areaName, area);
+  }
+  return {
+    date, currency: EDGE_CONFIG.currency,
+    tables: [...tables.values()].map(bucket => ({ tableId: bucket.tableId, tableName: bucket.tableName, ...finish(bucket) }))
+      .sort((a, b) => b.salesMinor - a.salesMinor || a.tableName.localeCompare(b.tableName)),
+    areas: [...areas.values()].map(finish).sort((a, b) => b.salesMinor - a.salesMinor),
+  };
+}
+
+export function tableReportCsv(report: TableReport): string {
+  const header = ['level', 'area', 'table', 'orders', 'guests', 'sales_minor', 'average_bill_minor', 'average_seated_minutes', 'currency'];
+  const rows: Array<Array<string | number>> = [header,
+    ...report.areas.map(row => ['area', row.areaName, '', row.orderCount, row.guestCount, row.salesMinor, row.averageBillMinor, row.averageSeatedMinutes, report.currency]),
+    ...report.tables.map(row => ['table', row.areaName, row.tableName, row.orderCount, row.guestCount, row.salesMinor, row.averageBillMinor, row.averageSeatedMinutes, report.currency])];
   return `${rows.map(row => row.map(csvCell).join(',')).join('\r\n')}\r\n`;
 }

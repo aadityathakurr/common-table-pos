@@ -3,7 +3,7 @@ import express, { type Express, type Request, type Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import type { AddOrderLinesCommand, CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderLineDraft, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
 import { allocateNumber, createId, db, DATABASE_PATH, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, discardStaleInventoryCount, enqueueSyncEvent, listInventoryCountConflicts, localInventoryBalances, recordManualInventoryMovement, recordPaidOrderInventoryConsumption, syncOutboxStatus } from '../database.js';
-import { checkEdgeConfiguration, EDGE_CONFIG } from '../config.js';
+import { checkEdgeConfiguration, EDGE_CONFIG, setupMode } from '../config.js';
 import { formatKitchenTicket, formatReceipt, printerStatus, sendToPrinter } from '../printer.js';
 import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from '../reports.js';
 import { getSyncStatus, syncMenuOnce } from '../sync.js';
@@ -16,7 +16,7 @@ app.get('/api/health',(_req,res)=>res.json({status:'ok',service:'common-table-ed
 app.get('/api/context',(_req,res)=>res.json({
   tenantId:DEMO_TENANT,tenantName:EDGE_CONFIG.tenantName,outletId:DEMO_OUTLET,outletName:EDGE_CONFIG.outletName,
   terminalId:DEMO_TERMINAL,terminalName:EDGE_CONFIG.terminalName,locationLabel:EDGE_CONFIG.locationLabel,
-  currency:EDGE_CONFIG.currency,timeZone:EDGE_CONFIG.timezone,taxRateBps:EDGE_CONFIG.taxRateBps,
+  currency:EDGE_CONFIG.currency,timeZone:EDGE_CONFIG.timezone,taxRateBps:EDGE_CONFIG.taxRateBps,setupMode:setupMode(),
   receipt:{name:EDGE_CONFIG.receiptName,address:EDGE_CONFIG.receiptAddress,phone:EDGE_CONFIG.receiptPhone,gstin:EDGE_CONFIG.gstin,footer:EDGE_CONFIG.receiptFooter},
 }));
 app.get('/api/ready',(_req,res)=>{

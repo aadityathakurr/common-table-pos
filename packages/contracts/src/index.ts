@@ -65,6 +65,8 @@ export interface CreateOrderCommand {
   outletId: string;
   terminalId: string;
   orderType: OrderType;
+  /** Preferred for dine-in. A legacy client may send only tableLabel. */
+  tableId?: string;
   tableLabel?: string;
   guestCount?: number;
   note?: string;
@@ -125,6 +127,8 @@ export interface OrderRecord extends KitchenOrder {
   taxTotalMinor: number;
   totalMinor: number;
   paymentMethod?: PaymentMethod;
+  tableId?: string | null;
+  billPrintedAt?: string | null;
 }
 
 export interface PaymentCommand {
@@ -133,7 +137,15 @@ export interface PaymentCommand {
   shiftId: string;
   method?: PaymentMethod;
   amountMinor?: number;
-  tenders?: Array<{ method: PaymentMethod; amountMinor: number }>;
+  tenders?: PaymentTender[];
+}
+
+/** One tender of a payment. A label (e.g. "Guest 2") prints a share slip; lineIds narrow it to those items. */
+export interface PaymentTender {
+  method: PaymentMethod;
+  amountMinor: number;
+  label?: string;
+  lineIds?: string[];
 }
 
 export interface ShiftRecord {
@@ -181,7 +193,7 @@ export interface CashMovementCommand {
 }
 
 export interface ServerMessage {
-  type: 'kitchen.snapshot' | 'order.created' | 'order.updated' | 'server.ready';
+  type: 'kitchen.snapshot' | 'order.created' | 'order.updated' | 'floor.updated' | 'server.ready';
   payload: KitchenOrder[] | KitchenOrder | { outletId: string };
 }
 
@@ -246,3 +258,55 @@ export const DEMO_MENU: MenuItem[] = [
   demoItem('masala-chaas','Masala Chaas','Beverages',55,'🥛','#e9e8d9','Beverages'),
   demoItem('mango-shake','Mango Shake','Beverages',110,'🥭','#f2e6ce','Beverages'),
 ];
+
+/** Who owns outlet setup: this laptop while unpaired, the cloud portal once paired. */
+export type SetupMode = 'standalone' | 'cloud';
+
+export type FloorTableStatus = 'free' | 'occupied' | 'bill_printed' | 'ready';
+
+export interface FloorTableView {
+  id: string;
+  name: string;
+  capacity: number;
+  sortOrder: number;
+  status: FloorTableStatus;
+  order: null | {
+    id: string;
+    orderNumber: string;
+    guestCount: number;
+    totalMinor: number;
+    createdAt: string;
+    billPrintedAt: string | null;
+  };
+}
+
+export interface FloorAreaView {
+  id: string;
+  name: string;
+  sortOrder: number;
+  tables: FloorTableView[];
+}
+
+export interface FloorView {
+  setupMode: SetupMode;
+  currency: string;
+  areas: FloorAreaView[];
+}
+
+export interface TableReportRow {
+  tableId: string | null;
+  tableName: string;
+  areaName: string;
+  orderCount: number;
+  guestCount: number;
+  salesMinor: number;
+  averageBillMinor: number;
+  averageSeatedMinutes: number;
+}
+
+export interface TableReport {
+  date: string;
+  currency: string;
+  tables: TableReportRow[];
+  areas: Array<Omit<TableReportRow, 'tableId' | 'tableName'>>;
+}

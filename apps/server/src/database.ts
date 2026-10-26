@@ -77,6 +77,16 @@ if (!paymentColumns.some(column => column.name === 'shift_id')) db.exec('ALTER T
 if (!paymentColumns.some(column => column.name === 'entry_type')) db.exec("ALTER TABLE payment_events ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'tender'");
 if (!paymentColumns.some(column => column.name === 'refund_of')) db.exec('ALTER TABLE payment_events ADD COLUMN refund_of TEXT');
 if (!paymentColumns.some(column => column.name === 'refund_reason')) db.exec('ALTER TABLE payment_events ADD COLUMN refund_reason TEXT');
+const orderColumns = db.pragma('table_info(orders)') as Array<{ name: string }>;
+// No foreign key: a cloud snapshot replaces dining tables wholesale, and orders
+// must keep pointing at the table they were served on.
+if (!orderColumns.some(column => column.name === 'table_id')) {
+  db.exec('ALTER TABLE orders ADD COLUMN table_id TEXT');
+  db.exec(`UPDATE orders SET table_id=(SELECT t.id FROM dining_tables t WHERE t.tenant_id=orders.tenant_id
+    AND t.outlet_id=orders.outlet_id AND t.name=orders.table_label) WHERE table_label IS NOT NULL`);
+}
+if (!orderColumns.some(column => column.name === 'bill_printed_at')) db.exec('ALTER TABLE orders ADD COLUMN bill_printed_at TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS orders_by_table ON orders(tenant_id,outlet_id,table_id,status)');
 db.exec('CREATE INDEX IF NOT EXISTS payments_by_shift ON payment_events(tenant_id,outlet_id,shift_id,method,status)');
 db.exec('CREATE INDEX IF NOT EXISTS payments_by_refund ON payment_events(tenant_id,outlet_id,refund_of,status)');
 
@@ -84,6 +94,34 @@ export const DEMO_TENANT = EDGE_CONFIG.tenantId;
 export const DEMO_OUTLET = EDGE_CONFIG.outletId;
 export const DEMO_TERMINAL = EDGE_CONFIG.terminalId;
 export const DEMO_ACTOR = EDGE_CONFIG.actorId;
+
+export function edgeSetting(key: string): string | undefined {
+  return (db.prepare('SELECT value FROM edge_settings WHERE key=?').get(key) as { value: string } | undefined)?.value;
+}
+export function setEdgeSetting(key: string, value: string): void {
+  db.prepare(`INSERT INTO edge_settings(key,value,updated_at) VALUES(?,?,?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(key, value, new Date().toISOString());
+}
+
+/**
+ * Runs a local command (setup change, table move or merge) at most once per commandId. A retry with the same
+ * request returns the stored result; reusing the ID for a different request throws.
+ */
+export function runLocalCommand<T>(commandId: string, action: string, request: unknown, apply: () => T): { result: T; duplicate: boolean } {
+  const requestJson = JSON.stringify(request);
+  return db.transaction(() => {
+    const previous = db.prepare('SELECT action,request_json,result_json FROM local_commands WHERE command_id=?').get(commandId) as
+      { action: string; request_json: string; result_json: string } | undefined;
+    if (previous) {
+      if (previous.action !== action || previous.request_json !== requestJson) throw new Error('This commandId was already used for a different change.');
+      return { result: JSON.parse(previous.result_json) as T, duplicate: true };
+    }
+    const result = apply();
+    db.prepare('INSERT INTO local_commands(command_id,action,request_json,result_json,occurred_at) VALUES(?,?,?,?,?)')
+      .run(commandId, action, requestJson, JSON.stringify(result ?? null), new Date().toISOString());
+    return { result, duplicate: false };
+  })();
+}
 
 const seed = db.transaction(() => {
   db.prepare('INSERT OR IGNORE INTO tenants(id,name) VALUES(?,?)').run(DEMO_TENANT, EDGE_CONFIG.tenantName);
@@ -95,7 +133,14 @@ const seed = db.transaction(() => {
       EDGE_CONFIG.gstin || null, EDGE_CONFIG.receiptFooter || null);
   db.prepare('INSERT OR IGNORE INTO terminals(id,tenant_id,outlet_id,name) VALUES(?,?,?,?)')
     .run(DEMO_TERMINAL, DEMO_TENANT, DEMO_OUTLET, EDGE_CONFIG.terminalName);
-  if (process.env.NODE_ENV !== 'production') {
+  // Seed the training layout and menu once, so tables or items a manager removes
+  // locally do not reappear on the next restart. Databases seeded before this
+  // flag existed already have menu rows and count as seeded.
+  const alreadySeeded = edgeSetting('demo_seeded') === '1'
+    || Boolean(db.prepare('SELECT 1 FROM menu_items WHERE tenant_id=? AND outlet_id=? LIMIT 1').get(DEMO_TENANT, DEMO_OUTLET));
+  const seedDemo = process.env.NODE_ENV !== 'production' && !alreadySeeded;
+  if (process.env.NODE_ENV !== 'production') setEdgeSetting('demo_seeded', '1');
+  if (seedDemo) {
     const areas = [
       { id: 'demo-area-main', name: 'Main floor', order: 0, tables: ['Table 01','Table 02','Table 03','Table 04','Table 05'] },
       { id: 'demo-area-patio', name: 'Patio', order: 1, tables: ['Patio 01'] },
@@ -114,7 +159,7 @@ const seed = db.transaction(() => {
   const insert = db.prepare(`INSERT OR IGNORE INTO menu_items
       (id,tenant_id,outlet_id,name,category,price_minor,emoji,color,tag,vegetarian,available,kitchen_station,tax_code,tax_rate_bps)
     VALUES(@id,@tenantId,@outletId,@name,@category,@priceMinor,@emoji,@color,@tag,@vegetarian,@available,@kitchenStation,@taxCode,@taxRateBps)`);
-  if (process.env.NODE_ENV !== 'production') for (const item of DEMO_MENU) insert.run({
+  if (seedDemo) for (const item of DEMO_MENU) insert.run({
     id:item.id,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,name:item.name,category:item.category,
     priceMinor:item.priceMinor,emoji:item.emoji,color:item.color,tag:item.tag??null,
     vegetarian:item.vegetarian?1:0,available:item.available?1:0,kitchenStation:item.kitchenStation,
@@ -123,7 +168,7 @@ const seed = db.transaction(() => {
   const insertModifier=db.prepare(`INSERT OR IGNORE INTO menu_modifiers
     (id,tenant_id,outlet_id,menu_item_id,group_name,name,price_delta_minor,sort_order)
     VALUES(@id,@tenantId,@outletId,@menuItemId,@group,@name,@priceDeltaMinor,@sortOrder)`);
-  if (process.env.NODE_ENV !== 'production') for(const item of DEMO_MENU)item.modifiers.forEach((modifier,index)=>insertModifier.run({
+  if (seedDemo) for(const item of DEMO_MENU)item.modifiers.forEach((modifier,index)=>insertModifier.run({
     id:modifier.id,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,menuItemId:item.id,group:modifier.group,
     name:modifier.name,priceDeltaMinor:modifier.priceDeltaMinor,sortOrder:index,
   }));

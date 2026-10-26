@@ -198,3 +198,10 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
 );
 CREATE INDEX IF NOT EXISTS sync_outbox_pending
   ON sync_outbox(next_attempt_at,outbox_id) WHERE synced_at IS NULL;
+CREATE TABLE IF NOT EXISTS edge_settings (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS local_commands (
+  command_id TEXT PRIMARY KEY, action TEXT NOT NULL, request_json TEXT NOT NULL,
+  result_json TEXT NOT NULL, occurred_at TEXT NOT NULL
+);

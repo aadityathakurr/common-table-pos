@@ -48,14 +48,17 @@ export function formatKitchenTicket(order: KitchenOrder): Buffer {
   return Buffer.concat(parts);
 }
 
-export function formatReceipt(order: OrderRecord, tenders: Array<{ method: string; amountMinor: number }> = []): Buffer {
+/** A pre-payment bill handed to a table; it carries no invoice number and no tenders. */
+export function formatBill(order: OrderRecord): Buffer { return formatReceipt(order, [], 'bill'); }
+
+export function formatReceipt(order: OrderRecord, tenders: Array<{ method: string; amountMinor: number }> = [], kind: 'receipt'|'bill' = 'receipt'): Buffer {
   const receiptName=EDGE_CONFIG.receiptName||EDGE_CONFIG.tenantName;
   const receiptAddress=EDGE_CONFIG.receiptAddress||EDGE_CONFIG.locationLabel;
   const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text(`${receiptName}\n${EDGE_CONFIG.outletName}\n`),command(ESC,0x45,0),
     text(`${wrap(receiptAddress).join('\n')}\n`),
     ...(EDGE_CONFIG.receiptPhone?[text(`Phone: ${EDGE_CONFIG.receiptPhone}\n`)]:[]),
     ...(EDGE_CONFIG.gstin?[text(`GSTIN: ${EDGE_CONFIG.gstin}\n`)]:[]),
-    text(line('=')+'\n'),text(`INVOICE  ${order.invoiceNumber??'PENDING'}\n`),
+    text(line('=')+'\n'),text(kind==='bill'?'BILL - NOT A TAX INVOICE\n':`INVOICE  ${order.invoiceNumber??'PENDING'}\n`),
     text(`ORDER    ${order.orderNumber}\n`),text(`${new Date(order.createdAt).toLocaleString('en-IN',{timeZone:EDGE_CONFIG.timezone})}\n`),
     text(`${order.orderType==='dine_in'?(order.tableLabel??'Dine in'):'Takeaway'} - ${order.guestCount} guest(s)\n`),text(line()+'\n')];
   for(const item of order.lines.filter(line=>!line.voidedAt)){parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor,order.currency))+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor,order.currency)})`:''}\n`));}
@@ -68,9 +71,21 @@ export function formatReceipt(order: OrderRecord, tenders: Array<{ method: strin
   parts.push(text(line()+'\n'),text(columns('Subtotal',money(order.subtotalMinor,order.currency))+'\n'),
     ...taxRows.map(bucket=>text(columns(`Tax ${bucket.rate/100}%${bucket.code?` HSN/SAC ${bucket.code}`:''}`,money(bucket.amount,order.currency))+'\n')),
     command(ESC,0x45,1),text(columns('TOTAL',money(order.totalMinor,order.currency))+'\n'),command(ESC,0x45,0),
-    ...(tenders.length?tenders:[{method:order.paymentMethod??'cash',amountMinor:order.totalMinor}])
-      .map(tender=>text(columns(`Paid - ${tender.method.toUpperCase()}`,money(tender.amountMinor,order.currency))+'\n')),text(line('=')+'\n'),
+    ...(kind==='bill'?[text('Please pay at the counter.\n')]:(tenders.length?tenders:[{method:order.paymentMethod??'cash',amountMinor:order.totalMinor}])
+      .map(tender=>text(columns(`Paid - ${tender.method.toUpperCase()}`,money(tender.amountMinor,order.currency))+'\n'))),text(line('=')+'\n'),
     command(ESC,0x61,1),text(`${wrap(EDGE_CONFIG.receiptFooter||'Thank you. See you again!').join('\n')}\n\n`),command(GS,0x56,0x41,0x03));
+  return Buffer.concat(parts);
+}
+
+/** One guest's share of a split bill, printed after the single invoice is paid. */
+export function formatShareSlip(order: OrderRecord, share: { label: string; method: string; amountMinor: number; lineIds?: string[] }): Buffer {
+  const lines=share.lineIds?.length?order.lines.filter(item=>share.lineIds!.includes(item.id)&&!item.voidedAt):[];
+  const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text('SPLIT BILL SHARE\n'),command(ESC,0x45,0),command(ESC,0x61,0),
+    text(line('=')+'\n'),text(columns('INVOICE',order.invoiceNumber??'PENDING')+'\n'),text(columns(share.label,order.tableLabel??'Takeaway')+'\n'),text(line()+'\n')];
+  for(const item of lines)parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor,order.currency))+'\n'));
+  if(lines.length)parts.push(text('Item prices exclude tax and charges.\n'),text(line()+'\n'));
+  parts.push(command(ESC,0x45,1),text(columns(`Paid - ${share.method.toUpperCase()}`,money(share.amountMinor,order.currency))+'\n'),command(ESC,0x45,0),
+    text(line('=')+'\n\n'),command(GS,0x56,0x41,0x03));
   return Buffer.concat(parts);
 }
 

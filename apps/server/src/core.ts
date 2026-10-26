@@ -36,6 +36,7 @@ export function mapOrder(row:Record<string,unknown>):OrderRecord{
     taxRateBps:Number(row.tax_rate_bps),subtotalMinor:Number(row.subtotal_minor),taxTotalMinor:Number(row.tax_total_minor),
     totalMinor:Number(row.total_minor),...(row.invoice_number?{invoiceNumber:String(row.invoice_number)}:{}),
     ...(row.payment_method?{paymentMethod:row.payment_method as PaymentMethod}:{}),
+    tableId:row.table_id==null?null:String(row.table_id),billPrintedAt:row.bill_printed_at==null?null:String(row.bill_printed_at),
   };
 }
 export function orderById(id:string):OrderRecord|undefined{
@@ -159,7 +160,17 @@ export function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{orde
   if(command.tenantId!==DEMO_TENANT||command.outletId!==DEMO_OUTLET||command.terminalId!==DEMO_TERMINAL)throw new Error('Unknown demo tenant, outlet, or terminal.');
   if(!Array.isArray(command.lines)||command.lines.length===0||command.lines.length>50)throw new Error('An order needs between 1 and 50 items.');
   if(command.orderType!=='dine_in'&&command.orderType!=='takeaway')throw new Error('Unsupported order type.');
-  if(command.orderType==='dine_in'&&!command.tableLabel?.trim())throw new Error('Choose a table for dine-in orders.');
+  if(command.orderType==='dine_in'&&!command.tableId&&!command.tableLabel?.trim())throw new Error('Choose a table for dine-in orders.');
+  let tableId:string|null=null;let tableLabel:string|null=null;
+  if(command.orderType==='dine_in'){
+    const table=findTable(command.tableId,command.tableLabel);
+    if(table){
+      if(activeOrderAtTable(table.id))throw new Error(`${table.name} already has an open order. Add items to it or merge the tables.`);
+      tableId=table.id;tableLabel=table.name;
+    }else if(command.tableId)throw new Error('Choose a table that exists on this floor.');
+    // Orders queued offline by older clients may name a table that no longer exists; keep the label.
+    else tableLabel=command.tableLabel!.trim().slice(0,40);
+  }
   const prepared=prepareLines(command.lines);
   const subtotalMinor=prepared.reduce((sum,line)=>sum+line.lineTotalMinor,0);
   const taxTotalMinor=prepared.reduce((sum,line)=>sum+Math.round(line.lineTotalMinor*line.taxRateBps/10000),0);
@@ -167,10 +178,10 @@ export function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{orde
   const orderId=randomUUID();const timestamp=new Date().toISOString();
   const create=db.transaction(()=>{
     const orderNumber=allocateNumber('order','ORD');
-    db.prepare(`INSERT INTO orders(id,command_id,tenant_id,outlet_id,terminal_id,order_number,order_type,table_label,guest_count,status,note,currency,subtotal_minor,tax_total_minor,tax_rate_bps,total_minor,created_at,updated_at)
-      VALUES(@id,@commandId,@tenantId,@outletId,@terminalId,@orderNumber,@orderType,@tableLabel,@guestCount,'sent',@note,@currency,@subtotalMinor,@taxTotalMinor,@taxRateBps,@totalMinor,@createdAt,@updatedAt)`).run({
+    db.prepare(`INSERT INTO orders(id,command_id,tenant_id,outlet_id,terminal_id,order_number,order_type,table_id,table_label,guest_count,status,note,currency,subtotal_minor,tax_total_minor,tax_rate_bps,total_minor,created_at,updated_at)
+      VALUES(@id,@commandId,@tenantId,@outletId,@terminalId,@orderNumber,@orderType,@tableId,@tableLabel,@guestCount,'sent',@note,@currency,@subtotalMinor,@taxTotalMinor,@taxRateBps,@totalMinor,@createdAt,@updatedAt)`).run({
       id:orderId,commandId:command.commandId,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,terminalId:DEMO_TERMINAL,orderNumber,
-      orderType:command.orderType,tableLabel:command.orderType==='dine_in'?command.tableLabel:null,guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),
+      orderType:command.orderType,tableId,tableLabel,guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),
       note:command.note?.slice(0,140)??null,currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,
     });
     const insertLine=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note,tax_code_snapshot,tax_rate_bps)
@@ -181,7 +192,7 @@ export function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{orde
     for(const station of stations)insertTicket.run(createId(),DEMO_TENANT,DEMO_OUTLET,orderId,station,timestamp);
     audit('order',orderId,'order.sent_to_kitchen',null,{orderNumber,terminalId:DEMO_TERMINAL,lineCount:prepared.length},actorId);
     enqueueSyncEvent('order',orderId,'order.created',{id:orderId,commandId:command.commandId,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,
-      terminalId:DEMO_TERMINAL,orderNumber,orderType:command.orderType,tableLabel:command.orderType==='dine_in'?command.tableLabel:null,
+      terminalId:DEMO_TERMINAL,orderNumber,orderType:command.orderType,tableId,tableLabel,
       guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),status:'sent',note:command.note?.slice(0,140)??null,
       currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,
       lines:prepared.map(line=>({id:line.id,menuItemId:line.menuItemId,name:line.name,category:line.category,quantity:line.quantity,
@@ -196,4 +207,17 @@ export function orderTenders(orderId:string):Array<{method:PaymentMethod;amountM
   return (db.prepare(`SELECT method,amount_minor AS amountMinor FROM payment_events WHERE tenant_id=? AND outlet_id=? AND order_id=?
     AND status='succeeded' AND entry_type='tender' ORDER BY created_at,id`).all(DEMO_TENANT,DEMO_OUTLET,orderId) as Array<{method:PaymentMethod;amountMinor:number}>)
     .map(row=>({method:row.method,amountMinor:Number(row.amountMinor)}));
+}
+
+export interface TableRow {id:string;areaId:string;name:string;capacity:number;sortOrder:number;active:number}
+/** Finds an active table by ID, or by name for clients that only send a label. */
+export function findTable(tableId?:string,tableLabel?:string):TableRow|undefined{
+  const columns='id,area_id AS areaId,name,capacity,sort_order AS sortOrder,active';
+  if(tableId)return db.prepare(`SELECT ${columns} FROM dining_tables WHERE tenant_id=? AND outlet_id=? AND id=? AND active=1`).get(DEMO_TENANT,DEMO_OUTLET,tableId) as TableRow|undefined;
+  if(tableLabel?.trim())return db.prepare(`SELECT ${columns} FROM dining_tables WHERE tenant_id=? AND outlet_id=? AND name=? AND active=1`).get(DEMO_TENANT,DEMO_OUTLET,tableLabel.trim()) as TableRow|undefined;
+  return undefined;
+}
+export function activeOrderAtTable(tableId:string):{id:string}|undefined{
+  return db.prepare(`SELECT id FROM orders WHERE tenant_id=? AND outlet_id=? AND table_id=? AND status IN ('sent','preparing','ready')`)
+    .get(DEMO_TENANT,DEMO_OUTLET,tableId) as {id:string}|undefined;
 }

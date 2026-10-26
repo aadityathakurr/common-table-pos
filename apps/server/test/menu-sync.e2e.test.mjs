@@ -242,7 +242,7 @@ test('managed menu sync is local-first across WAN loss and an edge restart', { t
   assert.deepEqual((await jsonRequest(baseUrl, '/api/context')).body, {
     tenantId, tenantName: 'Test Cafe', outletId, outletName: outletConfig.name,
     terminalId, terminalName: 'Counter 1', locationLabel: 'Test Location',
-    currency: 'USD', timeZone: 'UTC', taxRateBps: 1000,
+    currency: 'USD', timeZone: 'UTC', taxRateBps: 1000, setupMode: 'cloud',
     receipt: { name: outletConfig.receiptName, address: outletConfig.receiptAddress, phone: outletConfig.receiptPhone,
       gstin: outletConfig.gstin, footer: outletConfig.receiptFooter },
   }, 'the paired edge applies cloud outlet settings');
