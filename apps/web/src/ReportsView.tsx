@@ -128,6 +128,7 @@ export default function ReportsView({ timeZone, currency='INR', canManage=false 
           ['Refunds', money(report.refunds.amountMinor), `${report.refunds.count} refund${report.refunds.count===1?'':'s'} recorded`],
           ['Cash variance', money(report.shifts.varianceMinor), `${report.shifts.closedCount} shifts closed`],
           ['Voids', money(report.voids.amountMinor), `${report.voids.lineCount} lines · ${report.voids.quantity} units`],
+          ['Discounts', money(report.totals.discountMinor), `Service charge ${money(report.totals.serviceChargeMinor)} · round-off ${money(report.totals.roundOffMinor)}`],
         ].map(([label,value,caption])=><article key={label} className={card}><p className="text-[9px] font-semibold text-[#87948d]">{label}</p><strong className="mt-2 block text-[22px] tracking-[-.6px] text-[#293c31]">{value}</strong><small className="mt-1 block text-[9px] text-[#98a29d]">{caption}</small></article>)}
       </div>
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
