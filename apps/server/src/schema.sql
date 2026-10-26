@@ -219,3 +219,8 @@ CREATE TABLE IF NOT EXISTS order_tax_lines (
   taxable_minor INTEGER NOT NULL, cgst_minor INTEGER NOT NULL, sgst_minor INTEGER NOT NULL,
   PRIMARY KEY(order_id,tax_rate_bps,tax_code)
 );
+CREATE TABLE IF NOT EXISTS customers (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, outlet_id TEXT NOT NULL, phone TEXT NOT NULL, name TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  FOREIGN KEY(tenant_id,outlet_id) REFERENCES outlets(tenant_id,id), UNIQUE(tenant_id,outlet_id,phone)
+);

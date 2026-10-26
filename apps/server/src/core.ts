@@ -2,10 +2,11 @@
 import type { Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import type { AddOrderLinesCommand, CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderLineDraft, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
-import { allocateNumber, createId, db, DATABASE_PATH, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, discardStaleInventoryCount, enqueueSyncEvent, listInventoryCountConflicts, localInventoryBalances, recordManualInventoryMovement, recordPaidOrderInventoryConsumption, syncOutboxStatus } from './database.js';
+import { allocateNumber, allocateToken, createId, db, DATABASE_PATH, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, discardStaleInventoryCount, enqueueSyncEvent, listInventoryCountConflicts, localInventoryBalances, recordManualInventoryMovement, recordPaidOrderInventoryConsumption, syncOutboxStatus } from './database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
 import { priceBill, roundToMinorFor } from '@common-table/contracts';
 import { operationalSettings } from './settings.js';
+import type { CustomerInput, CustomerRecord } from '@common-table/contracts';
 import { formatKitchenTicket, formatReceipt, printerStatus, sendToPrinter } from './printer.js';
 import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from './reports.js';
 import { getSyncStatus, syncMenuOnce } from './sync.js';
@@ -43,6 +44,7 @@ export function mapOrder(row:Record<string,unknown>):OrderRecord{
     serviceChargeMinor:Number(row.service_charge_minor??0),roundOffMinor:Number(row.round_off_minor??0),
     discounts:activeDiscounts(String(row.id)).map(({id,lineId,kind,value,appliedMinor,reason,createdAt})=>({id,lineId,kind,value,appliedMinor,reason,createdAt})),
     taxLines:orderTaxLines(String(row.id)),
+    customer:row.customer_id?customerById(String(row.customer_id))??null:null,tokenNumber:row.token_number==null?null:Number(row.token_number),
   };
 }
 export function orderById(id:string):OrderRecord|undefined{
@@ -85,7 +87,7 @@ export function kitchenOrders():KitchenOrder[]{
 export function kitchenSnapshot():KitchenOrder[]{
   return kitchenOrders().map(ticket=>({
     id:ticket.id,ticketId:ticket.ticketId??ticket.id,kitchenStation:ticket.kitchenStation??'Unknown station',ticketStatus:ticket.ticketStatus??'new',
-    orderNumber:ticket.orderNumber,orderType:ticket.orderType,tableLabel:ticket.tableLabel,status:ticket.status,note:ticket.note,createdAt:ticket.createdAt,
+    orderNumber:ticket.orderNumber,orderType:ticket.orderType,tableLabel:ticket.tableLabel,status:ticket.status,note:ticket.note,createdAt:ticket.createdAt,tokenNumber:ticket.tokenNumber??null,
     lines:ticket.lines.map(line=>({id:line.id,menuItemId:line.menuItemId,name:line.name,category:line.category,quantity:line.quantity,
       kitchenStation:line.kitchenStation,note:line.note,modifiers:line.modifiers.map(({id,group,name})=>({id,group,name,priceDeltaMinor:0})),voidedAt:line.voidedAt} as OrderLine)),
   }));
@@ -179,6 +181,8 @@ export function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{orde
     // Orders queued offline by older clients may name a table that no longer exists; keep the label.
     else tableLabel=command.tableLabel!.trim().slice(0,40);
   }
+  const customer=command.customer?normalizeCustomer(command.customer):undefined;
+  if(typeof customer==='string')throw new Error(customer);
   const prepared=prepareLines(command.lines);
   // Totals are filled in by repriceOrder once the lines exist.
   const subtotalMinor=0;const taxTotalMinor=0;const totalMinor=0;
@@ -199,6 +203,8 @@ export function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{orde
     const insertTicket=db.prepare(`INSERT INTO kitchen_tickets(id,tenant_id,outlet_id,order_id,station,status,created_at) VALUES(?,?,?,?,?,'new',?)`);
     for(const station of stations)insertTicket.run(createId(),DEMO_TENANT,DEMO_OUTLET,orderId,station,timestamp);
     repriceOrder(orderId,timestamp);
+    if(customer)db.prepare('UPDATE orders SET customer_id=? WHERE id=?').run(upsertCustomer(customer,timestamp),orderId);
+    if(command.orderType==='takeaway')db.prepare('UPDATE orders SET token_number=? WHERE id=?').run(allocateToken(localBusinessDate()),orderId);
     audit('order',orderId,'order.sent_to_kitchen',null,{orderNumber,terminalId:DEMO_TERMINAL,lineCount:prepared.length},actorId);
     enqueueSyncEvent('order',orderId,'order.created',{...orderById(orderId)!},timestamp);
   });
@@ -254,4 +260,25 @@ export function orderTaxLines(orderId:string){
   return (db.prepare(`SELECT tax_rate_bps AS taxRateBps,tax_code AS taxCode,taxable_minor AS taxableMinor,cgst_minor AS cgstMinor,sgst_minor AS sgstMinor
     FROM order_tax_lines WHERE order_id=? ORDER BY tax_rate_bps,tax_code`).all(orderId) as Array<{taxRateBps:number;taxCode:string;taxableMinor:number;cgstMinor:number;sgstMinor:number}>)
     .map(row=>({...row,taxCode:row.taxCode||null}));
+}
+
+/** Cleans guest details: phone digits only (10-15), optional name; returns an error message when invalid. */
+export function normalizeCustomer(input:CustomerInput):{phone:string;name:string|null}|string{
+  const phone=typeof input?.phone==='string'?input.phone.replace(/[\s()+-]/g,''):'';
+  if(!/^[0-9]{10,15}$/.test(phone))return 'Enter a phone number of 10 to 15 digits.';
+  const name=typeof input.name==='string'?input.name.trim().replace(/[\u0000-\u001f\u007f]/g,'').slice(0,80):'';
+  return {phone,name:name||null};
+}
+export function upsertCustomer(customer:{phone:string;name:string|null},timestamp:string):string{
+  const existing=db.prepare('SELECT id FROM customers WHERE tenant_id=? AND outlet_id=? AND phone=?').get(DEMO_TENANT,DEMO_OUTLET,customer.phone) as {id:string}|undefined;
+  if(existing){
+    if(customer.name)db.prepare('UPDATE customers SET name=?,updated_at=? WHERE id=?').run(customer.name,timestamp,existing.id);
+    return existing.id;
+  }
+  const id=createId();
+  db.prepare('INSERT INTO customers(id,tenant_id,outlet_id,phone,name,created_at,updated_at) VALUES(?,?,?,?,?,?,?)').run(id,DEMO_TENANT,DEMO_OUTLET,customer.phone,customer.name,timestamp,timestamp);
+  return id;
+}
+export function customerById(id:string):CustomerRecord|undefined{
+  return db.prepare('SELECT id,phone,name FROM customers WHERE id=? AND tenant_id=? AND outlet_id=?').get(id,DEMO_TENANT,DEMO_OUTLET) as CustomerRecord|undefined;
 }

@@ -72,7 +72,26 @@ export interface CreateOrderCommand {
   tableLabel?: string;
   guestCount?: number;
   note?: string;
+  /** Optional guest details; a known phone number links the order to that customer. */
+  customer?: CustomerInput;
   lines: OrderLineDraft[];
+}
+
+export interface CustomerInput {
+  phone: string;
+  name?: string;
+}
+
+export interface CustomerRecord {
+  id: string;
+  phone: string;
+  name: string | null;
+}
+
+export interface CustomerSummary extends CustomerRecord {
+  visitCount: number;
+  lastVisitAt: string | null;
+  totalSpendMinor: number;
 }
 
 export interface OrderLine {
@@ -114,6 +133,7 @@ export interface KitchenOrder {
   note: string | null;
   createdAt: string;
   lines: OrderLine[];
+  tokenNumber?: number | null;
 }
 
 export interface OrderRecord extends KitchenOrder {
@@ -139,6 +159,7 @@ export interface OrderRecord extends KitchenOrder {
   roundOffMinor?: number;
   discounts?: OrderDiscount[];
   taxLines?: TaxLine[];
+  customer?: CustomerRecord | null;
 }
 
 export interface OrderDiscount {

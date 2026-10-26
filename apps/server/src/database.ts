@@ -93,6 +93,12 @@ for (const [column, definition] of [
   ['service_charge_bps', 'INTEGER NOT NULL DEFAULT 0'], ['service_charge_minor', 'INTEGER NOT NULL DEFAULT 0'],
   ['round_off_minor', 'INTEGER NOT NULL DEFAULT 0'],
 ] as const) if (!orderColumns.some(existing => existing.name === column)) db.exec(`ALTER TABLE orders ADD COLUMN ${column} ${definition}`);
+// Customer link and the daily takeaway token number printed on KOT and receipt.
+if (!orderColumns.some(column => column.name === 'customer_id')) db.exec('ALTER TABLE orders ADD COLUMN customer_id TEXT');
+if (!orderColumns.some(column => column.name === 'token_number')) db.exec('ALTER TABLE orders ADD COLUMN token_number INTEGER');
+db.exec('CREATE INDEX IF NOT EXISTS orders_by_customer ON orders(tenant_id,outlet_id,customer_id)');
+// Locally removed menu items stay for order history but leave the menu.
+if (!menuTaxColumns.some(column => column.name === 'archived')) db.exec('ALTER TABLE menu_items ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
 db.exec('CREATE INDEX IF NOT EXISTS orders_by_table ON orders(tenant_id,outlet_id,table_id,status)');
 db.exec('CREATE INDEX IF NOT EXISTS payments_by_shift ON payment_events(tenant_id,outlet_id,shift_id,method,status)');
 db.exec('CREATE INDEX IF NOT EXISTS payments_by_refund ON payment_events(tenant_id,outlet_id,refund_of,status)');
@@ -190,6 +196,15 @@ const cachedOutletSettings = db.prepare(`SELECT name,timezone,currency,tax_rate_
   FROM outlets WHERE id=? AND tenant_id=?`)
   .get(DEMO_OUTLET, DEMO_TENANT) as OutletRuntimeSettings | undefined;
 if (cachedOutletSettings) applyOutletRuntimeSettings(cachedOutletSettings);
+
+/** Takeaway tokens restart at 1 every business day. */
+export function allocateToken(businessDate: string): number {
+  const counter = `token:${businessDate}`;
+  db.prepare('INSERT OR IGNORE INTO outlet_counters(tenant_id,outlet_id,counter_name,next_value) VALUES(?,?,?,1)').run(DEMO_TENANT, DEMO_OUTLET, counter);
+  const row = db.prepare('SELECT next_value FROM outlet_counters WHERE tenant_id=? AND outlet_id=? AND counter_name=?').get(DEMO_TENANT, DEMO_OUTLET, counter) as { next_value: number };
+  db.prepare('UPDATE outlet_counters SET next_value=? WHERE tenant_id=? AND outlet_id=? AND counter_name=?').run(row.next_value + 1, DEMO_TENANT, DEMO_OUTLET, counter);
+  return row.next_value;
+}
 
 export function allocateNumber(counterName: 'order'|'invoice'|'shift', prefix: 'ORD'|'INV'|'SHIFT'): string {
   const row = db.prepare(`SELECT next_value FROM outlet_counters WHERE tenant_id=? AND outlet_id=? AND counter_name=?`)
