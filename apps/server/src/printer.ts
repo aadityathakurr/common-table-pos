@@ -41,14 +41,14 @@ function readableReceipt(raw:Buffer):string{
 export function formatKitchenTicket(order: KitchenOrder): Buffer {
   const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text(`${EDGE_CONFIG.tenantName}\n${EDGE_CONFIG.outletName}\n`),command(ESC,0x45,0),
     text('KITCHEN ORDER\n'),command(ESC,0x61,0),text(line('=')+'\n'),text(columns('ORDER',order.orderNumber)+'\n'),
-    text(columns(order.orderType==='dine_in'?(order.tableLabel??'DINE IN'):'TAKEAWAY',new Date(order.createdAt).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}))+'\n'),text(line()+'\n')];
+    text(columns(order.orderType==='dine_in'?(order.tableLabel??'DINE IN'):'TAKEAWAY',new Date(order.createdAt).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:EDGE_CONFIG.timezone}))+'\n'),text(line()+'\n')];
   for(const item of order.lines){parts.push(command(ESC,0x45,1),text(`${item.voidedAt?'VOID ':''}${item.quantity} x ${item.name}\n`),command(ESC,0x45,0));if(item.voidReason)parts.push(text(`    REASON: ${item.voidReason}\n`));if(!item.voidedAt){for(const modifier of item.modifiers)parts.push(text(`    + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor)})`:''}\n`));for(const row of wrap(item.note??''))if(row)parts.push(text(`    ${row}\n`));}}
   if(order.note)parts.push(text(line()+ '\n'),text('NOTE: '+wrap(order.note).join('\n')+'\n'));
   parts.push(text(line('=')+'\n\n'),command(GS,0x56,0x41,0x03));
   return Buffer.concat(parts);
 }
 
-export function formatReceipt(order: OrderRecord): Buffer {
+export function formatReceipt(order: OrderRecord, tenders: Array<{ method: string; amountMinor: number }> = []): Buffer {
   const receiptName=EDGE_CONFIG.receiptName||EDGE_CONFIG.tenantName;
   const receiptAddress=EDGE_CONFIG.receiptAddress||EDGE_CONFIG.locationLabel;
   const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text(`${receiptName}\n${EDGE_CONFIG.outletName}\n`),command(ESC,0x45,0),
@@ -56,7 +56,7 @@ export function formatReceipt(order: OrderRecord): Buffer {
     ...(EDGE_CONFIG.receiptPhone?[text(`Phone: ${EDGE_CONFIG.receiptPhone}\n`)]:[]),
     ...(EDGE_CONFIG.gstin?[text(`GSTIN: ${EDGE_CONFIG.gstin}\n`)]:[]),
     text(line('=')+'\n'),text(`INVOICE  ${order.invoiceNumber??'PENDING'}\n`),
-    text(`ORDER    ${order.orderNumber}\n`),text(`${new Date(order.createdAt).toLocaleString('en-IN')}\n`),
+    text(`ORDER    ${order.orderNumber}\n`),text(`${new Date(order.createdAt).toLocaleString('en-IN',{timeZone:EDGE_CONFIG.timezone})}\n`),
     text(`${order.orderType==='dine_in'?(order.tableLabel??'Dine in'):'Takeaway'} - ${order.guestCount} guest(s)\n`),text(line()+'\n')];
   for(const item of order.lines.filter(line=>!line.voidedAt)){parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor,order.currency))+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor,order.currency)})`:''}\n`));}
   const taxes=new Map<string,{code:string|null;rate:number;amount:number}>();
@@ -68,7 +68,8 @@ export function formatReceipt(order: OrderRecord): Buffer {
   parts.push(text(line()+'\n'),text(columns('Subtotal',money(order.subtotalMinor,order.currency))+'\n'),
     ...taxRows.map(bucket=>text(columns(`Tax ${bucket.rate/100}%${bucket.code?` HSN/SAC ${bucket.code}`:''}`,money(bucket.amount,order.currency))+'\n')),
     command(ESC,0x45,1),text(columns('TOTAL',money(order.totalMinor,order.currency))+'\n'),command(ESC,0x45,0),
-    text(columns(`Paid - ${(order.paymentMethod??'cash').toUpperCase()}`,money(order.totalMinor,order.currency))+'\n'),text(line('=')+'\n'),
+    ...(tenders.length?tenders:[{method:order.paymentMethod??'cash',amountMinor:order.totalMinor}])
+      .map(tender=>text(columns(`Paid - ${tender.method.toUpperCase()}`,money(tender.amountMinor,order.currency))+'\n')),text(line('=')+'\n'),
     command(ESC,0x61,1),text(`${wrap(EDGE_CONFIG.receiptFooter||'Thank you. See you again!').join('\n')}\n\n`),command(GS,0x56,0x41,0x03));
   return Buffer.concat(parts);
 }

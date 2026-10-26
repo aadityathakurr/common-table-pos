@@ -192,3 +192,8 @@ export function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{orde
   const order=orderById(orderId)!;
   return {order,duplicate:false};
 }
+export function orderTenders(orderId:string):Array<{method:PaymentMethod;amountMinor:number}>{
+  return (db.prepare(`SELECT method,amount_minor AS amountMinor FROM payment_events WHERE tenant_id=? AND outlet_id=? AND order_id=?
+    AND status='succeeded' AND entry_type='tender' ORDER BY created_at,id`).all(DEMO_TENANT,DEMO_OUTLET,orderId) as Array<{method:PaymentMethod;amountMinor:number}>)
+    .map(row=>({method:row.method,amountMinor:Number(row.amountMinor)}));
+}

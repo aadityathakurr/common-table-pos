@@ -338,6 +338,11 @@ function App(){
         const createResponse=await fetch('/api/orders',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(buildCommand(checkoutCommandId))});
         if(!createResponse.ok)throw new Error();
         order=await createResponse.json() as OrderRecord;
+        // The order now exists on the server; a failed payment must retry this
+        // order rather than create a second one and a second kitchen ticket.
+        const created=order;
+        setOrders(previous=>[created,...previous.filter(row=>row.id!==created.id)]);
+        setEditingOrderId(created.id);setEditCommandId(makeId());setCart([]);
       }
       if(splitPayment&&(!Number.isSafeInteger(splitMinor)||splitMinor<=0||splitMinor>=order.totalMinor||splitMethod===paymentMethod)){
         notify(splitMethod===paymentMethod?'Choose two different tender methods.':'Enter a split amount smaller than the order total.');setBusy(false);return;

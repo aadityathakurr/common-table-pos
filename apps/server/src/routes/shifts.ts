@@ -43,7 +43,10 @@ app.post('/api/shifts/:shiftId/cash-movements',requireRoles('owner','manager','c
   const amountMinor=Number(body.amountMinor);if(!Number.isSafeInteger(amountMinor)||amountMinor<=0)return fail(res,400,'Cash movement must be greater than zero.');
   const reason=typeof body.reason==='string'?body.reason.trim():'';if(reason.length<3||reason.length>120)return fail(res,400,'Enter a reason between 3 and 120 characters.');
   const replay=db.prepare('SELECT shift_id FROM cash_movements WHERE command_id=?').get(body.commandId) as {shift_id:string}|undefined;
-  if(replay)return res.json(shiftSummary(replay.shift_id));
+  if(replay){
+    if(replay.shift_id!==routeParam(req,'shiftId'))return fail(res,409,'This cash movement command was already used for a different shift.');
+    return res.json(shiftSummary(replay.shift_id));
+  }
   const shift=db.prepare("SELECT id FROM shifts WHERE id=? AND tenant_id=? AND outlet_id=? AND status='open'").get(routeParam(req,'shiftId'),DEMO_TENANT,DEMO_OUTLET);
   if(!shift)return fail(res,409,'Open a shift before recording cash movement.');
   db.transaction(()=>{
@@ -63,8 +66,9 @@ app.post('/api/shifts/:shiftId/close',requireRoles('owner','manager','cashier'),
   const replay=db.prepare('SELECT id FROM shifts WHERE close_command_id=?').get(body.commandId) as {id:string}|undefined;
   if(replay)return res.json(shiftSummary(replay.id));
   const summary=shiftSummary(routeParam(req,'shiftId'));if(!summary||summary.shift.status!=='open')return fail(res,409,'This shift is not open.');
-  const unsettled=db.prepare(`SELECT COUNT(*) AS count FROM orders WHERE tenant_id=? AND outlet_id=? AND created_at>=? AND status IN ('sent','preparing','ready')`)
-    .get(DEMO_TENANT,DEMO_OUTLET,summary.shift.openedAt) as {count:number};
+  // Orders can be taken before a shift opens, so every unsettled order blocks close.
+  const unsettled=db.prepare(`SELECT COUNT(*) AS count FROM orders WHERE tenant_id=? AND outlet_id=? AND status IN ('sent','preparing','ready')`)
+    .get(DEMO_TENANT,DEMO_OUTLET) as {count:number};
   if(unsettled.count>0)return fail(res,409,`Close or cancel ${unsettled.count} open order${unsettled.count===1?'':'s'} before closing the shift.`);
   const closedAt=new Date().toISOString();const varianceMinor=countedCashMinor-summary.expectedCashMinor;
   db.transaction(()=>{

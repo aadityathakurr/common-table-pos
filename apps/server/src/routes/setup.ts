@@ -24,7 +24,7 @@ app.get('/api/floor-plan',requireRoles('owner','manager','cashier'),(_req,res)=>
   return res.json({areas:areas.map(area=>({...area,tables:tables.filter(table=>table.areaId===area.id).map(({areaId,...table})=>({...table,occupied:occupied.has(table.name)}))})),stations});
 });
 app.get('/api/menu',requireRoles('owner','manager','cashier','kitchen','viewer'),(_req,res)=>{
-  const rows=db.prepare('SELECT id,name,category,price_minor AS priceMinor,emoji,color,tag,vegetarian,available,kitchen_station AS kitchenStation FROM menu_items WHERE tenant_id=? AND outlet_id=? AND available=1 ORDER BY rowid')
+  const rows=db.prepare('SELECT id,name,category,price_minor AS priceMinor,emoji,color,tag,vegetarian,available,kitchen_station AS kitchenStation,tax_code AS taxCode,tax_rate_bps AS taxRateBps FROM menu_items WHERE tenant_id=? AND outlet_id=? AND available=1 ORDER BY rowid')
     .all(DEMO_TENANT,DEMO_OUTLET) as Array<Record<string,unknown>>;
   const modifiers=db.prepare(`SELECT id,menu_item_id AS menuItemId,group_name AS "group",name,price_delta_minor AS priceDeltaMinor FROM menu_modifiers WHERE tenant_id=? AND outlet_id=? AND active=1 ORDER BY sort_order`)
     .all(DEMO_TENANT,DEMO_OUTLET) as Array<Record<string,unknown>>;

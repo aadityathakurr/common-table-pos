@@ -99,14 +99,32 @@ export function buildDailySalesReport(date = localBusinessDate()): DailySalesRep
     bucket.taxMinor+=Math.round(Number(row.line_total_minor)*taxRateBps/10000);order.buckets.set(key,bucket);taxByOrder.set(row.order_id,order);
   }
   const refundByOrder=new Map(refundsByOrder.map(row=>[row.order_id,Number(row.amount_minor)]));
+  // Refunds of orders paid on an earlier day still reduce this day's tax, so load
+  // their lines too; only their refunded share is counted below.
+  const earlierOrderIds=new Set<string>();
+  const earlierLines=db.prepare(`SELECT o.id AS order_id,o.total_minor,o.tax_total_minor,l.tax_code_snapshot AS tax_code,l.tax_rate_bps,l.line_total_minor
+    FROM orders o JOIN order_lines l ON l.order_id=o.id AND l.tenant_id=o.tenant_id AND l.outlet_id=o.outlet_id
+    LEFT JOIN order_line_voids v ON v.order_line_id=l.id
+    WHERE o.tenant_id=? AND o.outlet_id=? AND o.id=? AND v.order_line_id IS NULL`);
+  for(const orderId of refundByOrder.keys()){
+    if(taxByOrder.has(orderId))continue;
+    earlierOrderIds.add(orderId);
+    for(const row of earlierLines.all(EDGE_CONFIG.tenantId,EDGE_CONFIG.outletId,orderId) as typeof taxRows){
+      const order=taxByOrder.get(row.order_id)??{total:Number(row.total_minor),taxTotal:Number(row.tax_total_minor),buckets:new Map()};
+      const taxCode=row.tax_code??null;const taxRateBps=Number(row.tax_rate_bps);const key=`${taxRateBps}:${taxCode??''}`;
+      const bucket=order.buckets.get(key)??{taxCode,taxRateBps,taxMinor:0};
+      bucket.taxMinor+=Math.round(Number(row.line_total_minor)*taxRateBps/10000);order.buckets.set(key,bucket);taxByOrder.set(row.order_id,order);
+    }
+  }
   const taxBreakdownMap=new Map<string,{taxCode:string|null;taxRateBps:number;taxMinor:number}>();
   for(const [orderId,order] of taxByOrder){
+    const soldToday=!earlierOrderIds.has(orderId);
     const refund=Math.min(order.total,refundByOrder.get(orderId)??0);const targetRefundTax=order.total?Math.round(order.taxTotal*refund/order.total):0;
     let allocated=0;const buckets=[...order.buckets.values()];
     buckets.forEach((bucket,index)=>{
       const refundTax=index===buckets.length-1?targetRefundTax-allocated:(order.total?Math.round(bucket.taxMinor*refund/order.total):0);
       allocated+=refundTax;const key=`${bucket.taxRateBps}:${bucket.taxCode??''}`;
-      const aggregate=taxBreakdownMap.get(key)??{...bucket,taxMinor:0};aggregate.taxMinor+=bucket.taxMinor-refundTax;taxBreakdownMap.set(key,aggregate);
+      const aggregate=taxBreakdownMap.get(key)??{...bucket,taxMinor:0};aggregate.taxMinor+=(soldToday?bucket.taxMinor:0)-refundTax;taxBreakdownMap.set(key,aggregate);
     });
   }
   const voids = db.prepare(`SELECT COUNT(*) AS line_count,COALESCE(SUM(l.quantity),0) AS quantity,

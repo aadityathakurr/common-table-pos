@@ -9,6 +9,7 @@ import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from '../repo
 import { getSyncStatus, syncMenuOnce } from '../sync.js';
 import { clearedSessionCookie, createStaffSession, currentStaff, readStaffSession, refreshStaffSession, requireRoles, sessionCookie, StaffAuthError } from '../auth.js';
 import { fail, queuePrint, routeParam, mapLines, mapOrder, orderById, mapShift, shiftSummary, kitchenOrders, kitchenSnapshot, refreshOrderKitchenStatus, audit, prepareLines, recalculateOrder, rememberEdit, editReplay, persistAddedLines, createOrder, type PreparedOrderLine } from '../core.js';
+import { orderTenders } from '../core.js';
 import { publish } from '../realtime.js';
 
 export function registerOrderRoutes(app:Express){
@@ -135,7 +136,9 @@ app.patch('/api/orders/:orderId/status',requireRoles('owner','manager'),(req,res
   const timestamp=new Date().toISOString();
   const update=db.transaction(()=>{
     db.prepare('UPDATE orders SET status=?,updated_at=? WHERE id=?').run(nextStatus,timestamp,before.id);
-    db.prepare('UPDATE kitchen_tickets SET status=?,ready_at=? WHERE order_id=?').run(nextStatus==='ready'?'ready':nextStatus==='preparing'?'preparing':nextStatus==='cancelled'?'voided':'new',nextStatus==='ready'?timestamp:null,before.id);
+    // Only advance active tickets: never revive voided ones or move a ready station back.
+    if(nextStatus==='ready')db.prepare("UPDATE kitchen_tickets SET status='ready',ready_at=? WHERE order_id=? AND status IN ('new','preparing')").run(timestamp,before.id);
+    else db.prepare("UPDATE kitchen_tickets SET status='preparing' WHERE order_id=? AND status='new'").run(before.id);
     audit('order',before.id,`order.${nextStatus}`,null,{},currentStaff(res).userId);
     enqueueSyncEvent('order',before.id,`order.${nextStatus}`,{...orderById(before.id)!},timestamp);
   });update();
@@ -155,9 +158,10 @@ app.post('/api/orders/:orderId/payment',requireRoles('owner','manager','cashier'
     ||!Number.isSafeInteger(payment.amountMinor)||Number(payment.amountMinor)<=0))
     return fail(res,400,'Each tender needs a valid method and a positive amount.');
   const dueCommandIds=payments.map(payment=>payment.commandId);
-  const duplicateRows=db.prepare(`SELECT command_id,method,amount_minor FROM payment_events WHERE command_id IN (${dueCommandIds.map(()=>'?').join(',')})`)
-    .all(...dueCommandIds) as Array<{command_id:string;method:PaymentMethod;amount_minor:number}>;
+  const duplicateRows=db.prepare(`SELECT command_id,order_id,entry_type,method,amount_minor FROM payment_events WHERE command_id IN (${dueCommandIds.map(()=>'?').join(',')})`)
+    .all(...dueCommandIds) as Array<{command_id:string;order_id:string;entry_type:string;method:PaymentMethod;amount_minor:number}>;
   if(duplicateRows.length){
+    if(duplicateRows.some(row=>row.order_id!==before.id||row.entry_type!=='tender'))return fail(res,409,'This payment command was already used for a different order.');
     const same=duplicateRows.length===payments.length&&payments.every(payment=>duplicateRows.some(row=>row.command_id===payment.commandId
       &&row.method===payment.method&&Number(row.amount_minor)===payment.amountMinor));
     if(!same)return fail(res,409,'This payment command was already used for different tender amounts.');
@@ -188,7 +192,7 @@ app.post('/api/orders/:orderId/payment',requireRoles('owner','manager','cashier'
     audit('order',before.id,'order.payment_recorded',null,{payments:payments.map(({method,amountMinor})=>({method,amountMinor})),invoiceNumber,amountMinor:before.totalMinor,shiftId:body.shiftId},currentStaff(res).userId);
   });pay();
   const order=orderById(before.id)!;publish('order.updated',order);
-  queuePrint(formatReceipt(order),'Receipt');
+  queuePrint(formatReceipt(order,orderTenders(order.id)),'Receipt');
   return res.json(order);
 });
 app.post('/api/orders/:orderId/receipt/reprint',requireRoles('owner','manager','cashier'),async(req,res)=>{
@@ -204,7 +208,7 @@ app.post('/api/orders/:orderId/receipt/reprint',requireRoles('owner','manager','
   audit('receipt',order.id,'receipt.reprint_requested',body.reason.trim(),
     {orderNumber:order.orderNumber,invoiceNumber:order.invoiceNumber,printerMode:printer.mode},actor.userId);
   try{
-    await sendToPrinter(formatReceipt(order));
+    await sendToPrinter(formatReceipt(order,orderTenders(order.id)));
     audit('receipt',order.id,'receipt.reprint_dispatched',body.reason.trim(),
       {orderNumber:order.orderNumber,invoiceNumber:order.invoiceNumber,printerMode:printer.mode},actor.userId);
     return res.json({status:'dispatched',invoiceNumber:order.invoiceNumber,printerMode:printer.mode});
