@@ -44,7 +44,7 @@ export function buildDailySalesReport(date = localBusinessDate()): DailySalesRep
   if (!range) return undefined;
   const scope = [EDGE_CONFIG.tenantId, EDGE_CONFIG.outletId, range.startAt, range.endAt] as const;
   const totals = db.prepare(`WITH paid_orders AS (
-      SELECT o.id,o.subtotal_minor,o.tax_total_minor,o.total_minor
+      SELECT o.id,o.subtotal_minor,o.tax_total_minor,o.total_minor,o.discount_minor,o.service_charge_minor,o.round_off_minor
       FROM orders o WHERE o.tenant_id=? AND o.outlet_id=? AND o.status='paid'
         AND EXISTS (SELECT 1 FROM payment_events p WHERE p.tenant_id=o.tenant_id AND p.outlet_id=o.outlet_id
           AND p.order_id=o.id AND p.status='succeeded' AND p.entry_type='tender' AND p.created_at>=? AND p.created_at<?)
@@ -54,14 +54,17 @@ export function buildDailySalesReport(date = localBusinessDate()): DailySalesRep
         AND r.created_at>=? AND r.created_at<? GROUP BY r.order_id
     )
     SELECT COUNT(*) AS paid_order_count,
-      COALESCE(SUM(p.subtotal_minor),0)-COALESCE((SELECT SUM(rb.amount_minor-ROUND(p2.tax_total_minor*1.0*rb.amount_minor/NULLIF(p2.total_minor,0)))
+      COALESCE(SUM(p.total_minor-p.tax_total_minor-p.round_off_minor),0)-COALESCE((SELECT SUM(rb.amount_minor-ROUND(p2.tax_total_minor*1.0*rb.amount_minor/NULLIF(p2.total_minor,0)))
         FROM refund_by_order rb JOIN orders p2 ON p2.id=rb.order_id AND p2.tenant_id=? AND p2.outlet_id=?),0) AS subtotal_minor,
       COALESCE(SUM(p.tax_total_minor),0)-COALESCE((SELECT SUM(ROUND(p2.tax_total_minor*1.0*rb.amount_minor/NULLIF(p2.total_minor,0)))
         FROM refund_by_order rb JOIN orders p2 ON p2.id=rb.order_id AND p2.tenant_id=? AND p2.outlet_id=?),0) AS tax_total_minor,
-      COALESCE(SUM(p.total_minor),0)-COALESCE((SELECT SUM(amount_minor) FROM refund_by_order),0) AS sales_minor
+      COALESCE(SUM(p.total_minor),0)-COALESCE((SELECT SUM(amount_minor) FROM refund_by_order),0) AS sales_minor,
+      COALESCE(SUM(p.discount_minor),0) AS discount_minor,COALESCE(SUM(p.service_charge_minor),0) AS service_charge_minor,
+      COALESCE(SUM(p.round_off_minor),0) AS round_off_minor
     FROM paid_orders p`)
     .get(...scope, ...scope, EDGE_CONFIG.tenantId, EDGE_CONFIG.outletId, EDGE_CONFIG.tenantId, EDGE_CONFIG.outletId) as {
-      paid_order_count: number; subtotal_minor: number; tax_total_minor: number; sales_minor: number };
+      paid_order_count: number; subtotal_minor: number; tax_total_minor: number; sales_minor: number;
+      discount_minor: number; service_charge_minor: number; round_off_minor: number };
   const refunds = db.prepare(`SELECT COUNT(*) AS refund_count,COALESCE(SUM(amount_minor),0) AS amount_minor
     FROM payment_events WHERE tenant_id=? AND outlet_id=? AND status='succeeded' AND entry_type='refund' AND created_at>=? AND created_at<?`)
     .get(...scope) as {refund_count:number;amount_minor:number};
@@ -116,6 +119,14 @@ export function buildDailySalesReport(date = localBusinessDate()): DailySalesRep
       bucket.taxMinor+=Math.round(Number(row.line_total_minor)*taxRateBps/10000);order.buckets.set(key,bucket);taxByOrder.set(row.order_id,order);
     }
   }
+  // Orders priced by the GST engine store their tax lines (after discounts and service
+  // charge); use those instead of re-deriving tax from item lines.
+  const storedTaxLines=db.prepare('SELECT tax_rate_bps,tax_code,cgst_minor,sgst_minor FROM order_tax_lines WHERE order_id=?');
+  for(const [orderId,order] of taxByOrder){
+    const stored=storedTaxLines.all(orderId) as Array<{tax_rate_bps:number;tax_code:string;cgst_minor:number;sgst_minor:number}>;
+    if(stored.length)order.buckets=new Map(stored.map(row=>[`${row.tax_rate_bps}:${row.tax_code}`,
+      {taxCode:row.tax_code||null,taxRateBps:Number(row.tax_rate_bps),taxMinor:Number(row.cgst_minor)+Number(row.sgst_minor)}]));
+  }
   const taxBreakdownMap=new Map<string,{taxCode:string|null;taxRateBps:number;taxMinor:number}>();
   for(const [orderId,order] of taxByOrder){
     const soldToday=!earlierOrderIds.has(orderId);
@@ -139,8 +150,9 @@ export function buildDailySalesReport(date = localBusinessDate()): DailySalesRep
   return {
     date, timeZone: EDGE_CONFIG.timezone, outletName: EDGE_CONFIG.outletName, currency: EDGE_CONFIG.currency,
     ...range, generatedAt: new Date().toISOString(),
-    totals: { paidOrderCount: Number(totals.paid_order_count), subtotalMinor: Number(totals.subtotal_minor), taxTotalMinor: Number(totals.tax_total_minor), salesMinor: Number(totals.sales_minor) },
-    taxBreakdown: [...taxBreakdownMap.values()].sort((a,b)=>a.taxRateBps-b.taxRateBps||(a.taxCode??'').localeCompare(b.taxCode??'')),
+    totals: { paidOrderCount: Number(totals.paid_order_count), subtotalMinor: Number(totals.subtotal_minor), taxTotalMinor: Number(totals.tax_total_minor), salesMinor: Number(totals.sales_minor),
+      discountMinor: Number(totals.discount_minor), serviceChargeMinor: Number(totals.service_charge_minor), roundOffMinor: Number(totals.round_off_minor) },
+    taxBreakdown: [...taxBreakdownMap.values()].map(row => { const cgstMinor = Math.round(row.taxMinor / 2); return { ...row, cgstMinor, sgstMinor: row.taxMinor - cgstMinor }; }).sort((a,b)=>a.taxRateBps-b.taxRateBps||(a.taxCode??'').localeCompare(b.taxCode??'')),
     refunds: { count: Number(refunds.refund_count), amountMinor: Number(refunds.amount_minor) },
     tenders: tenders.map(row => ({ method: row.method, amountMinor: Number(row.amount_minor), paymentCount: Number(row.payment_count) })),
     items: items.map(row => ({ menuItemId: row.menu_item_id, name: row.name, quantity: Number(row.quantity), salesMinor: Number(row.sales_minor) })),
@@ -162,7 +174,14 @@ export function dailySalesCsv(report: DailySalesReport): string {
     ['sales', 'paid_orders', report.totals.paidOrderCount, '', report.currency, report.timeZone],
     ['sales', 'subtotal', '', report.totals.subtotalMinor, report.currency, ''],
     ['sales', 'tax', '', report.totals.taxTotalMinor, report.currency, ''],
-    ...report.taxBreakdown.map(row => ['tax_rate', `${(row.taxRateBps/100).toFixed(2)}%`, '', row.taxMinor, report.currency, row.taxCode ?? 'unclassified']),
+    ['sales', 'discounts', '', report.totals.discountMinor, report.currency, 'before tax'],
+    ['sales', 'service_charge', '', report.totals.serviceChargeMinor, report.currency, ''],
+    ['sales', 'round_off', '', report.totals.roundOffMinor, report.currency, ''],
+    ...report.taxBreakdown.flatMap(row => [
+      ['tax_rate', `${(row.taxRateBps/100).toFixed(2)}%`, '', row.taxMinor, report.currency, row.taxCode ?? 'unclassified'],
+      ['cgst', `${(row.taxRateBps/200).toFixed(2)}%`, '', row.cgstMinor, report.currency, row.taxCode ?? 'unclassified'],
+      ['sgst', `${(row.taxRateBps/200).toFixed(2)}%`, '', row.sgstMinor, report.currency, row.taxCode ?? 'unclassified'],
+    ]),
     ['sales', 'net_sales', '', report.totals.salesMinor, report.currency, 'after refunds'],
     ['refunds', 'refunds', report.refunds.count, report.refunds.amountMinor, report.currency, ''],
     ...report.tenders.map(row => ['tender', row.method, row.paymentCount, row.amountMinor, report.currency, '']),

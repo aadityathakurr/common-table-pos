@@ -11,6 +11,7 @@ import { clearedSessionCookie, createStaffSession, currentStaff, readStaffSessio
 import { fail, queuePrint, routeParam, mapLines, mapOrder, orderById, mapShift, shiftSummary, kitchenOrders, kitchenSnapshot, refreshOrderKitchenStatus, audit, prepareLines, recalculateOrder, rememberEdit, editReplay, persistAddedLines, createOrder, type PreparedOrderLine } from '../core.js';
 import { orderTenders } from '../core.js';
 import { publish } from '../realtime.js';
+import { operationalSettings } from '../settings.js';
 
 export function registerOrderRoutes(app:Express){
 app.get('/api/orders/:orderId',requireRoles('owner','manager','cashier'), (req,res)=>{const order=orderById(routeParam(req,'orderId'));if(!order)return fail(res,404,'Order not found.');return res.json(order);});
@@ -202,7 +203,7 @@ app.post('/api/orders/:orderId/payment',requireRoles('owner','manager','cashier'
     audit('order',before.id,'order.payment_recorded',null,{payments:payments.map(({method,amountMinor})=>({method,amountMinor})),invoiceNumber,amountMinor:before.totalMinor,shiftId:body.shiftId},currentStaff(res).userId);
   });pay();
   const order=orderById(before.id)!;publish('order.updated',order);
-  queuePrint(formatReceipt(order,orderTenders(order.id)),'Receipt');
+  queuePrint(formatReceipt(order,orderTenders(order.id),'receipt',operationalSettings().defaultSac),'Receipt');
   for(const tender of tenders)if(tender?.label)queuePrint(formatShareSlip(order,{label:tender.label.trim(),method:String(tender.method),amountMinor:Number(tender.amountMinor),...(tender.lineIds?{lineIds:tender.lineIds}:{})}),'Split share');
   return res.json(order);
 });
@@ -219,7 +220,7 @@ app.post('/api/orders/:orderId/receipt/reprint',requireRoles('owner','manager','
   audit('receipt',order.id,'receipt.reprint_requested',body.reason.trim(),
     {orderNumber:order.orderNumber,invoiceNumber:order.invoiceNumber,printerMode:printer.mode},actor.userId);
   try{
-    await sendToPrinter(formatReceipt(order,orderTenders(order.id)));
+    await sendToPrinter(formatReceipt(order,orderTenders(order.id),'receipt',operationalSettings().defaultSac));
     audit('receipt',order.id,'receipt.reprint_dispatched',body.reason.trim(),
       {orderNumber:order.orderNumber,invoiceNumber:order.invoiceNumber,printerMode:printer.mode},actor.userId);
     return res.json({status:'dispatched',invoiceNumber:order.invoiceNumber,printerMode:printer.mode});

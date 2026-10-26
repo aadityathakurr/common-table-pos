@@ -49,32 +49,57 @@ export function formatKitchenTicket(order: KitchenOrder): Buffer {
 }
 
 /** A pre-payment bill handed to a table; it carries no invoice number and no tenders. */
-export function formatBill(order: OrderRecord): Buffer { return formatReceipt(order, [], 'bill'); }
+export function formatBill(order: OrderRecord, defaultSac = ''): Buffer { return formatReceipt(order, [], 'bill', defaultSac); }
 
-export function formatReceipt(order: OrderRecord, tenders: Array<{ method: string; amountMinor: number }> = [], kind: 'receipt'|'bill' = 'receipt'): Buffer {
+export function formatReceipt(order: OrderRecord, tenders: Array<{ method: string; amountMinor: number }> = [], kind: 'receipt'|'bill' = 'receipt', defaultSac = ''): Buffer {
   const receiptName=EDGE_CONFIG.receiptName||EDGE_CONFIG.tenantName;
   const receiptAddress=EDGE_CONFIG.receiptAddress||EDGE_CONFIG.locationLabel;
   const parts:Buffer[]=[command(ESC,0x40),command(ESC,0x61,1),command(ESC,0x45,1),text(`${receiptName}\n${EDGE_CONFIG.outletName}\n`),command(ESC,0x45,0),
     text(`${wrap(receiptAddress).join('\n')}\n`),
     ...(EDGE_CONFIG.receiptPhone?[text(`Phone: ${EDGE_CONFIG.receiptPhone}\n`)]:[]),
     ...(EDGE_CONFIG.gstin?[text(`GSTIN: ${EDGE_CONFIG.gstin}\n`)]:[]),
-    text(line('=')+'\n'),text(kind==='bill'?'BILL - NOT A TAX INVOICE\n':`INVOICE  ${order.invoiceNumber??'PENDING'}\n`),
+    text(line('=')+'\n'),...(kind==='receipt'&&EDGE_CONFIG.gstin?[command(ESC,0x61,1),command(ESC,0x45,1),text('TAX INVOICE\n'),command(ESC,0x45,0),command(ESC,0x61,0)]:[]),
+    text(kind==='bill'?'BILL - NOT A TAX INVOICE\n':`INVOICE  ${order.invoiceNumber??'PENDING'}\n`),
     text(`ORDER    ${order.orderNumber}\n`),text(`${new Date(order.createdAt).toLocaleString('en-IN',{timeZone:EDGE_CONFIG.timezone})}\n`),
     text(`${order.orderType==='dine_in'?(order.tableLabel??'Dine in'):'Takeaway'} - ${order.guestCount} guest(s)\n`),text(line()+'\n')];
   for(const item of order.lines.filter(line=>!line.voidedAt)){parts.push(text(columns(`${item.quantity} x ${item.name}`,money(item.lineTotalMinor,order.currency))+'\n'));for(const modifier of item.modifiers)parts.push(text(`  + ${modifier.name}${modifier.priceDeltaMinor?` (${money(modifier.priceDeltaMinor,order.currency)})`:''}\n`));}
+  parts.push(text(line()+'\n'),...((order.pricingVersion??1)>=2?gstTotals(order,defaultSac):legacyTotals(order)),
+    command(ESC,0x45,1),text(columns('TOTAL',money(order.totalMinor,order.currency))+'\n'),command(ESC,0x45,0),
+    ...(kind==='bill'?[text('Please pay at the counter.\n')]:(tenders.length?tenders:[{method:order.paymentMethod??'cash',amountMinor:order.totalMinor}])
+      .map(tender=>text(columns(`Paid - ${tender.method.toUpperCase()}`,money(tender.amountMinor,order.currency))+'\n'))),text(line('=')+'\n'),
+    command(ESC,0x61,1),text(`${wrap(EDGE_CONFIG.receiptFooter||'Thank you. See you again!').join('\n')}\n\n`),command(GS,0x56,0x41,0x03));
+  return Buffer.concat(parts);
+}
+
+/** Totals block for orders priced before the GST bill engine: one tax row per rate. */
+function legacyTotals(order: OrderRecord): Buffer[] {
   const taxes=new Map<string,{code:string|null;rate:number;amount:number}>();
   for(const item of order.lines.filter(line=>!line.voidedAt)){
     const rate=item.taxRateBps??order.taxRateBps;const code=item.taxCode??null;const key=`${rate}:${code??''}`;
     const bucket=taxes.get(key)??{code,rate,amount:0};bucket.amount+=Math.round(item.lineTotalMinor*rate/10000);taxes.set(key,bucket);
   }
   const taxRows=[...taxes.values()].sort((a,b)=>a.rate-b.rate||(a.code??'').localeCompare(b.code??''));
-  parts.push(text(line()+'\n'),text(columns('Subtotal',money(order.subtotalMinor,order.currency))+'\n'),
-    ...taxRows.map(bucket=>text(columns(`Tax ${bucket.rate/100}%${bucket.code?` HSN/SAC ${bucket.code}`:''}`,money(bucket.amount,order.currency))+'\n')),
-    command(ESC,0x45,1),text(columns('TOTAL',money(order.totalMinor,order.currency))+'\n'),command(ESC,0x45,0),
-    ...(kind==='bill'?[text('Please pay at the counter.\n')]:(tenders.length?tenders:[{method:order.paymentMethod??'cash',amountMinor:order.totalMinor}])
-      .map(tender=>text(columns(`Paid - ${tender.method.toUpperCase()}`,money(tender.amountMinor,order.currency))+'\n'))),text(line('=')+'\n'),
-    command(ESC,0x61,1),text(`${wrap(EDGE_CONFIG.receiptFooter||'Thank you. See you again!').join('\n')}\n\n`),command(GS,0x56,0x41,0x03));
-  return Buffer.concat(parts);
+  return [text(columns('Subtotal',money(order.subtotalMinor,order.currency))+'\n'),
+    ...taxRows.map(bucket=>text(columns(`Tax ${bucket.rate/100}%${bucket.code?` HSN/SAC ${bucket.code}`:''}`,money(bucket.amount,order.currency))+'\n'))];
+}
+
+/** GST totals block: discount, service charge, taxable value, CGST/SGST per rate and round-off. */
+function gstTotals(order: OrderRecord, defaultSac: string): Buffer[] {
+  const amount=(label:string,minor:number)=>text(columns(label,money(minor,order.currency))+'\n');
+  const rows:Buffer[]=[amount('Item total',order.subtotalMinor)];
+  for(const discount of order.discounts??[])if(discount.appliedMinor){
+    const item=discount.lineId?order.lines.find(line=>line.id===discount.lineId)?.name:undefined;
+    rows.push(amount(`Discount${discount.kind==='percent'?` ${discount.value/100}%`:''}${item?` (${item})`:''}`,-discount.appliedMinor));
+  }
+  if(order.serviceChargeMinor)rows.push(amount(`Service charge ${(order.serviceChargeBps??0)/100}%`,order.serviceChargeMinor));
+  rows.push(amount('Taxable value',order.subtotalMinor-(order.discountMinor??0)+(order.serviceChargeMinor??0)));
+  for(const tax of order.taxLines??[]){
+    const code=tax.taxCode??defaultSac;const half=`${tax.taxRateBps/200}%`;
+    rows.push(text(`  ${code?`HSN/SAC ${code} - `:''}${tax.taxRateBps/100}% on ${money(tax.taxableMinor,order.currency)}\n`),
+      amount(`  CGST ${half}`,tax.cgstMinor),amount(`  SGST ${half}`,tax.sgstMinor));
+  }
+  if(order.roundOffMinor)rows.push(amount('Round off',order.roundOffMinor));
+  return rows;
 }
 
 /** One guest's share of a split bill, printed after the single invoice is paid. */

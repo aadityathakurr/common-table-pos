@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 import type { AddOrderLinesCommand, CashMovementCommand, CreateOrderCommand, KitchenOrder, OrderLine, OrderLineDraft, OrderRecord, OrderStatus, PaymentCommand, PaymentMethod, ServerMessage, ShiftRecord, ShiftSummary } from '@common-table/contracts';
 import { allocateNumber, createId, db, DATABASE_PATH, DEMO_ACTOR, DEMO_OUTLET, DEMO_TENANT, DEMO_TERMINAL, discardStaleInventoryCount, enqueueSyncEvent, listInventoryCountConflicts, localInventoryBalances, recordManualInventoryMovement, recordPaidOrderInventoryConsumption, syncOutboxStatus } from './database.js';
 import { checkEdgeConfiguration, EDGE_CONFIG } from './config.js';
+import { priceBill, roundToMinorFor } from '@common-table/contracts';
+import { operationalSettings } from './settings.js';
 import { formatKitchenTicket, formatReceipt, printerStatus, sendToPrinter } from './printer.js';
 import { buildDailySalesReport, dailySalesCsv, localBusinessDate } from './reports.js';
 import { getSyncStatus, syncMenuOnce } from './sync.js';
@@ -37,6 +39,10 @@ export function mapOrder(row:Record<string,unknown>):OrderRecord{
     totalMinor:Number(row.total_minor),...(row.invoice_number?{invoiceNumber:String(row.invoice_number)}:{}),
     ...(row.payment_method?{paymentMethod:row.payment_method as PaymentMethod}:{}),
     tableId:row.table_id==null?null:String(row.table_id),billPrintedAt:row.bill_printed_at==null?null:String(row.bill_printed_at),
+    pricingVersion:Number(row.pricing_version??1),discountMinor:Number(row.discount_minor??0),serviceChargeBps:Number(row.service_charge_bps??0),
+    serviceChargeMinor:Number(row.service_charge_minor??0),roundOffMinor:Number(row.round_off_minor??0),
+    discounts:activeDiscounts(String(row.id)).map(({id,lineId,kind,value,appliedMinor,reason,createdAt})=>({id,lineId,kind,value,appliedMinor,reason,createdAt})),
+    taxLines:orderTaxLines(String(row.id)),
   };
 }
 export function orderById(id:string):OrderRecord|undefined{
@@ -124,6 +130,8 @@ export function prepareLines(lines:OrderLineDraft[]):PreparedOrderLine[]{
   });
 }
 export function recalculateOrder(orderId:string,timestamp:string){
+  const version=Number((db.prepare('SELECT pricing_version FROM orders WHERE id=?').get(orderId) as {pricing_version:number}|undefined)?.pricing_version??1);
+  if(version>=2){repriceOrder(orderId,timestamp);return;}
   const totals=db.prepare(`SELECT COALESCE(SUM(l.line_total_minor),0) AS subtotal,
     COALESCE(SUM(ROUND(l.line_total_minor*l.tax_rate_bps/10000.0)),0) AS tax FROM order_lines l
     LEFT JOIN order_line_voids v ON v.order_line_id=l.id WHERE l.order_id=? AND v.order_line_id IS NULL`).get(orderId) as {subtotal:number;tax:number};
@@ -172,17 +180,17 @@ export function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{orde
     else tableLabel=command.tableLabel!.trim().slice(0,40);
   }
   const prepared=prepareLines(command.lines);
-  const subtotalMinor=prepared.reduce((sum,line)=>sum+line.lineTotalMinor,0);
-  const taxTotalMinor=prepared.reduce((sum,line)=>sum+Math.round(line.lineTotalMinor*line.taxRateBps/10000),0);
-  const totalMinor=subtotalMinor+taxTotalMinor;
+  // Totals are filled in by repriceOrder once the lines exist.
+  const subtotalMinor=0;const taxTotalMinor=0;const totalMinor=0;
+  const serviceChargeBps=command.orderType==='dine_in'?operationalSettings().serviceChargeBps:0;
   const orderId=randomUUID();const timestamp=new Date().toISOString();
   const create=db.transaction(()=>{
     const orderNumber=allocateNumber('order','ORD');
-    db.prepare(`INSERT INTO orders(id,command_id,tenant_id,outlet_id,terminal_id,order_number,order_type,table_id,table_label,guest_count,status,note,currency,subtotal_minor,tax_total_minor,tax_rate_bps,total_minor,created_at,updated_at)
-      VALUES(@id,@commandId,@tenantId,@outletId,@terminalId,@orderNumber,@orderType,@tableId,@tableLabel,@guestCount,'sent',@note,@currency,@subtotalMinor,@taxTotalMinor,@taxRateBps,@totalMinor,@createdAt,@updatedAt)`).run({
+    db.prepare(`INSERT INTO orders(id,command_id,tenant_id,outlet_id,terminal_id,order_number,order_type,table_id,table_label,guest_count,status,note,currency,subtotal_minor,tax_total_minor,tax_rate_bps,total_minor,created_at,updated_at,pricing_version,service_charge_bps)
+      VALUES(@id,@commandId,@tenantId,@outletId,@terminalId,@orderNumber,@orderType,@tableId,@tableLabel,@guestCount,'sent',@note,@currency,@subtotalMinor,@taxTotalMinor,@taxRateBps,@totalMinor,@createdAt,@updatedAt,2,@serviceChargeBps)`).run({
       id:orderId,commandId:command.commandId,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,terminalId:DEMO_TERMINAL,orderNumber,
       orderType:command.orderType,tableId,tableLabel,guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),
-      note:command.note?.slice(0,140)??null,currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,
+      note:command.note?.slice(0,140)??null,currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,serviceChargeBps,
     });
     const insertLine=db.prepare(`INSERT INTO order_lines(id,tenant_id,outlet_id,order_id,menu_item_id,item_name_snapshot,category_snapshot,unit_price_minor,modifiers_json,quantity,line_total_minor,kitchen_station,note,tax_code_snapshot,tax_rate_bps)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
@@ -190,14 +198,9 @@ export function createOrder(command:CreateOrderCommand,actorId=DEMO_ACTOR):{orde
     const stations=new Set(prepared.map(line=>line.kitchenStation));
     const insertTicket=db.prepare(`INSERT INTO kitchen_tickets(id,tenant_id,outlet_id,order_id,station,status,created_at) VALUES(?,?,?,?,?,'new',?)`);
     for(const station of stations)insertTicket.run(createId(),DEMO_TENANT,DEMO_OUTLET,orderId,station,timestamp);
+    repriceOrder(orderId,timestamp);
     audit('order',orderId,'order.sent_to_kitchen',null,{orderNumber,terminalId:DEMO_TERMINAL,lineCount:prepared.length},actorId);
-    enqueueSyncEvent('order',orderId,'order.created',{id:orderId,commandId:command.commandId,tenantId:DEMO_TENANT,outletId:DEMO_OUTLET,
-      terminalId:DEMO_TERMINAL,orderNumber,orderType:command.orderType,tableId,tableLabel,
-      guestCount:Math.max(1,Math.min(20,Math.floor(command.guestCount??1))),status:'sent',note:command.note?.slice(0,140)??null,
-      currency:EDGE_CONFIG.currency,subtotalMinor,taxTotalMinor,taxRateBps:EDGE_CONFIG.taxRateBps,totalMinor,createdAt:timestamp,updatedAt:timestamp,
-      lines:prepared.map(line=>({id:line.id,menuItemId:line.menuItemId,name:line.name,category:line.category,quantity:line.quantity,
-        unitPriceMinor:line.basePriceMinor,lineTotalMinor:line.lineTotalMinor,kitchenStation:line.kitchenStation,note:line.note,
-        taxCode:line.taxCode,taxRateBps:line.taxRateBps,modifiers:line.modifiers}))},timestamp);
+    enqueueSyncEvent('order',orderId,'order.created',{...orderById(orderId)!},timestamp);
   });
   create();
   const order=orderById(orderId)!;
@@ -220,4 +223,35 @@ export function findTable(tableId?:string,tableLabel?:string):TableRow|undefined
 export function activeOrderAtTable(tableId:string):{id:string}|undefined{
   return db.prepare(`SELECT id FROM orders WHERE tenant_id=? AND outlet_id=? AND table_id=? AND status IN ('sent','preparing','ready')`)
     .get(DEMO_TENANT,DEMO_OUTLET,tableId) as {id:string}|undefined;
+}
+
+export interface OrderDiscountRow {id:string;lineId:string|null;kind:'percent'|'amount';value:number;appliedMinor:number;reason:string;createdAt:string}
+export function activeDiscounts(orderId:string):OrderDiscountRow[]{
+  return (db.prepare(`SELECT id,order_line_id AS lineId,kind,value,applied_minor AS appliedMinor,reason,created_at AS createdAt FROM order_discounts
+    WHERE tenant_id=? AND outlet_id=? AND order_id=? AND voided_at IS NULL ORDER BY created_at,id`).all(DEMO_TENANT,DEMO_OUTLET,orderId) as OrderDiscountRow[])
+    .map(row=>({...row,value:Number(row.value),appliedMinor:Number(row.appliedMinor)}));
+}
+/** Prices an order with the shared bill engine and stores totals, discount amounts and GST lines. */
+export function repriceOrder(orderId:string,timestamp:string){
+  const order=db.prepare('SELECT currency,service_charge_bps FROM orders WHERE id=?').get(orderId) as {currency:string;service_charge_bps:number};
+  const lines=db.prepare(`SELECT l.id,l.line_total_minor AS lineTotalMinor,l.tax_rate_bps AS taxRateBps,l.tax_code_snapshot AS taxCode FROM order_lines l
+    LEFT JOIN order_line_voids v ON v.order_line_id=l.id WHERE l.order_id=? AND v.order_line_id IS NULL ORDER BY l.rowid`).all(orderId) as
+    Array<{id:string;lineTotalMinor:number;taxRateBps:number;taxCode:string|null}>;
+  const discounts=activeDiscounts(orderId).filter(discount=>!discount.lineId||lines.some(line=>line.id===discount.lineId));
+  const bill=priceBill({lines,discounts,serviceChargeBps:Number(order.service_charge_bps),serviceTaxRateBps:EDGE_CONFIG.taxRateBps,
+    roundToMinor:roundToMinorFor(order.currency)});
+  discounts.forEach((discount,index)=>db.prepare('UPDATE order_discounts SET applied_minor=? WHERE id=?').run(bill.discountAmounts[index]??0,discount.id));
+  // Discounts on lines that were voided no longer apply.
+  db.prepare(`UPDATE order_discounts SET applied_minor=0 WHERE order_id=? AND voided_at IS NULL AND order_line_id IS NOT NULL
+    AND order_line_id IN (SELECT order_line_id FROM order_line_voids WHERE order_id=?)`).run(orderId,orderId);
+  db.prepare(`UPDATE orders SET subtotal_minor=?,discount_minor=?,service_charge_minor=?,tax_total_minor=?,round_off_minor=?,total_minor=?,updated_at=? WHERE id=?`)
+    .run(bill.subtotalMinor,bill.discountMinor,bill.serviceChargeMinor,bill.taxTotalMinor,bill.roundOffMinor,bill.totalMinor,timestamp,orderId);
+  db.prepare('DELETE FROM order_tax_lines WHERE order_id=?').run(orderId);
+  const insert=db.prepare('INSERT INTO order_tax_lines(order_id,tax_rate_bps,tax_code,taxable_minor,cgst_minor,sgst_minor) VALUES(?,?,?,?,?,?)');
+  for(const line of bill.taxLines)insert.run(orderId,line.taxRateBps,line.taxCode??'',line.taxableMinor,line.cgstMinor,line.sgstMinor);
+}
+export function orderTaxLines(orderId:string){
+  return (db.prepare(`SELECT tax_rate_bps AS taxRateBps,tax_code AS taxCode,taxable_minor AS taxableMinor,cgst_minor AS cgstMinor,sgst_minor AS sgstMinor
+    FROM order_tax_lines WHERE order_id=? ORDER BY tax_rate_bps,tax_code`).all(orderId) as Array<{taxRateBps:number;taxCode:string;taxableMinor:number;cgstMinor:number;sgstMinor:number}>)
+    .map(row=>({...row,taxCode:row.taxCode||null}));
 }

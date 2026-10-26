@@ -86,6 +86,13 @@ if (!orderColumns.some(column => column.name === 'table_id')) {
     AND t.outlet_id=orders.outlet_id AND t.name=orders.table_label) WHERE table_label IS NOT NULL`);
 }
 if (!orderColumns.some(column => column.name === 'bill_printed_at')) db.exec('ALTER TABLE orders ADD COLUMN bill_printed_at TEXT');
+// pricing_version 1 = original per-line tax; 2 = shared bill engine with discounts,
+// service charge, CGST/SGST and round-off. Existing orders keep their stored totals.
+for (const [column, definition] of [
+  ['pricing_version', 'INTEGER NOT NULL DEFAULT 1'], ['discount_minor', 'INTEGER NOT NULL DEFAULT 0'],
+  ['service_charge_bps', 'INTEGER NOT NULL DEFAULT 0'], ['service_charge_minor', 'INTEGER NOT NULL DEFAULT 0'],
+  ['round_off_minor', 'INTEGER NOT NULL DEFAULT 0'],
+] as const) if (!orderColumns.some(existing => existing.name === column)) db.exec(`ALTER TABLE orders ADD COLUMN ${column} ${definition}`);
 db.exec('CREATE INDEX IF NOT EXISTS orders_by_table ON orders(tenant_id,outlet_id,table_id,status)');
 db.exec('CREATE INDEX IF NOT EXISTS payments_by_shift ON payment_events(tenant_id,outlet_id,shift_id,method,status)');
 db.exec('CREATE INDEX IF NOT EXISTS payments_by_refund ON payment_events(tenant_id,outlet_id,refund_of,status)');

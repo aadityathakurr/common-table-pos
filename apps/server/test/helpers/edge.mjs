@@ -5,7 +5,7 @@ import { createServer } from 'node:net';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -66,10 +66,18 @@ export async function startEdge(t, env = {}) {
     await delay(100);
   }
 
-  async function request(path, { method = 'GET', body } = {}) {
-    const response = await fetch(`${baseUrl}${path}`, {
-      method, ...(body === undefined ? {} : { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } }),
-    });
+  // Development edges fall back to this secret; signing a cookie lets a test act as a given role.
+  function staffCookie(role) {
+    const session = { userId: `user-${role}`, email: `${role}@example.test`, displayName: role, role,
+      tenantId: 'test-tenant', outletId: 'test-outlet', expiresAt: Math.floor(Date.now() / 1000) + 3600 };
+    const encoded = Buffer.from(JSON.stringify(session)).toString('base64url');
+    const signature = createHmac('sha256', 'common-table-development-session-secret').update(encoded).digest('base64url');
+    return `ct_pos_session=${encoded}.${signature}`;
+  }
+
+  async function request(path, { method = 'GET', body, as } = {}) {
+    const headers = { ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...(as ? { cookie: staffCookie(as) } : {}) };
+    const response = await fetch(`${baseUrl}${path}`, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const text = await response.text();
     let json = null;
     try { json = text ? JSON.parse(text) : null; } catch { json = text; }

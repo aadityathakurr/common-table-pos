@@ -1,3 +1,5 @@
+import type { DiscountKind, TaxLine } from './pricing.js';
+export * from './pricing.js';
 export type OrderType = 'dine_in' | 'takeaway';
 export type OrderStatus = 'sent' | 'preparing' | 'ready' | 'paid' | 'cancelled';
 export type PaymentMethod = 'cash' | 'upi' | 'card';
@@ -129,6 +131,24 @@ export interface OrderRecord extends KitchenOrder {
   paymentMethod?: PaymentMethod;
   tableId?: string | null;
   billPrintedAt?: string | null;
+  /** 1: original per-line tax; 2: discounts, service charge, CGST/SGST and round-off. */
+  pricingVersion?: number;
+  discountMinor?: number;
+  serviceChargeBps?: number;
+  serviceChargeMinor?: number;
+  roundOffMinor?: number;
+  discounts?: OrderDiscount[];
+  taxLines?: TaxLine[];
+}
+
+export interface OrderDiscount {
+  id: string;
+  lineId: string | null;
+  kind: DiscountKind;
+  value: number;
+  appliedMinor: number;
+  reason: string;
+  createdAt: string;
 }
 
 export interface PaymentCommand {
@@ -176,8 +196,10 @@ export interface DailySalesReport {
   startAt: string;
   endAt: string;
   generatedAt: string;
-  totals: { paidOrderCount: number; subtotalMinor: number; taxTotalMinor: number; salesMinor: number };
-  taxBreakdown: Array<{ taxCode: string | null; taxRateBps: number; taxMinor: number }>;
+  /** subtotalMinor is the taxable value (after discounts, including service charge), net of refunds. */
+  totals: { paidOrderCount: number; subtotalMinor: number; taxTotalMinor: number; salesMinor: number;
+    discountMinor: number; serviceChargeMinor: number; roundOffMinor: number };
+  taxBreakdown: Array<{ taxCode: string | null; taxRateBps: number; taxMinor: number; cgstMinor: number; sgstMinor: number }>;
   refunds: { count: number; amountMinor: number };
   tenders: Array<{ method: PaymentMethod; amountMinor: number; paymentCount: number }>;
   items: Array<{ menuItemId: string; name: string; quantity: number; salesMinor: number }>;

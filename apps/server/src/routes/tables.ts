@@ -7,6 +7,7 @@ import { currentStaff, requireRoles } from '../auth.js';
 import { activeOrderAtTable, audit, fail, findTable, orderById, queuePrint, recalculateOrder, refreshOrderKitchenStatus, routeParam } from '../core.js';
 import { formatBill } from '../printer.js';
 import { publish } from '../realtime.js';
+import { operationalSettings } from '../settings.js';
 
 const ACTIVE = "('sent','preparing','ready')";
 const managers = requireRoles('owner', 'manager');
@@ -286,7 +287,7 @@ export function registerTableRoutes(app: Express) {
       audit('order', order.id, 'order.bill_printed', null, { totalMinor: order.totalMinor, reprint: Boolean(order.billPrintedAt) }, currentStaff(res).userId);
     })();
     const after = orderById(order.id)!;
-    queuePrint(formatBill(after), 'Bill');
+    queuePrint(formatBill(after, operationalSettings().defaultSac), 'Bill');
     publish('order.updated', after);
     return res.json(after);
   });
