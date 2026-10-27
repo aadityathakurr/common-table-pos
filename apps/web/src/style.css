@@ -11,8 +11,33 @@
 }
 
 * { box-sizing: border-box; }
-body { min-width: 360px; min-height: 100vh; margin: 0; }
+body { min-width: 320px; min-height: 100vh; margin: 0; }
 button, input, select { font: inherit; }
 button { cursor: pointer; }
 button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #afd6bf; outline-offset: 2px; }
 ::selection { background: #d9ecdf; }
+
+/* Cashier screens need to stay readable at arm's length on touch displays. */
+.pos-app {
+  --pos-ink: #20352b;
+  color: var(--pos-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.pos-app [class~="text-[6px]"] { font-size: 10px !important; line-height: 1.25; }
+.pos-app [class~="text-[7px]"] { font-size: 11px !important; line-height: 1.35; }
+.pos-app [class~="text-[8px]"] { font-size: 12px !important; line-height: 1.4; }
+.pos-app [class~="text-[9px]"] { font-size: 13px !important; line-height: 1.4; }
+.pos-app [class~="text-[10px]"] { font-size: 14px !important; line-height: 1.4; }
+.pos-app [class~="text-[11px]"] { font-size: 14px !important; line-height: 1.4; }
+.pos-app button { -webkit-tap-highlight-color: transparent; }
+.pos-app button:active:not(:disabled) { transform: translateY(1px); }
+
+@media (prefers-reduced-motion: reduce) {
+  .pos-app *, .pos-app *::before, .pos-app *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
